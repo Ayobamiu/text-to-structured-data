@@ -3,6 +3,7 @@ import multer from "multer";
 import axios from "axios";
 import OpenAI from "openai";
 import dotenv from "dotenv";
+import S3Service from "./s3Service.js";
 
 dotenv.config();
 
@@ -15,6 +16,9 @@ const openai = new OpenAI({
 // Flask service URL
 const FLASK_URL = process.env.FLASK_URL || "http://localhost:5001";
 
+// Initialize S3 service
+const s3Service = new S3Service();
+
 app.use(express.json());
 
 // Health check
@@ -22,8 +26,45 @@ app.get("/health", (req, res) => {
     res.json({ status: "healthy", service: "ai-extractor" });
 });
 
+// S3 connection test
+app.get("/test-s3", async (req, res) => {
+    try {
+        const connection = await s3Service.testConnection();
+        const stats = await s3Service.getStorageStats();
+
+        res.json({
+            status: "success",
+            s3: connection,
+            storage_stats: stats
+        });
+    } catch (error) {
+        res.status(500).json({
+            status: "error",
+            message: error.message
+        });
+    }
+});
+
+// S3 storage statistics
+app.get("/storage-stats", async (req, res) => {
+    try {
+        const stats = await s3Service.getStorageStats();
+        res.json({
+            status: "success",
+            storage: stats
+        });
+    } catch (error) {
+        res.status(500).json({
+            status: "error",
+            message: error.message
+        });
+    }
+});
+
 // Main extraction endpoint
 app.post("/extract", upload.single("file"), async (req, res) => {
+    let s3FileInfo = null;
+
     try {
         console.log("=== EXTRACT ENDPOINT CALLED ===");
         console.log(`Request method: ${req.method}`);
@@ -44,6 +85,18 @@ app.post("/extract", upload.single("file"), async (req, res) => {
 
         console.log(`Processing file: ${req.file.originalname}`);
         console.log(`Schema name: ${schemaName || 'default'}`);
+
+        // Step 0: Upload file to S3 (if enabled)
+        if (s3Service.isCloudStorageEnabled()) {
+            console.log("Step 0: Uploading file to S3...");
+            try {
+                const jobId = `extract_${Date.now()}_${Math.random().toString(36).substring(2)}`;
+                s3FileInfo = await s3Service.uploadFile(req.file, jobId);
+                console.log(`✅ File uploaded to S3: ${s3FileInfo.s3Key}`);
+            } catch (s3Error) {
+                console.warn(`⚠️ S3 upload failed, continuing with local processing: ${s3Error.message}`);
+            }
+        }
 
         // Step 1: Extract text from PDF using Flask service
         console.log("Step 1: Calling Flask service for text extraction...");
@@ -108,6 +161,13 @@ app.post("/extract", upload.single("file"), async (req, res) => {
                 filename: req.file.originalname,
                 textLength: extractedText.length,
                 pagesProcessed: flaskResponse.data.data.metadata.total_pages,
+                s3Storage: s3FileInfo ? {
+                    s3Key: s3FileInfo.s3Key,
+                    fileUrl: s3FileInfo.fileUrl,
+                    storageType: s3FileInfo.storageType,
+                    fileHash: s3FileInfo.fileHash,
+                    expiresAt: s3FileInfo.expiresAt
+                } : null
             },
         });
 

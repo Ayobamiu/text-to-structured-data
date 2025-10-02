@@ -2,6 +2,7 @@ import { S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectCommand, Head
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import crypto from 'crypto';
 import path from 'path';
+import fs from 'fs';
 import dotenv from 'dotenv';
 
 dotenv.config();
@@ -17,8 +18,13 @@ class S3Service {
         });
 
         this.bucketName = process.env.S3_BUCKET_NAME || 'document-extractor-files';
-        this.enabled = process.env.S3_ENABLED === 'true';
+        this.enabled = process.env.CLOUD_STORAGE_ENABLED === 'true';
         this.fileRetentionDays = parseInt(process.env.FILE_RETENTION_DAYS) || 7;
+    }
+
+    // Check if cloud storage is enabled
+    isCloudStorageEnabled() {
+        return this.enabled;
     }
 
     // Generate unique filename with hash
@@ -47,7 +53,7 @@ class S3Service {
             const key = `jobs/${jobId}/${uniqueFilename}`;
 
             // Read file buffer
-            const fileBuffer = file.buffer || require('fs').readFileSync(file.path);
+            const fileBuffer = file.buffer || fs.readFileSync(file.path);
 
             // Calculate file hash
             const fileHash = this.calculateFileHash(fileBuffer);
