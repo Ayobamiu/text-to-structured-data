@@ -1,0 +1,294 @@
+{
+  "type": "object",
+  "properties": {
+    "casing": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "size": {
+            "type": ["number", "null"],
+            "description": "The diameter of the casing, typically in inches."
+          },
+          "type": {
+            "enum": ["Surface", "Intermediate", "Production", null],
+            "extend:descriptions": ["", "", "", ""],
+            "description": "The function or designation of the casing string, such as 'Surface', 'Intermediate', or 'Production'."
+          },
+          "cement_type": {
+            "type": ["string", "null"],
+            "description": "The type or specification of cement used for this casing string."
+          },
+          "bags_of_cement": {
+            "type": ["number", "null"],
+            "description": "The number of bags of cement used to secure this casing string."
+          },
+          "Interval": {
+            "type": ["number", "null"],
+            "description": "The length or interval covered by the casing, if specified."
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "size",
+          "type",
+          "cement_type",
+          "bags_of_cement",
+          "Interval"
+        ]
+      },
+      "description": "A list of casing strings set in the well. Each entry describes a casing type, size, cement details, and other relevant information."
+    },
+    "issues": {
+      "type": ["string", "null"],
+      "description": "Any reported issues, problems, or notes related to the well, such as operational difficulties, regulatory concerns, or special conditions."
+    },
+    "status": {
+      "enum": [
+        "Active",
+        "Drilling Completed",
+        "Orphan",
+        "Plugged Back",
+        "Plugging Approved",
+        "Plugging Completed",
+        "Producing",
+        "Pilot",
+        "Permitted Well",
+        "Shut In",
+        "Suspended",
+        "Temporarily Abandoned",
+        "Terminated Permit",
+        "Well Completed",
+        null
+      ],
+      "extend:descriptions": [
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        ""
+      ],
+      "description": "The current status of the well, such as 'permitted', 'drilled', 'completed', 'plugged', or other operational states. This may be explicitly stated or inferred from context."
+    },
+    "acidized": {
+      "type": ["boolean", "null"],
+      "description": "Indicates whether acid treatment was performed on the well to enhance production. True if acidized, false if not, or null if unknown."
+    },
+    "deviation": {
+      "enum": ["Deviated", "Horizontal", "Straight", null],
+      "extend:descriptions": ["", "", "", ""],
+      "description": "The maximum deviation of the wellbore from vertical, typically measured in degrees or feet/meters. Indicates the extent of directional drilling, if any."
+    },
+    "elevation": {
+      "type": ["number", "null"],
+      "description": "The surface elevation at the well location, typically measured in feet or meters above sea level. This value may be labeled as 'Elevation', 'Ground Elevation', or similar."
+    },
+    "fractured": {
+      "type": ["boolean", "null"],
+      "description": "Indicates whether hydraulic fracturing or similar stimulation was performed on the well. True if fractured, false if not, or null if unknown."
+    },
+    "pluggings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": ["string", "null"],
+            "description": "The type or method of plugging used, such as 'cement plug', 'mechanical plug', or other."
+          },
+          "depth": {
+            "type": ["number", "null"],
+            "description": "The depth at which the plug was set, typically in feet or meters."
+          },
+          "details": {
+            "type": ["string", "null"],
+            "description": "Additional details or notes about the plugging operation."
+          },
+          "interval": {
+            "type": ["number", "null"],
+            "description": "The length or interval covered by the plug, if specified."
+          },
+          "plugging_date": {
+            "type": ["string", "null"],
+            "extend:type": "date",
+            "description": "The date when this plugging operation was performed."
+          },
+          "bag_of_cements": {
+            "type": ["string", "null"],
+            "description": "The number of bags of cement used to secure this plugging."
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "type",
+          "depth",
+          "details",
+          "interval",
+          "plugging_date",
+          "bag_of_cements"
+        ]
+      },
+      "description": "A list of plugging operations performed on the well. Each entry includes the date, type, depth, interval, and details of the plugging."
+    },
+    "well_type": {
+      "enum": [
+        "Brine Disposal",
+        "Dry Hole",
+        "Gas Injection",
+        "Gas Production",
+        "Gas Storage",
+        "Mineral",
+        "Oil Production",
+        "Other Injection",
+        "Water Injection",
+        "Observation",
+        "Location",
+        "Lost Hole",
+        "LPG",
+        "Other",
+        null
+      ],
+      "extend:descriptions": [
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        ""
+      ],
+      "description": "The intended type or purpose of the well, such as 'oil', 'gas', 'test hole', 'injection', or other. This field captures the primary function as described in the document."
+    },
+    "workovers": {
+      "type": ["string", "null"],
+      "description": "A description of any workover operations performed on the well, such as repairs, re-completions, or major interventions."
+    },
+    "formations": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "to": {
+            "type": ["number", "null"],
+            "description": "The ending depth (in feet or meters) where this formation ends in the well."
+          },
+          "from": {
+            "type": ["number", "null"],
+            "description": "The starting depth (in feet or meters) where this formation begins in the well."
+          },
+          "name": {
+            "type": ["string", "null"],
+            "description": "The name of the geological formation, such as 'Marshall', 'Dundee', or 'Traverse'."
+          }
+        },
+        "additionalProperties": false,
+        "required": ["to", "from", "name"]
+      },
+      "description": "A list of geological formations encountered or expected in the well. Each entry includes the formation name and the depth interval it covers."
+    },
+    "lease_name": {
+      "type": ["string", "null"],
+      "description": "The name or designation of the lease under which the well is being drilled. This typically refers to the property or agreement name and may be labeled as 'Lease Name', 'Leased Property', or similar."
+    },
+    "true_depth": {
+      "type": ["number", "null"],
+      "description": "The true vertical depth of the well, representing the straight-line distance from surface to the deepest point. This may differ from measured depth in deviated wells."
+    },
+    "h2s_present": {
+      "type": ["boolean", "null"],
+      "description": "Indicates whether hydrogen sulfide (H2S) gas is present or expected in the well. True if H2S is present, false if not, or null if unknown."
+    },
+    "target_zone": {
+      "type": ["string", "null"],
+      "description": "The primary geological zone or formation targeted by the well. This may be a formation name, depth interval, or descriptive term."
+    },
+    "well_number": {
+      "type": ["string", "null"],
+      "description": "The specific number or identifier for the well within the lease or field. This may include numbers, letters, or a combination, and is often labeled as 'Well No.', 'Well Number', or similar."
+    },
+    "permit_number": {
+      "type": ["string", "null"],
+      "description": "The unique identifier assigned to the drilling permit for this well. This number is used for regulatory tracking and may appear with labels such as 'Permit No.', 'Permit Number', or similar. In these documents, it is often found near the bottom or in a dedicated section."
+    },
+    "injection_well": {
+      "type": ["boolean", "null"],
+      "description": "Indicates whether the well is used for injection purposes (e.g., water, gas, or other fluids). True if an injection well, false if not, or null if unknown."
+    },
+    "measured_depth": {
+      "type": ["number", "null"],
+      "description": "The total measured depth of the wellbore, typically in feet or meters. This is the length along the well path from surface to the deepest point drilled."
+    },
+    "completion_date": {
+      "type": ["string", "null"],
+      "extend:type": "date",
+      "description": "The date when the well was completed, plugged, or otherwise finished. This is typically the date of final operations and may be labeled as 'Completion Date', 'Plugging Date', or similar."
+    },
+    "elevation_datum": {
+      "enum": ["Kelly Bushing", "Ground", "Rotary Table", "Drill Floor", null],
+      "extend:descriptions": ["", "", "", "", ""],
+      "description": "The reference datum used for the elevation measurement, such as 'mean sea level', 'NGVD', or other standard geodetic datums."
+    },
+    "number_of_plugs": {
+      "type": ["integer", "null"],
+      "description": "The total number of plugs set in the well, typically during plugging and abandonment operations."
+    },
+    "deepest_formation": {
+      "type": ["string", "null"],
+      "description": "The name of the deepest geological formation penetrated by the well. This is often the primary target or the last formation encountered."
+    },
+    "type_fluid_injected": {
+      "type": ["string", "null"],
+      "description": "The type of fluid injected into the well if it is an injection well. Examples include water, CO2, brine, or other substances."
+    },
+    "perforation_intervals": {
+      "type": ["string", "null"],
+      "description": "The depth intervals where the well casing has been perforated to allow fluid flow. This may be a list or range of depths, and can include multiple intervals."
+    }
+  },
+  "required": [
+    "casing",
+    "issues",
+    "status",
+    "acidized",
+    "deviation",
+    "elevation",
+    "fractured",
+    "pluggings",
+    "well_type",
+    "workovers",
+    "formations",
+    "lease_name",
+    "true_depth",
+    "h2s_present",
+    "target_zone",
+    "well_number",
+    "permit_number",
+    "injection_well",
+    "measured_depth",
+    "completion_date",
+    "elevation_datum",
+    "number_of_plugs",
+    "deepest_formation",
+    "type_fluid_injected",
+    "perforation_intervals"
+  ],
+  "additionalProperties": false
+}

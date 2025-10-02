@@ -1,0 +1,22 @@
+{
+  "name": "document-extrator",
+  "version": "1.0.0",
+  "description": "AI data extractor",
+  "main": "index.js",
+  "type": "module",
+  "author": "Core Extract, Inc.",
+  "license": "ISC",
+  "dependencies": {
+    "axios": "^1.6.0",
+    "dotenv": "^17.2.3",
+    "express": "^4.18.2",
+    "form-data": "^4.0.4",
+    "multer": "^1.4.5-lts.1",
+    "openai": "^6.0.0",
+    "zod": "^4.1.11"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node src/server.js"
+  }
+}

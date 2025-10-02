@@ -1,0 +1,48 @@
+{
+  "type": "object",
+  "properties": {
+    "title": {
+      "type": "string",
+      "description": "Document title or main heading"
+    },
+    "content": {
+      "type": "string",
+      "description": "Main content extracted from the document"
+    },
+    "metadata": {
+      "type": "object",
+      "properties": {
+        "pageCount": {
+          "type": "number",
+          "description": "Total number of pages processed"
+        },
+        "wordCount": {
+          "type": "number",
+          "description": "Total word count in the document"
+        },
+        "extractionDate": {
+          "type": "string",
+          "description": "Date when extraction was performed"
+        }
+      }
+    },
+    "entities": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "type": {
+            "type": "string"
+          },
+          "confidence": {
+            "type": "number"
+          }
+        }
+      }
+    }
+  },
+  "required": ["title", "content"]
+}
