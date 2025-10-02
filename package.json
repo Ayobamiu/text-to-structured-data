@@ -7,6 +7,8 @@
   "author": "Core Extract, Inc.",
   "license": "ISC",
   "dependencies": {
+    "@aws-sdk/client-s3": "^3.901.0",
+    "@aws-sdk/s3-request-presigner": "^3.901.0",
     "axios": "^1.6.0",
     "dotenv": "^17.2.3",
     "express": "^4.18.2",
