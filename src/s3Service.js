@@ -122,6 +122,10 @@ class S3Service {
 
     // Download file from S3
     async downloadFile(s3Key) {
+        if (!this.enabled) {
+            throw new Error('S3 storage is disabled');
+        }
+
         try {
             const command = new GetObjectCommand({
                 Bucket: this.bucketName,
@@ -129,9 +133,18 @@ class S3Service {
             });
 
             const response = await this.s3Client.send(command);
-            return response.Body;
+
+            // Convert stream to buffer
+            const chunks = [];
+            for await (const chunk of response.Body) {
+                chunks.push(chunk);
+            }
+
+            const buffer = Buffer.concat(chunks);
+            console.log(`✅ File downloaded from S3: ${s3Key} (${buffer.length} bytes)`);
+            return buffer;
         } catch (error) {
-            console.error('❌ Error downloading file from S3:', error.message);
+            console.error(`❌ Error downloading file from S3 (${s3Key}):`, error.message);
             throw error;
         }
     }

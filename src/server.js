@@ -16,6 +16,7 @@ import {
     getFileResult,
     getSystemStats
 } from "./database.js";
+import queueService from "./queue.js";
 
 dotenv.config();
 
@@ -80,6 +81,41 @@ app.get("/test-db", async (req, res) => {
         res.json({
             status: "success",
             database: result
+        });
+    } catch (error) {
+        res.status(500).json({
+            status: "error",
+            message: error.message
+        });
+    }
+});
+
+// Redis connection test
+app.get("/test-redis", async (req, res) => {
+    try {
+        const result = await queueService.testConnection();
+        res.json({
+            status: "success",
+            redis: {
+                connected: result,
+                message: result ? "Redis connection successful" : "Redis connection failed"
+            }
+        });
+    } catch (error) {
+        res.status(500).json({
+            status: "error",
+            message: error.message
+        });
+    }
+});
+
+// Queue statistics
+app.get("/queue-stats", async (req, res) => {
+    try {
+        const stats = await queueService.getQueueStats();
+        res.json({
+            status: "success",
+            queue: stats
         });
     } catch (error) {
         res.status(500).json({
@@ -215,6 +251,10 @@ app.post("/jobs/:id/files", upload.array("files", 10), async (req, res) => {
                 s3FileInfo?.s3Key || null,
                 s3FileInfo?.fileHash || null
             );
+
+            // Add file to processing queue
+            await queueService.addFileToQueue(fileRecord.id, jobId);
+            console.log(`✅ File ${fileRecord.id} added to processing queue`);
 
             addedFiles.push({
                 id: fileRecord.id,
