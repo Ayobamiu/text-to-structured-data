@@ -125,6 +125,106 @@ app.get("/queue-stats", async (req, res) => {
     }
 });
 
+// Queue analytics endpoint
+app.get("/queue-analytics", async (req, res) => {
+    try {
+        const analytics = await queueService.getQueueAnalytics();
+        res.json({
+            status: "success",
+            analytics
+        });
+    } catch (error) {
+        res.status(500).json({
+            status: "error",
+            message: error.message
+        });
+    }
+});
+
+// Pause queue endpoint
+app.post("/queue/pause", async (req, res) => {
+    try {
+        await queueService.pauseQueue();
+        res.json({
+            status: "success",
+            message: "Queue paused"
+        });
+    } catch (error) {
+        res.status(500).json({
+            status: "error",
+            message: error.message
+        });
+    }
+});
+
+// Resume queue endpoint
+app.post("/queue/resume", async (req, res) => {
+    try {
+        await queueService.resumeQueue();
+        res.json({
+            status: "success",
+            message: "Queue resumed"
+        });
+    } catch (error) {
+        res.status(500).json({
+            status: "error",
+            message: error.message
+        });
+    }
+});
+
+// Clear queue endpoint
+app.post("/queue/clear", async (req, res) => {
+    try {
+        await queueService.clearQueue();
+        res.json({
+            status: "success",
+            message: "Queue cleared"
+        });
+    } catch (error) {
+        res.status(500).json({
+            status: "error",
+            message: error.message
+        });
+    }
+});
+
+// Remove specific file from queue
+app.delete("/queue/files/:fileId", async (req, res) => {
+    try {
+        const { fileId } = req.params;
+        await queueService.removeFileFromQueue(fileId);
+        res.json({
+            status: "success",
+            message: `File ${fileId} removed from queue`
+        });
+    } catch (error) {
+        res.status(500).json({
+            status: "error",
+            message: error.message
+        });
+    }
+});
+
+// Get queue status (paused/resumed)
+app.get("/queue/status", async (req, res) => {
+    try {
+        const isPaused = await queueService.isQueuePaused();
+        res.json({
+            status: "success",
+            queueStatus: {
+                paused: isPaused,
+                status: isPaused ? "paused" : "running"
+            }
+        });
+    } catch (error) {
+        res.status(500).json({
+            status: "error",
+            message: error.message
+        });
+    }
+});
+
 // System statistics
 app.get("/system-stats", async (req, res) => {
     try {

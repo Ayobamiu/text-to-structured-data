@@ -87,6 +87,14 @@ class FileProcessorWorker {
     async pollQueue() {
         while (this.isRunning) {
             try {
+                // Check if queue is paused
+                const isPaused = await queueService.isQueuePaused();
+                if (isPaused) {
+                    console.log('⏸️ Queue is paused, waiting...');
+                    await new Promise(resolve => setTimeout(resolve, WORKER_INTERVAL_MS));
+                    continue;
+                }
+
                 const queueItem = await queueService.getNextFile();
                 if (queueItem) {
                     await this.processFile(queueItem);

@@ -199,17 +199,59 @@ class QueueService {
                 }
             }).filter(Boolean);
 
+            // Get processing files details
+            const processingFiles = await this.getProcessingFiles();
+
+            // Get queue health metrics
+            const oldestItem = await client.zRange(this.queueKey, 0, 0, { REV: false, WITHSCORES: true });
+            const newestItem = await client.zRange(this.queueKey, -1, -1, { REV: false, WITHSCORES: true });
+
+            const oldestTimestamp = oldestItem.length > 0 ? oldestItem[0].score : null;
+            const newestTimestamp = newestItem.length > 0 ? newestItem[0].score : null;
+
+            const avgWaitTime = oldestTimestamp ? Date.now() - oldestTimestamp : 0;
+
             return {
                 queueSize,
                 processingCount,
                 nextFiles,
+                processingFiles,
                 maxRetries: this.maxRetries,
-                retryDelay: this.retryDelay
+                retryDelay: this.retryDelay,
+                metrics: {
+                    avgWaitTimeMs: avgWaitTime,
+                    oldestItemAge: oldestTimestamp ? Date.now() - oldestTimestamp : 0,
+                    queueHealth: this.calculateQueueHealth(queueSize, processingCount, avgWaitTime)
+                }
             };
         } catch (error) {
             console.error('❌ Error getting queue stats:', error.message);
             throw error;
         }
+    }
+
+    // Calculate queue health score
+    calculateQueueHealth(queueSize, processingCount, avgWaitTime) {
+        let healthScore = 100;
+
+        // Penalize high queue size
+        if (queueSize > 100) healthScore -= 20;
+        else if (queueSize > 50) healthScore -= 10;
+
+        // Penalize high processing count (potential bottleneck)
+        if (processingCount > 10) healthScore -= 15;
+        else if (processingCount > 5) healthScore -= 5;
+
+        // Penalize long wait times
+        if (avgWaitTime > 300000) healthScore -= 25; // 5 minutes
+        else if (avgWaitTime > 60000) healthScore -= 10; // 1 minute
+
+        const health = Math.max(0, healthScore);
+        let status = 'healthy';
+        if (health < 50) status = 'critical';
+        else if (health < 75) status = 'warning';
+
+        return { score: health, status };
     }
 
     // Clear queue (for testing)
@@ -221,6 +263,110 @@ class QueueService {
             console.log('🗑️ Queue cleared');
         } catch (error) {
             console.error('❌ Error clearing queue:', error.message);
+            throw error;
+        }
+    }
+
+    // Pause queue processing
+    async pauseQueue() {
+        try {
+            const client = await this.connect();
+            await client.set('queue_paused', 'true');
+            console.log('⏸️ Queue paused');
+        } catch (error) {
+            console.error('❌ Error pausing queue:', error.message);
+            throw error;
+        }
+    }
+
+    // Resume queue processing
+    async resumeQueue() {
+        try {
+            const client = await this.connect();
+            await client.del('queue_paused');
+            console.log('▶️ Queue resumed');
+        } catch (error) {
+            console.error('❌ Error resuming queue:', error.message);
+            throw error;
+        }
+    }
+
+    // Check if queue is paused
+    async isQueuePaused() {
+        try {
+            const client = await this.connect();
+            const paused = await client.get('queue_paused');
+            return paused === 'true';
+        } catch (error) {
+            console.error('❌ Error checking queue status:', error.message);
+            return false;
+        }
+    }
+
+    // Remove specific file from queue
+    async removeFileFromQueue(fileId) {
+        try {
+            const client = await this.connect();
+
+            // Remove from main queue
+            const queueItems = await client.zRange(this.queueKey, 0, -1);
+            for (const item of queueItems) {
+                try {
+                    const data = JSON.parse(item);
+                    if (data.fileId === fileId) {
+                        await client.zRem(this.queueKey, item);
+                        break;
+                    }
+                } catch (e) {
+                    // Skip invalid items
+                }
+            }
+
+            // Remove from processing set
+            await client.hDel(this.processingKey, fileId);
+
+            console.log(`🗑️ File ${fileId} removed from queue`);
+        } catch (error) {
+            console.error('❌ Error removing file from queue:', error.message);
+            throw error;
+        }
+    }
+
+    // Get detailed queue analytics
+    async getQueueAnalytics() {
+        try {
+            const client = await this.connect();
+
+            // Get queue size over time (simplified)
+            const queueSize = await client.zCard(this.queueKey);
+            const processingCount = await client.hLen(this.processingKey);
+
+            // Get processing files with timestamps
+            const processingFiles = await this.getProcessingFiles();
+
+            // Calculate processing times
+            const now = Date.now();
+            const processingTimes = processingFiles.map(file => {
+                if (file.timestamp) {
+                    return now - file.timestamp;
+                }
+                return 0;
+            });
+
+            const avgProcessingTime = processingTimes.length > 0
+                ? processingTimes.reduce((a, b) => a + b, 0) / processingTimes.length
+                : 0;
+
+            return {
+                queueSize,
+                processingCount,
+                avgProcessingTimeMs: avgProcessingTime,
+                processingFiles: processingFiles.length,
+                queueUtilization: processingCount > 0 ? (processingCount / (processingCount + queueSize)) * 100 : 0,
+                timestamp: now
+            };
+        } catch (error) {
+            console.error('❌ Error getting queue analytics:', error.message);
             throw error;
         }
     }
