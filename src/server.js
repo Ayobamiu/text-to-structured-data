@@ -3,6 +3,7 @@ import multer from "multer";
 import axios from "axios";
 import OpenAI from "openai";
 import dotenv from "dotenv";
+import cors from "cors";
 import S3Service from "./s3Service.js";
 import {
     testConnection,
@@ -32,7 +33,23 @@ const FLASK_URL = process.env.FLASK_URL || "http://localhost:5001";
 // Initialize S3 service
 const s3Service = new S3Service();
 
-app.use(express.json());
+// CORS configuration
+app.use(cors({
+    origin: ['http://localhost:3001', 'http://localhost:3002', 'http://localhost:8080'],
+    credentials: true,
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization']
+}));
+
+// Apply JSON parsing only to specific routes (not multipart routes)
+app.use('/jobs', express.json());
+app.use('/queue', express.json());
+app.use('/system-stats', express.json());
+app.use('/test-db', express.json());
+app.use('/test-redis', express.json());
+app.use('/test-s3', express.json());
+app.use('/storage-stats', express.json());
+app.use('/files', express.json());
 
 // Health check
 app.get("/health", (req, res) => {
@@ -424,8 +441,15 @@ app.post("/extract", upload.single("file"), async (req, res) => {
     try {
         console.log("=== EXTRACT ENDPOINT CALLED ===");
         console.log(`Request method: ${req.method}`);
+        console.log(`Request URL: ${req.url}`);
+        console.log(`Request headers: ${JSON.stringify(req.headers)}`);
         console.log(`Request files: ${req.file ? req.file.originalname : 'none'}`);
-        console.log(`Request body keys: ${Object.keys(req.body)}`);
+        console.log(`Request body keys: ${req.body ? Object.keys(req.body) : 'no body'}`);
+
+        if (!req.body) {
+            console.error("No request body provided");
+            return res.status(400).json({ error: "No request body provided" });
+        }
 
         const { schema, schemaName, jobName } = req.body;
 
