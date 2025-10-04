@@ -40,6 +40,7 @@ CREATE TABLE IF NOT EXISTS job_files (
     processing_status VARCHAR(50) NOT NULL DEFAULT 'pending',
     extracted_text TEXT,
     extracted_tables JSONB,
+    markdown TEXT, -- Markdown formatted content from Document AI + V3 converter
     result JSONB,
     extraction_error TEXT,
     processing_error TEXT,

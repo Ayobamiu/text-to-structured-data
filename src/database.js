@@ -114,7 +114,7 @@ export async function getJobStatus(jobId) {
         // Get job files
         const filesQuery = `
             SELECT id, filename, size, s3_key, file_hash, extraction_status, 
-                   processing_status, extracted_text, extracted_tables, result, 
+                   processing_status, extracted_text, extracted_tables, markdown, result, 
                    extraction_error, processing_error, created_at, processed_at
             FROM job_files WHERE job_id = $1
             ORDER BY created_at
@@ -151,18 +151,18 @@ export async function getJobStatus(jobId) {
 }
 
 // Update file extraction status
-export async function updateFileExtractionStatus(fileId, status, extractedText = null, extractedTables = null, error = null) {
+export async function updateFileExtractionStatus(fileId, status, extractedText = null, extractedTables = null, markdown = null, error = null) {
     const client = await pool.connect();
     try {
         const query = `
             UPDATE job_files 
             SET extraction_status = $1, extracted_text = $2, extracted_tables = $3, 
-                extraction_error = $4, updated_at = NOW()
-            WHERE id = $5
+                markdown = $4, extraction_error = $5, updated_at = NOW()
+            WHERE id = $6
             RETURNING id, job_id, filename
         `;
 
-        const values = [status, extractedText, extractedTables ? JSON.stringify(extractedTables) : null, error, fileId];
+        const values = [status, extractedText, extractedTables ? JSON.stringify(extractedTables) : null, markdown, error, fileId];
         const result = await client.query(query, values);
 
         if (result.rows.length === 0) {
@@ -277,7 +277,7 @@ export async function getFileResult(fileId) {
     const client = await pool.connect();
     try {
         const query = `
-            SELECT jf.id, jf.filename, jf.result, jf.extracted_text, jf.extracted_tables,
+            SELECT jf.id, jf.filename, jf.result, jf.extracted_text, jf.extracted_tables, jf.markdown,
                    jf.extraction_status, jf.processing_status, jf.extraction_error, jf.processing_error, jf.processed_at,
                    j.name as job_name, j.schema_data
             FROM job_files jf

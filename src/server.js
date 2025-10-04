@@ -532,15 +532,26 @@ async function processFilesAsync(job, files, schema, schemaName) {
                     throw new Error(`Flask extraction failed: ${flaskResponse.data.error}`);
                 }
 
-                const extractedText = flaskResponse.data.data.pages.map((page) => page.text).join("\n\n");
-                console.log(`Extracted text length: ${extractedText.length} characters`);
+                // Extract document data from Flask response
+                const documentData = flaskResponse.data.data;
+                const markdown = documentData.markdown || "";
+                const rawText = documentData.full_text || "";
+                const pages = documentData.pages || [];
+                const tables = documentData.tables || [];
+
+                console.log(`Document structure: ${pages.length} pages, ${tables.length} tables, ${rawText.length} chars raw text, ${markdown.length} chars markdown`);
+
+                // Use markdown if available, otherwise fallback to raw_text, then concatenated page text
+                const extractedText = markdown || rawText || pages.map((page) => page.text).join("\n\n");
+                console.log(`Using ${markdown ? 'markdown' : rawText ? 'raw_text' : 'concatenated pages'} - length: ${extractedText.length} characters`);
 
                 // Step 3: Update file extraction status to completed
                 await updateFileExtractionStatus(
                     fileRecord.id,
                     'completed',
                     extractedText,
-                    flaskResponse.data.data.tables || null
+                    tables || null,
+                    markdown || null
                 );
 
                 // Emit extraction completed event
@@ -556,18 +567,23 @@ async function processFilesAsync(job, files, schema, schemaName) {
                 // Step 4: Update file processing status to processing
                 await updateFileProcessingStatus(fileRecord.id, 'processing');
 
-                // Step 5: Process extracted text with OpenAI
-                console.log(`Step 5: Processing ${file.originalname} with OpenAI...`);
+                // Step 5: Process with OpenAI using markdown content
+                console.log(`Step 5: Processing ${file.originalname} with OpenAI using markdown content...`);
+
+                // Use markdown content for better AI processing
+                const contentForAI = markdown || extractedText;
+                console.log(`Using ${markdown ? 'markdown' : 'extracted text'} for OpenAI processing (${contentForAI.length} characters)`);
+
                 const response = await openai.chat.completions.create({
                     model: "gpt-4o-2024-08-06",
                     messages: [
                         {
                             role: "system",
-                            content: "You are an expert at structured data extraction. Extract data from the provided text according to the given schema.",
+                            content: "You are an expert at structured data extraction from documents. Extract data accurately according to the provided schema, paying attention to document structure, tables, and contextual relationships.",
                         },
                         {
                             role: "user",
-                            content: `Extract data from the following text and return it in the schema format:\n\n${extractedText}`,
+                            content: `Extract structured data from this document according to the provided schema:\n\n${contentForAI}`,
                         },
                     ],
                     response_format: {
