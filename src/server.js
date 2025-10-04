@@ -4,6 +4,8 @@ import axios from "axios";
 import OpenAI from "openai";
 import dotenv from "dotenv";
 import cors from "cors";
+import { createServer } from "http";
+import { Server } from "socket.io";
 import S3Service from "./s3Service.js";
 import {
     testConnection,
@@ -22,6 +24,15 @@ import queueService from "./queue.js";
 dotenv.config();
 
 const app = express();
+const server = createServer(app);
+const io = new Server(server, {
+    cors: {
+        origin: ['http://localhost:3001', 'http://localhost:3002', 'http://localhost:8080'],
+        methods: ['GET', 'POST'],
+        credentials: true
+    }
+});
+
 const upload = multer({ dest: "uploads/" });
 const openai = new OpenAI({
     apiKey: process.env.OPENAI_API_KEY,
@@ -32,6 +43,27 @@ const FLASK_URL = process.env.FLASK_URL || "http://localhost:5001";
 
 // Initialize S3 service
 const s3Service = new S3Service();
+
+// Socket.IO connection handling
+io.on('connection', (socket) => {
+    console.log(`🔌 Client connected: ${socket.id}`);
+
+    // Join job room for real-time updates
+    socket.on('join-job', (jobId) => {
+        socket.join(`job-${jobId}`);
+        console.log(`📋 Client ${socket.id} joined job room: job-${jobId}`);
+    });
+
+    // Leave job room
+    socket.on('leave-job', (jobId) => {
+        socket.leave(`job-${jobId}`);
+        console.log(`📋 Client ${socket.id} left job room: job-${jobId}`);
+    });
+
+    socket.on('disconnect', () => {
+        console.log(`🔌 Client disconnected: ${socket.id}`);
+    });
+});
 
 // CORS configuration
 app.use(cors({
@@ -437,6 +469,13 @@ async function processFilesAsync(job, files, schema, schemaName) {
     try {
         console.log(`🔄 Starting background processing for job ${job.id} with ${files.length} files`);
 
+        // Emit job started event
+        io.to(`job-${job.id}`).emit('job-status-update', {
+            jobId: job.id,
+            status: 'processing',
+            message: `Processing ${files.length} files...`
+        });
+
         // Get existing file records for this job
         const jobDetails = await getJobStatus(job.id);
         const fileRecords = jobDetails.files;
@@ -448,6 +487,16 @@ async function processFilesAsync(job, files, schema, schemaName) {
 
             try {
                 console.log(`\n--- Processing file ${i + 1}/${files.length}: ${file.originalname} ---`);
+
+                // Emit file processing started event
+                io.to(`job-${job.id}`).emit('file-status-update', {
+                    jobId: job.id,
+                    fileId: fileRecord.id,
+                    filename: file.originalname,
+                    extraction_status: 'processing',
+                    processing_status: 'pending',
+                    message: `Starting extraction for ${file.originalname}...`
+                });
 
                 // Step 1: Update file extraction status to processing
                 console.log(`Step 1: Updating extraction status for ${file.originalname}...`);
@@ -489,6 +538,16 @@ async function processFilesAsync(job, files, schema, schemaName) {
                     flaskResponse.data.data.tables || null
                 );
 
+                // Emit extraction completed event
+                io.to(`job-${job.id}`).emit('file-status-update', {
+                    jobId: job.id,
+                    fileId: fileRecord.id,
+                    filename: file.originalname,
+                    extraction_status: 'completed',
+                    processing_status: 'processing',
+                    message: `Extraction completed for ${file.originalname}. Starting AI processing...`
+                });
+
                 // Step 4: Update file processing status to processing
                 await updateFileProcessingStatus(fileRecord.id, 'processing');
 
@@ -522,10 +581,32 @@ async function processFilesAsync(job, files, schema, schemaName) {
                 // Step 6: Update file processing status to completed
                 await updateFileProcessingStatus(fileRecord.id, 'completed', extractedData);
 
+                // Emit file processing completed event
+                io.to(`job-${job.id}`).emit('file-status-update', {
+                    jobId: job.id,
+                    fileId: fileRecord.id,
+                    filename: file.originalname,
+                    extraction_status: 'completed',
+                    processing_status: 'completed',
+                    message: `Successfully processed ${file.originalname}`,
+                    result: extractedData
+                });
+
                 console.log(`✅ Successfully processed ${file.originalname}`);
 
             } catch (fileError) {
                 console.error(`Error processing file ${file.originalname}:`, fileError.message);
+
+                // Emit file error event
+                io.to(`job-${job.id}`).emit('file-status-update', {
+                    jobId: job.id,
+                    fileId: fileRecord.id,
+                    filename: file.originalname,
+                    extraction_status: fileRecord.extraction_status === 'processing' ? 'failed' : fileRecord.extraction_status,
+                    processing_status: fileRecord.processing_status === 'processing' ? 'failed' : fileRecord.processing_status,
+                    message: `Error processing ${file.originalname}: ${fileError.message}`,
+                    error: fileError.message
+                });
 
                 // Update file status to failed
                 if (fileRecord.extraction_status === 'processing') {
@@ -552,6 +633,15 @@ async function processFilesAsync(job, files, schema, schemaName) {
 
         await updateJobStatus(job.id, jobStatus);
 
+        // Emit job completion event
+        io.to(`job-${job.id}`).emit('job-status-update', {
+            jobId: job.id,
+            status: jobStatus,
+            message: `Job completed: ${completedFiles}/${files.length} files processed successfully`,
+            completedFiles,
+            totalFiles: files.length
+        });
+
         console.log(`\n=== BACKGROUND PROCESSING COMPLETE ===`);
         console.log(`Job ID: ${job.id}`);
         console.log(`Files processed: ${completedFiles}/${files.length}`);
@@ -559,6 +649,14 @@ async function processFilesAsync(job, files, schema, schemaName) {
 
     } catch (error) {
         console.error("Background processing error:", error.message);
+
+        // Emit job error event
+        io.to(`job-${job.id}`).emit('job-status-update', {
+            jobId: job.id,
+            status: 'failed',
+            message: `Job failed: ${error.message}`,
+            error: error.message
+        });
 
         // Update job status to failed
         await updateJobStatus(job.id, 'failed');
@@ -687,7 +785,8 @@ app.post("/extract", upload.array("files", 10), async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
+server.listen(PORT, () => {
     console.log(`AI Extractor server running on port ${PORT}`);
     console.log(`Flask service URL: ${FLASK_URL}`);
+    console.log(`🔌 Socket.IO server ready for connections`);
 });
