@@ -162,7 +162,7 @@ export async function updateFileExtractionStatus(fileId, status, extractedText =
             RETURNING id, job_id, filename
         `;
 
-        const values = [status, extractedText, extractedTables, error, fileId];
+        const values = [status, extractedText, extractedTables ? JSON.stringify(extractedTables) : null, error, fileId];
         const result = await client.query(query, values);
 
         if (result.rows.length === 0) {

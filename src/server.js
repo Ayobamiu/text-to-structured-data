@@ -500,12 +500,16 @@ async function processFilesAsync(job, files, schema, schemaName) {
 
                 // Step 1: Update file extraction status to processing
                 console.log(`Step 1: Updating extraction status for ${file.originalname}...`);
+                console.log(`File record ID: ${fileRecord.id}`);
+                console.log(`File path: ${file.path}`);
+                const fs = (await import('fs')).default;
+                console.log(`File exists: ${fs.existsSync(file.path)}`);
                 await updateFileExtractionStatus(fileRecord.id, 'processing');
+                console.log(`✅ Step 1 completed for ${file.originalname}`);
 
                 // Step 2: Extract text from PDF using Flask service
                 console.log(`Step 2: Calling Flask service for text extraction of ${file.originalname}...`);
                 const FormData = (await import('form-data')).default;
-                const fs = (await import('fs')).default;
 
                 const formData = new FormData();
                 formData.append("file", fs.createReadStream(file.path), {
@@ -518,6 +522,7 @@ async function processFilesAsync(job, files, schema, schemaName) {
                     headers: {
                         ...formData.getHeaders(),
                     },
+                    timeout: 600000, // 10 minutes timeout for large files
                 });
 
                 console.log(`Flask response received for ${file.originalname}`);
@@ -764,7 +769,11 @@ app.post("/extract", upload.array("files", 10), async (req, res) => {
         });
 
         // Process files asynchronously in the background
-        processFilesAsync(job, req.files, schema, schemaName);
+        console.log(`🚀 Starting background processing for job ${job.id} with ${req.files.length} files`);
+        processFilesAsync(job, req.files, schema, schemaName).catch(error => {
+            console.error(`❌ Background processing failed for job ${job.id}:`, error.message);
+            console.error(`❌ Error stack:`, error.stack);
+        });
         return;
 
     } catch (error) {
