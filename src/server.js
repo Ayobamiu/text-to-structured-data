@@ -432,18 +432,151 @@ app.get("/jobs/:id/files", async (req, res) => {
     }
 });
 
-// Main extraction endpoint
-app.post("/extract", upload.single("file"), async (req, res) => {
+// Async function to process files in the background
+async function processFilesAsync(job, files, schema, schemaName) {
+    try {
+        console.log(`🔄 Starting background processing for job ${job.id} with ${files.length} files`);
+
+        // Get existing file records for this job
+        const jobDetails = await getJobStatus(job.id);
+        const fileRecords = jobDetails.files;
+
+        // Process each file
+        for (let i = 0; i < files.length; i++) {
+            const file = files[i];
+            const fileRecord = fileRecords[i]; // Use existing file record
+
+            try {
+                console.log(`\n--- Processing file ${i + 1}/${files.length}: ${file.originalname} ---`);
+
+                // Step 1: Update file extraction status to processing
+                console.log(`Step 1: Updating extraction status for ${file.originalname}...`);
+                await updateFileExtractionStatus(fileRecord.id, 'processing');
+
+                // Step 2: Extract text from PDF using Flask service
+                console.log(`Step 2: Calling Flask service for text extraction of ${file.originalname}...`);
+                const FormData = (await import('form-data')).default;
+                const fs = (await import('fs')).default;
+
+                const formData = new FormData();
+                formData.append("file", fs.createReadStream(file.path), {
+                    filename: file.originalname,
+                    contentType: file.mimetype,
+                });
+
+                console.log(`Sending request to Flask service: ${FLASK_URL}/extract`);
+                const flaskResponse = await axios.post(`${FLASK_URL}/extract`, formData, {
+                    headers: {
+                        ...formData.getHeaders(),
+                    },
+                });
+
+                console.log(`Flask response received for ${file.originalname}`);
+                console.log(`Flask response success: ${flaskResponse.data.success}`);
+
+                if (!flaskResponse.data.success) {
+                    throw new Error(`Flask extraction failed: ${flaskResponse.data.error}`);
+                }
+
+                const extractedText = flaskResponse.data.data.pages.map((page) => page.text).join("\n\n");
+                console.log(`Extracted text length: ${extractedText.length} characters`);
+
+                // Step 3: Update file extraction status to completed
+                await updateFileExtractionStatus(
+                    fileRecord.id,
+                    'completed',
+                    extractedText,
+                    flaskResponse.data.data.tables || null
+                );
+
+                // Step 4: Update file processing status to processing
+                await updateFileProcessingStatus(fileRecord.id, 'processing');
+
+                // Step 5: Process extracted text with OpenAI
+                console.log(`Step 5: Processing ${file.originalname} with OpenAI...`);
+                const response = await openai.chat.completions.create({
+                    model: "gpt-4o-2024-08-06",
+                    messages: [
+                        {
+                            role: "system",
+                            content: "You are an expert at structured data extraction. Extract data from the provided text according to the given schema.",
+                        },
+                        {
+                            role: "user",
+                            content: `Extract data from the following text and return it in the schema format:\n\n${extractedText}`,
+                        },
+                    ],
+                    response_format: {
+                        type: "json_schema",
+                        json_schema: {
+                            name: schemaName || "data_extraction",
+                            schema: JSON.parse(schema),
+                        },
+                    },
+                });
+
+                console.log(`OpenAI response received for ${file.originalname}`);
+                const extractedData = JSON.parse(response.choices[0].message.content);
+                console.log(`OpenAI processing completed for ${file.originalname}`);
+
+                // Step 6: Update file processing status to completed
+                await updateFileProcessingStatus(fileRecord.id, 'completed', extractedData);
+
+                console.log(`✅ Successfully processed ${file.originalname}`);
+
+            } catch (fileError) {
+                console.error(`Error processing file ${file.originalname}:`, fileError.message);
+
+                // Update file status to failed
+                if (fileRecord.extraction_status === 'processing') {
+                    await updateFileExtractionStatus(fileRecord.id, 'failed', null, null, fileError.message);
+                } else if (fileRecord.processing_status === 'processing') {
+                    await updateFileProcessingStatus(fileRecord.id, 'failed', null, fileError.message);
+                }
+            } finally {
+                // Clean up uploaded file
+                console.log(`Cleaning up uploaded file: ${file.path}`);
+                const fs = (await import('fs')).default;
+                fs.unlink(file.path, (err) => {
+                    if (err) console.error('Error deleting file:', err);
+                    else console.log('File cleaned up successfully');
+                });
+            }
+        }
+
+        // Update job status based on results
+        const updatedJobDetails = await getJobStatus(job.id);
+        const completedFiles = updatedJobDetails.files.filter(f => f.processing_status === 'completed').length;
+        const jobStatus = completedFiles === files.length ? 'completed' :
+            completedFiles > 0 ? 'partial' : 'failed';
+
+        await updateJobStatus(job.id, jobStatus);
+
+        console.log(`\n=== BACKGROUND PROCESSING COMPLETE ===`);
+        console.log(`Job ID: ${job.id}`);
+        console.log(`Files processed: ${completedFiles}/${files.length}`);
+        console.log(`Job status: ${jobStatus}`);
+
+    } catch (error) {
+        console.error("Background processing error:", error.message);
+
+        // Update job status to failed
+        await updateJobStatus(job.id, 'failed');
+    }
+}
+
+// Main extraction endpoint - Updated for multiple files
+app.post("/extract", upload.array("files", 10), async (req, res) => {
     let job = null;
-    let fileRecord = null;
-    let s3FileInfo = null;
+    const fileRecords = [];
+    const processedFiles = [];
 
     try {
         console.log("=== EXTRACT ENDPOINT CALLED ===");
         console.log(`Request method: ${req.method}`);
         console.log(`Request URL: ${req.url}`);
         console.log(`Request headers: ${JSON.stringify(req.headers)}`);
-        console.log(`Request files: ${req.file ? req.file.originalname : 'none'}`);
+        console.log(`Request files: ${req.files ? req.files.length : 0} files`);
         console.log(`Request body keys: ${req.body ? Object.keys(req.body) : 'no body'}`);
 
         if (!req.body) {
@@ -453,9 +586,9 @@ app.post("/extract", upload.single("file"), async (req, res) => {
 
         const { schema, schemaName, jobName } = req.body;
 
-        if (!req.file) {
-            console.error("No file provided in request");
-            return res.status(400).json({ error: "No file provided" });
+        if (!req.files || req.files.length === 0) {
+            console.error("No files provided in request");
+            return res.status(400).json({ error: "No files provided" });
         }
 
         if (!schema) {
@@ -463,7 +596,7 @@ app.post("/extract", upload.single("file"), async (req, res) => {
             return res.status(400).json({ error: "No schema provided" });
         }
 
-        console.log(`Processing file: ${req.file.originalname}`);
+        console.log(`Processing ${req.files.length} files`);
         console.log(`Schema name: ${schemaName || 'default'}`);
 
         // Step 0: Create job in database
@@ -471,113 +604,44 @@ app.post("/extract", upload.single("file"), async (req, res) => {
         job = await createJob(jobName, schema, schemaName);
         console.log(`✅ Job created: ${job.id}`);
 
-        // Step 1: Upload file to S3 (if enabled)
-        if (s3Service.isCloudStorageEnabled()) {
-            console.log("Step 1: Uploading file to S3...");
-            try {
-                s3FileInfo = await s3Service.uploadFile(req.file, job.id);
-                console.log(`✅ File uploaded to S3: ${s3FileInfo.s3Key}`);
-            } catch (s3Error) {
-                console.warn(`⚠️ S3 upload failed, continuing with local processing: ${s3Error.message}`);
+        // Step 1: Create file records immediately for better UX
+        console.log("Step 1: Creating file records...");
+        const fileRecords = [];
+        const initialFileData = [];
+
+        for (let i = 0; i < req.files.length; i++) {
+            const file = req.files[i];
+
+            // Upload to S3 first (if enabled)
+            let s3FileInfo = null;
+            if (s3Service.isCloudStorageEnabled()) {
+                try {
+                    s3FileInfo = await s3Service.uploadFile(file, job.id);
+                    console.log(`✅ File uploaded to S3: ${s3FileInfo.s3Key}`);
+                } catch (s3Error) {
+                    console.warn(`⚠️ S3 upload failed, continuing with local processing: ${s3Error.message}`);
+                }
             }
-        }
 
-        // Step 2: Add file record to database
-        console.log("Step 2: Adding file record to database...");
-        fileRecord = await addFileToJob(
-            job.id,
-            req.file.originalname,
-            req.file.size,
-            s3FileInfo?.s3Key || null,
-            s3FileInfo?.fileHash || null
-        );
-        console.log(`✅ File record created: ${fileRecord.id}`);
+            // Create file record
+            const fileRecord = await addFileToJob(
+                job.id,
+                file.originalname,
+                file.size,
+                s3FileInfo?.s3Key || null,
+                s3FileInfo?.fileHash || null
+            );
+            console.log(`✅ File record created: ${fileRecord.id}`);
 
-        // Step 3: Update file extraction status to processing
-        await updateFileExtractionStatus(fileRecord.id, 'processing');
+            fileRecords.push(fileRecord);
 
-        // Step 4: Extract text from PDF using Flask service
-        console.log("Step 4: Calling Flask service for text extraction...");
-        const FormData = (await import('form-data')).default;
-        const fs = (await import('fs')).default;
-
-        const formData = new FormData();
-        formData.append("file", fs.createReadStream(req.file.path), {
-            filename: req.file.originalname,
-            contentType: req.file.mimetype,
-        });
-
-        console.log(`Sending request to Flask service: ${FLASK_URL}/extract`);
-        const flaskResponse = await axios.post(`${FLASK_URL}/extract`, formData, {
-            headers: {
-                ...formData.getHeaders(),
-            },
-        });
-
-        console.log("Flask response received successfully");
-        console.log(`Flask response success: ${flaskResponse.data.success}`);
-
-        if (!flaskResponse.data.success) {
-            throw new Error(`Flask extraction failed: ${flaskResponse.data.error}`);
-        }
-
-        const extractedText = flaskResponse.data.data.pages.map((page) => page.text).join("\n\n");
-        console.log(`Extracted text length: ${extractedText.length} characters`);
-
-        // Step 5: Update file extraction status to completed
-        await updateFileExtractionStatus(
-            fileRecord.id,
-            'completed',
-            extractedText,
-            flaskResponse.data.data.tables || null
-        );
-
-        // Step 6: Update file processing status to processing
-        await updateFileProcessingStatus(fileRecord.id, 'processing');
-
-        // Step 7: Process with OpenAI
-        console.log("Step 7: Processing with OpenAI...");
-        const response = await openai.chat.completions.create({
-            model: "gpt-4o-2024-08-06",
-            messages: [
-                {
-                    role: "system",
-                    content: "You are an expert at structured data extraction. Extract data from the provided text according to the given schema.",
-                },
-                {
-                    role: "user",
-                    content: `Extract data from the following text and return it in the schema format:\n\n${extractedText}`,
-                },
-            ],
-            response_format: {
-                type: "json_schema",
-                json_schema: {
-                    name: schemaName || "data_extraction",
-                    schema: JSON.parse(schema),
-                },
-            },
-        });
-
-        console.log("OpenAI response received successfully");
-        const extractedData = JSON.parse(response.choices[0].message.content);
-        console.log("Data extraction completed successfully");
-
-        // Step 8: Update file processing status to completed
-        await updateFileProcessingStatus(fileRecord.id, 'completed', extractedData);
-
-        // Step 9: Update job status to completed
-        await updateJobStatus(job.id, 'completed');
-
-        console.log("Sending response to client...");
-        res.json({
-            success: true,
-            data: extractedData,
-            metadata: {
-                jobId: job.id,
+            // Add to initial response data
+            initialFileData.push({
                 fileId: fileRecord.id,
-                filename: req.file.originalname,
-                textLength: extractedText.length,
-                pagesProcessed: flaskResponse.data.data.metadata.total_pages,
+                filename: file.originalname,
+                size: file.size,
+                extraction_status: 'pending',
+                processing_status: 'pending',
                 s3Storage: s3FileInfo ? {
                     s3Key: s3FileInfo.s3Key,
                     fileUrl: s3FileInfo.fileUrl,
@@ -585,22 +649,31 @@ app.post("/extract", upload.single("file"), async (req, res) => {
                     fileHash: s3FileInfo.fileHash,
                     expiresAt: s3FileInfo.expiresAt
                 } : null
+            });
+        }
+
+        // Return jobId and file information immediately for better UX
+        res.json({
+            success: true,
+            data: initialFileData,
+            metadata: {
+                jobId: job.id,
+                totalFiles: req.files.length,
+                successfulFiles: 0,
+                failedFiles: 0,
+                jobStatus: 'processing'
             },
         });
+
+        // Process files asynchronously in the background
+        processFilesAsync(job, req.files, schema, schemaName);
+        return;
 
     } catch (error) {
         console.error("Extraction error:", error.message);
         console.error("Error stack:", error.stack);
 
-        // Update file and job status to failed
-        if (fileRecord) {
-            if (fileRecord.extraction_status === 'processing') {
-                await updateFileExtractionStatus(fileRecord.id, 'failed', null, null, error.message);
-            } else if (fileRecord.processing_status === 'processing') {
-                await updateFileProcessingStatus(fileRecord.id, 'failed', null, error.message);
-            }
-        }
-
+        // Update job status to failed
         if (job) {
             await updateJobStatus(job.id, 'failed');
         }
@@ -608,19 +681,8 @@ app.post("/extract", upload.single("file"), async (req, res) => {
         res.status(500).json({
             success: false,
             error: error.message,
-            jobId: job?.id || null,
-            fileId: fileRecord?.id || null
+            jobId: job?.id || null
         });
-    } finally {
-        // Clean up uploaded file
-        if (req.file) {
-            console.log(`Cleaning up uploaded file: ${req.file.path}`);
-            const fs = (await import('fs')).default;
-            fs.unlink(req.file.path, (err) => {
-                if (err) console.error('Error deleting file:', err);
-                else console.log('File cleaned up successfully');
-            });
-        }
     }
 });
 
