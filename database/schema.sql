@@ -7,13 +7,42 @@
 -- Enable UUID extension
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
--- Create users table (for future multi-user support)
+-- Create users table (for authentication)
 CREATE TABLE IF NOT EXISTS users (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     email VARCHAR(255) UNIQUE NOT NULL,
+    password_hash VARCHAR(255) NOT NULL,
     name VARCHAR(255) NOT NULL,
+    role VARCHAR(50) NOT NULL DEFAULT 'user',
+    email_verified BOOLEAN DEFAULT FALSE,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    last_login_at TIMESTAMP WITH TIME ZONE,
+    login_count INTEGER DEFAULT 0
+);
+
+-- Create user sessions table
+CREATE TABLE IF NOT EXISTS user_sessions (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    token VARCHAR(255) UNIQUE NOT NULL,
+    ip_address INET,
+    user_agent TEXT,
+    expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- Create audit log table
+CREATE TABLE IF NOT EXISTS audit_logs (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+    action VARCHAR(100) NOT NULL,
+    resource_type VARCHAR(100),
+    resource_id VARCHAR(255),
+    details JSONB,
+    ip_address INET,
+    user_agent TEXT,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
 -- Create jobs table
@@ -49,6 +78,20 @@ CREATE TABLE IF NOT EXISTS job_files (
     processed_at TIMESTAMP WITH TIME ZONE
 );
 
+-- Create indexes for authentication tables
+CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
+CREATE INDEX IF NOT EXISTS idx_users_role ON users(role);
+CREATE INDEX IF NOT EXISTS idx_users_created_at ON users(created_at);
+
+CREATE INDEX IF NOT EXISTS idx_user_sessions_user_id ON user_sessions(user_id);
+CREATE INDEX IF NOT EXISTS idx_user_sessions_token ON user_sessions(token);
+CREATE INDEX IF NOT EXISTS idx_user_sessions_expires_at ON user_sessions(expires_at);
+
+CREATE INDEX IF NOT EXISTS idx_audit_logs_user_id ON audit_logs(user_id);
+CREATE INDEX IF NOT EXISTS idx_audit_logs_action ON audit_logs(action);
+CREATE INDEX IF NOT EXISTS idx_audit_logs_resource_type ON audit_logs(resource_type);
+CREATE INDEX IF NOT EXISTS idx_audit_logs_created_at ON audit_logs(created_at);
+
 -- Create indexes for better performance
 CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
 CREATE INDEX IF NOT EXISTS idx_jobs_created_at ON jobs(created_at);
@@ -80,9 +123,17 @@ CREATE TRIGGER update_jobs_updated_at BEFORE UPDATE ON jobs
 CREATE TRIGGER update_job_files_updated_at BEFORE UPDATE ON job_files
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
--- Insert default user (for single-user mode)
-INSERT INTO users (id, email, name) 
-VALUES ('00000000-0000-0000-0000-000000000000', 'admin@coreextract.com', 'System Admin')
+-- Insert default admin user (for single-user mode)
+-- Password: 'admin123' (change in production!)
+INSERT INTO users (id, email, password_hash, name, role, email_verified) 
+VALUES (
+    '00000000-0000-0000-0000-000000000000', 
+    'admin@coreextract.com', 
+    '$2b$12$0DzNdPoJJMMhFNXhYgvJ7.fumPENbtWVNz.IikBXFDd5wF.qF31XW', -- 'admin123'
+    'System Admin',
+    'admin',
+    true
+)
 ON CONFLICT (id) DO NOTHING;
 
 -- Create view for job statistics

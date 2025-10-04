@@ -4,6 +4,8 @@ import axios from "axios";
 import OpenAI from "openai";
 import dotenv from "dotenv";
 import cors from "cors";
+import helmet from "helmet";
+import rateLimit from "express-rate-limit";
 import { createServer } from "http";
 import { Server } from "socket.io";
 import S3Service from "./s3Service.js";
@@ -20,6 +22,9 @@ import {
     getSystemStats
 } from "./database.js";
 import queueService from "./queue.js";
+import authRoutes from "./routes/auth.js";
+import { authenticateToken, optionalAuth, securityHeaders } from "./middleware/auth.js";
+import { rateLimitConfig } from "./auth.js";
 
 dotenv.config();
 
@@ -33,6 +38,11 @@ const io = new Server(server, {
     }
 });
 
+// Security middleware
+app.use(helmet());
+app.use(securityHeaders);
+app.use(rateLimit(rateLimitConfig));
+
 const upload = multer({ dest: "uploads/" });
 const openai = new OpenAI({
     apiKey: process.env.OPENAI_API_KEY,
@@ -43,6 +53,10 @@ const FLASK_URL = process.env.FLASK_URL || "http://localhost:5001";
 
 // Initialize S3 service
 const s3Service = new S3Service();
+
+// Authentication routes
+app.use('/auth', express.json());
+app.use('/auth', authRoutes);
 
 // Socket.IO connection handling
 io.on('connection', (socket) => {
@@ -291,7 +305,7 @@ app.get("/system-stats", async (req, res) => {
 });
 
 // List jobs
-app.get("/jobs", async (req, res) => {
+app.get("/jobs", authenticateToken, async (req, res) => {
     try {
         const { limit = 10, offset = 0 } = req.query;
         const jobs = await listJobs(parseInt(limit), parseInt(offset));
@@ -308,7 +322,7 @@ app.get("/jobs", async (req, res) => {
 });
 
 // Get job status
-app.get("/jobs/:id", async (req, res) => {
+app.get("/jobs/:id", authenticateToken, async (req, res) => {
     try {
         const { id } = req.params;
         const job = await getJobStatus(id);
@@ -333,7 +347,7 @@ app.get("/jobs/:id", async (req, res) => {
 });
 
 // Get file result
-app.get("/files/:id/result", async (req, res) => {
+app.get("/files/:id/result", authenticateToken, async (req, res) => {
     try {
         const { id } = req.params;
         const file = await getFileResult(id);
@@ -358,7 +372,7 @@ app.get("/files/:id/result", async (req, res) => {
 });
 
 // Add files to existing job
-app.post("/jobs/:id/files", upload.array("files", 10), async (req, res) => {
+app.post("/jobs/:id/files", authenticateToken, upload.array("files", 10), async (req, res) => {
     try {
         const { id: jobId } = req.params;
         const { schema, schemaName } = req.body;
@@ -437,7 +451,7 @@ app.post("/jobs/:id/files", upload.array("files", 10), async (req, res) => {
 });
 
 // List files in a job
-app.get("/jobs/:id/files", async (req, res) => {
+app.get("/jobs/:id/files", authenticateToken, async (req, res) => {
     try {
         const { id: jobId } = req.params;
         const job = await getJobStatus(jobId);
@@ -685,7 +699,7 @@ async function processFilesAsync(job, files, schema, schemaName) {
 }
 
 // Main extraction endpoint - Updated for multiple files
-app.post("/extract", upload.array("files", 10), async (req, res) => {
+app.post("/extract", authenticateToken, upload.array("files", 10), async (req, res) => {
     let job = null;
     const fileRecords = [];
     const processedFiles = [];
@@ -720,7 +734,7 @@ app.post("/extract", upload.array("files", 10), async (req, res) => {
 
         // Step 0: Create job in database
         console.log("Step 0: Creating job in database...");
-        job = await createJob(jobName, schema, schemaName);
+        job = await createJob(jobName, schema, schemaName, req.user.id);
         console.log(`✅ Job created: ${job.id}`);
 
         // Step 1: Create file records immediately for better UX
