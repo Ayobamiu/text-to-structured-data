@@ -16,7 +16,11 @@ class QueueService {
     async connect() {
         if (!this.client) {
             this.client = createClient({
-                url: this.redisUrl
+                url: this.redisUrl,
+                socket: {
+                    connectTimeout: 10000, // 10 seconds
+                    lazyConnect: true
+                }
             });
 
             this.client.on('error', (err) => {
