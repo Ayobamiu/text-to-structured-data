@@ -889,7 +889,7 @@ app.post("/extract", authenticateToken, upload.array("files", 10), async (req, r
 });
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
+server.listen(PORT, '0.0.0.0', () => {
     logger.info(`AI Extractor server running on port ${PORT}`);
     logger.info(`Flask service URL: ${FLASK_URL}`);
     logger.info(`Socket.IO server ready for connections`);
