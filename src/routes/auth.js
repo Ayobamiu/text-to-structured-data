@@ -35,8 +35,8 @@ const router = express.Router();
 router.use(securityHeaders);
 
 // Apply rate limiting to auth routes
-const authLimiter = rateLimit(authRateLimitConfig);
-router.use(authLimiter);
+// const authLimiter = rateLimit(authRateLimitConfig);
+// router.use(authLimiter);
 
 // Apply auth attempt logging
 router.use(logAuthAttempt);

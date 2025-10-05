@@ -38,10 +38,19 @@ const io = new Server(server, {
     }
 });
 
+// CORS configuration (must be before security middleware)
+app.use(cors({
+    origin: ['http://localhost:3001', 'http://localhost:3002', 'http://localhost:8080'],
+    credentials: true,
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization'],
+    optionsSuccessStatus: 200 // Some legacy browsers (IE11, various SmartTVs) choke on 204
+}));
+
 // Security middleware
 app.use(helmet());
 app.use(securityHeaders);
-app.use(rateLimit(rateLimitConfig));
+// app.use(rateLimit(rateLimitConfig));
 
 const upload = multer({ dest: "uploads/" });
 const openai = new OpenAI({
@@ -79,13 +88,6 @@ io.on('connection', (socket) => {
     });
 });
 
-// CORS configuration
-app.use(cors({
-    origin: ['http://localhost:3001', 'http://localhost:3002', 'http://localhost:8080'],
-    credentials: true,
-    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization']
-}));
 
 // Apply JSON parsing only to specific routes (not multipart routes)
 app.use('/jobs', express.json());
