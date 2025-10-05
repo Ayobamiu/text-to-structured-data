@@ -1,6 +1,7 @@
 import axios from 'axios';
 import OpenAI from 'openai';
 import dotenv from 'dotenv';
+import { io } from 'socket.io-client';
 import queueService from './queue.js';
 import {
     getJobStatus,
@@ -19,6 +20,7 @@ const openai = new OpenAI({
 const FLASK_URL = process.env.FLASK_URL || "http://localhost:5001";
 const WORKER_INTERVAL_MS = parseInt(process.env.WORKER_INTERVAL_MS || '5000'); // Poll every 5 seconds
 const MAX_RETRIES = parseInt(process.env.WORKER_MAX_RETRIES || '3');
+const SERVER_URL = process.env.SERVER_URL || "http://localhost:3000";
 
 class FileProcessorWorker {
     constructor() {
@@ -27,7 +29,49 @@ class FileProcessorWorker {
         this.errorCount = 0;
         this.startTime = new Date();
         this.s3Service = new S3Service();
+
+        // Initialize Socket.IO client for WebSocket events
+        this.socket = io(SERVER_URL, {
+            transports: ['websocket', 'polling'],
+        });
+
+        this.socket.on('connect', () => {
+            console.log('🔌 Worker connected to server:', this.socket.id);
+        });
+
+        this.socket.on('disconnect', () => {
+            console.log('🔌 Worker disconnected from server');
+        });
     }
+
+    // Helper method to emit WebSocket events
+    emitFileStatusUpdate(jobId, fileId, extractionStatus, processingStatus, message, error = null) {
+        if (this.socket && this.socket.connected) {
+            this.socket.emit('file-status-update', {
+                jobId,
+                fileId,
+                extraction_status: extractionStatus,
+                processing_status: processingStatus,
+                message,
+                error,
+                timestamp: new Date().toISOString()
+            });
+            console.log(`📡 Emitted file-status-update: ${fileId} - ${extractionStatus}/${processingStatus}`);
+        }
+    }
+
+    emitJobStatusUpdate(jobId, status, message) {
+        if (this.socket && this.socket.connected) {
+            this.socket.emit('job-status-update', {
+                jobId,
+                status,
+                message,
+                timestamp: new Date().toISOString()
+            });
+            console.log(`📡 Emitted job-status-update: ${jobId} - ${status}`);
+        }
+    }
+
     async start() {
         if (this.isRunning) {
             console.log('Worker is already running.');
@@ -134,6 +178,15 @@ class FileProcessorWorker {
             console.log(`📄 Stage 1: Extracting text from ${file.filename}`);
             await updateFileExtractionStatus(file.id, 'processing');
 
+            // Emit WebSocket event for Stage 1 start
+            this.emitFileStatusUpdate(
+                jobId,
+                file.id,
+                'processing',
+                file.processing_status || 'pending',
+                `Starting text extraction for ${file.filename}`
+            );
+
             const extractionResult = await this.extractTextFromFile(file);
 
             if (!extractionResult.success) {
@@ -149,9 +202,27 @@ class FileProcessorWorker {
             );
             console.log(`✅ File ${file.filename} extraction completed`);
 
+            // Emit WebSocket event for Stage 1 completion
+            this.emitFileStatusUpdate(
+                jobId,
+                file.id,
+                'completed',
+                file.processing_status || 'pending',
+                `Text extraction completed for ${file.filename}`
+            );
+
             // Stage 2: Process with OpenAI
             console.log(`🤖 Stage 2: Processing extracted data with OpenAI`);
             await updateFileProcessingStatus(file.id, 'processing');
+
+            // Emit WebSocket event for Stage 2 start
+            this.emitFileStatusUpdate(
+                jobId,
+                file.id,
+                'completed',
+                'processing',
+                `Starting AI processing for ${file.filename}`
+            );
             // Parse schema data if it's a string
             let schemaData = job.schema_data;
             if (typeof schemaData === 'string') {
@@ -179,6 +250,16 @@ class FileProcessorWorker {
             if (processingResult.success) {
                 await updateFileProcessingStatus(file.id, 'completed', processingResult.data);
                 console.log(`✅ File ${file.filename} processing completed successfully`);
+
+                // Emit WebSocket event for Stage 2 completion
+                this.emitFileStatusUpdate(
+                    jobId,
+                    file.id,
+                    'completed',
+                    'completed',
+                    `AI processing completed for ${file.filename}`
+                );
+
                 this.processedCount++;
             } else {
                 throw new Error(`OpenAI processing failed: ${processingResult.error}`);
@@ -200,15 +281,45 @@ class FileProcessorWorker {
                 if (retrySuccess) {
                     // Update status to reflect retry
                     await updateFileExtractionStatus(fileId, 'pending', null, null, error.message);
+
+                    // Emit WebSocket event for retry
+                    this.emitFileStatusUpdate(
+                        jobId,
+                        fileId,
+                        'pending',
+                        'pending',
+                        `Retrying file processing (attempt ${retries + 1}/${MAX_RETRIES})`,
+                        error.message
+                    );
                 } else {
                     // Max retries reached
                     await updateFileExtractionStatus(fileId, 'failed', null, null, error.message);
                     await queueService.removeFileFromProcessing(fileId);
+
+                    // Emit WebSocket event for failure
+                    this.emitFileStatusUpdate(
+                        jobId,
+                        fileId,
+                        'failed',
+                        'failed',
+                        `File processing failed after ${MAX_RETRIES} attempts`,
+                        error.message
+                    );
                 }
             } else {
                 console.error(`❌ Max retries reached for file ${fileId}. Marking as failed.`);
                 await updateFileExtractionStatus(fileId, 'failed', null, null, error.message);
                 await queueService.removeFileFromProcessing(fileId);
+
+                // Emit WebSocket event for failure
+                this.emitFileStatusUpdate(
+                    jobId,
+                    fileId,
+                    'failed',
+                    'failed',
+                    `File processing failed after ${MAX_RETRIES} attempts`,
+                    error.message
+                );
             }
         }
     }

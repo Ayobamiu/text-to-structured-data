@@ -94,6 +94,21 @@ io.on('connection', (socket) => {
     socket.on('disconnect', () => {
         console.log(`🔌 Client disconnected: ${socket.id}`);
     });
+
+    // Handle events from worker process
+    socket.on('file-status-update', (data) => {
+        console.log(`📡 Received file-status-update from worker:`, data);
+        // Broadcast to all clients in the job room
+        io.to(`job-${data.jobId}`).emit('file-status-update', data);
+        console.log(`📡 Broadcasted file-status-update to job-${data.jobId}`);
+    });
+
+    socket.on('job-status-update', (data) => {
+        console.log(`📡 Received job-status-update from worker:`, data);
+        // Broadcast to all clients in the job room
+        io.to(`job-${data.jobId}`).emit('job-status-update', data);
+        console.log(`📡 Broadcasted job-status-update to job-${data.jobId}`);
+    });
 });
 
 
