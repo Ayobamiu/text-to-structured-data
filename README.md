@@ -1,117 +1,277 @@
-# AI Data Extractor
+# AI Extractor Backend
 
-A minimal Node.js API that integrates with the Flask PDF extraction service to provide structured data extraction using OpenAI.
+A production-ready Node.js backend service for AI-powered document extraction with multi-tenant support, real-time processing, and comprehensive monitoring.
 
-## Features
+## 🚀 Features
 
-- **File Upload**: Accepts PDF files via multipart form data
-- **Schema-Driven**: Uses JSON schemas to define extraction structure
-- **Flask Integration**: Calls the Python microservice for PDF text extraction
-- **OpenAI Processing**: Uses GPT-4 for structured data extraction
-- **Minimal Design**: Clean, focused API with standard practices
-- **Comprehensive Logging**: Detailed request/response logging for debugging
+- **AI-Powered Extraction**: OpenAI GPT-4 integration for intelligent document processing
+- **Multi-Tenant Architecture**: Organization-based data isolation and user management
+- **Real-Time Processing**: WebSocket-based live updates and Redis queue management
+- **Cloud Storage**: AWS S3 integration for scalable file storage
+- **Authentication & Security**: JWT-based auth with bcrypt password hashing
+- **Database Management**: PostgreSQL with automated migrations
+- **Health Monitoring**: Comprehensive health checks and metrics
+- **Production Ready**: Docker containerization with CI/CD pipeline
 
-## Project Structure
+## 📋 Prerequisites
+
+- Node.js 18+ and npm 8+
+- PostgreSQL 15+
+- Redis 7+
+- AWS S3 bucket
+- OpenAI API key
+- Docker (optional)
+
+## 🛠️ Installation
+
+### Local Development
+
+1. **Clone the repository**
+
+   ```bash
+   git clone https://github.com/your-org/ai-extractor-backend.git
+   cd ai-extractor-backend
+   ```
+
+2. **Install dependencies**
+
+   ```bash
+   npm install
+   ```
+
+3. **Set up environment variables**
+
+   ```bash
+   cp env.example .env
+   # Edit .env with your configuration
+   ```
+
+4. **Start dependencies**
+
+   ```bash
+   docker-compose up -d postgres redis
+   ```
+
+5. **Run database migrations**
+
+   ```bash
+   npm run migrate
+   ```
+
+6. **Start the application**
+
+   ```bash
+   # Start API server
+   npm run dev
+
+   # Start worker (in another terminal)
+   npm run worker:dev
+   ```
+
+### Docker Deployment
+
+1. **Build and run with Docker Compose**
+
+   ```bash
+   docker-compose -f docker-compose.production.yml up -d
+   ```
+
+2. **Or build individual images**
+
+   ```bash
+   # Build API image
+   docker build -t ai-extractor-backend .
+
+   # Run container
+   docker run -p 3000:3000 --env-file .env ai-extractor-backend
+   ```
+
+## 🔧 Configuration
+
+### Environment Variables
+
+| Variable                | Description        | Default                 | Required |
+| ----------------------- | ------------------ | ----------------------- | -------- |
+| `NODE_ENV`              | Environment mode   | `development`           | No       |
+| `PORT`                  | Server port        | `3000`                  | No       |
+| `DB_HOST`               | PostgreSQL host    | `localhost`             | Yes      |
+| `DB_PORT`               | PostgreSQL port    | `5432`                  | Yes      |
+| `DB_NAME`               | Database name      | `ai_extractor`          | Yes      |
+| `DB_USER`               | Database user      | `postgres`              | Yes      |
+| `DB_PASSWORD`           | Database password  | -                       | Yes      |
+| `REDIS_HOST`            | Redis host         | `localhost`             | Yes      |
+| `REDIS_PORT`            | Redis port         | `6379`                  | Yes      |
+| `FLASK_URL`             | Flask service URL  | `http://localhost:5001` | Yes      |
+| `OPENAI_API_KEY`        | OpenAI API key     | -                       | Yes      |
+| `AWS_REGION`            | AWS region         | `us-east-1`             | Yes      |
+| `AWS_ACCESS_KEY_ID`     | AWS access key     | -                       | Yes      |
+| `AWS_SECRET_ACCESS_KEY` | AWS secret key     | -                       | Yes      |
+| `S3_BUCKET_NAME`        | S3 bucket name     | -                       | Yes      |
+| `JWT_SECRET`            | JWT signing secret | -                       | Yes      |
+| `API_KEY`               | API access key     | -                       | Yes      |
+
+### Database Schema
+
+The application uses PostgreSQL with the following main tables:
+
+- `users` - User accounts and authentication
+- `organizations` - Multi-tenant organization data
+- `user_organization_memberships` - User-organization relationships
+- `jobs` - Document processing jobs
+- `job_files` - Individual files within jobs
+- `user_sessions` - Active user sessions
+- `audit_logs` - Security and activity logging
+
+## 📡 API Endpoints
+
+### Authentication
+
+- `POST /auth/register` - User registration
+- `POST /auth/login` - User login
+- `POST /auth/logout` - User logout
+- `POST /auth/refresh` - Token refresh
+
+### Organizations
+
+- `GET /organizations` - List user organizations
+- `POST /organizations` - Create organization
+- `GET /organizations/:id/members` - List organization members
+
+### Jobs
+
+- `GET /jobs` - List user jobs
+- `POST /jobs` - Create new job
+- `GET /jobs/:id` - Get job details
+- `POST /jobs/:id/files` - Add files to job
+
+### Health & Monitoring
+
+- `GET /health` - Health check
+- `GET /ready` - Readiness probe
+- `GET /live` - Liveness probe
+
+## 🔄 Processing Flow
+
+1. **File Upload**: Users upload documents via API
+2. **S3 Storage**: Files stored in AWS S3 with unique keys
+3. **Queue Processing**: Files added to Redis queue for processing
+4. **Text Extraction**: Flask service extracts text using Google Document AI
+5. **AI Processing**: OpenAI processes extracted text with user schema
+6. **Real-Time Updates**: WebSocket events notify frontend of progress
+7. **Result Storage**: Structured data stored in PostgreSQL
+
+## 🏗️ Architecture
 
 ```
-ai/
-├── src/
-│   ├── data/
-│   │   ├── example_schema.json          # Example extraction schema
-│   │   └── mgs_well_data_schema.json    # Well log specific schema
-│   └── server.js                        # Main Express server
-├── package.json                         # Dependencies
-├── README.md                           # This file
-└── .gitignore                          # Git ignore rules
+┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
+│   Frontend      │    │   API Server    │    │   Worker        │
+│   (Next.js)     │◄──►│   (Express)      │◄──►│   (Node.js)     │
+└─────────────────┘    └─────────────────┘    └─────────────────┘
+                              │                        │
+                              ▼                        ▼
+                       ┌─────────────────┐    ┌─────────────────┐
+                       │   PostgreSQL     │    │   Flask Service  │
+                       │   Database       │    │   (PDF Extract)  │
+                       └─────────────────┘    └─────────────────┘
+                              │
+                              ▼
+                       ┌─────────────────┐
+                       │   Redis Queue   │
+                       │   & Cache       │
+                       └─────────────────┘
+                              │
+                              ▼
+                       ┌─────────────────┐
+                       │   AWS S3        │
+                       │   File Storage   │
+                       └─────────────────┘
 ```
 
-## Installation
+## 🧪 Testing
 
 ```bash
-npm install
+# Run all tests
+npm test
+
+# Run tests in watch mode
+npm run test:watch
+
+# Run tests with coverage
+npm run test:coverage
 ```
 
-## Usage
+## 📊 Monitoring
 
-### Start the server:
+### Health Checks
 
-```bash
-npm start
-# or
-node src/server.js
-```
+- **Health**: `GET /health` - Comprehensive service health
+- **Readiness**: `GET /ready` - Service readiness for traffic
+- **Liveness**: `GET /live` - Service liveness check
 
-Server runs on `http://localhost:3000`
+### Logging
 
-### API Endpoints
+- Structured JSON logging with Pino
+- Log levels: `error`, `warn`, `info`, `debug`
+- Request/response logging middleware
+- Error tracking and alerting
 
-#### Health Check
+### Metrics
 
-```bash
-GET /health
-```
+- Request duration and count
+- Database connection pool status
+- Redis queue metrics
+- Worker processing statistics
 
-#### Extract Data
+## 🚀 Deployment
 
-```bash
-POST /extract
-Content-Type: multipart/form-data
-Body:
-  - file: PDF file
-  - schema: JSON schema string
-  - schemaName: Schema name (optional)
-```
+### Production Checklist
 
-### Example Request
+- [ ] Environment variables configured
+- [ ] Database migrations applied
+- [ ] SSL certificates installed
+- [ ] Monitoring and alerting set up
+- [ ] Backup strategy implemented
+- [ ] Security scanning completed
+- [ ] Load testing performed
 
-```bash
-curl -X POST http://localhost:3000/extract \
-  -F "file=@document.pdf" \
-  -F "schema={\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"string\"},\"content\":{\"type\":\"string\"}},\"required\":[\"title\",\"content\"]}" \
-  -F "schemaName=document_extraction"
-```
+### Scaling Considerations
 
-### Example Schema Files
+- **Horizontal Scaling**: Multiple API server instances behind load balancer
+- **Worker Scaling**: Multiple worker processes for queue processing
+- **Database**: Read replicas for read-heavy operations
+- **Redis**: Redis Cluster for high availability
+- **Storage**: S3 with CloudFront CDN for global distribution
 
-- `src/data/example_schema.json` - General purpose extraction schema
-- `src/data/mgs_well_data_schema.json` - Well log specific schema
+## 🔒 Security
 
-### Example Response
+- JWT-based authentication with refresh tokens
+- Password hashing with bcrypt
+- Rate limiting and request validation
+- CORS configuration for production domains
+- Helmet.js security headers
+- Input sanitization and validation
+- SQL injection prevention
+- XSS protection
 
-```json
-{
-  "success": true,
-  "data": {
-    "title": "Document Title",
-    "content": "Extracted content..."
-  },
-  "metadata": {
-    "filename": "document.pdf",
-    "textLength": 1234,
-    "pagesProcessed": 5
-  }
-}
-```
+## 🤝 Contributing
 
-## Environment Variables
+1. Fork the repository
+2. Create a feature branch (`git checkout -b feature/amazing-feature`)
+3. Commit your changes (`git commit -m 'Add amazing feature'`)
+4. Push to the branch (`git push origin feature/amazing-feature`)
+5. Open a Pull Request
 
-```env
-OPENAI_API_KEY=your_openai_api_key
-FLASK_URL=http://localhost:5001
-PORT=3000
-```
+## 📄 License
 
-## Architecture
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
-1. **File Upload**: Receives PDF + schema via multipart form
-2. **Text Extraction**: Calls Flask service `/extract-text` endpoint
-3. **AI Processing**: Sends extracted text + schema to OpenAI
-4. **Response**: Returns structured data in JSON format
+## 🆘 Support
 
-## Dependencies
+- **Documentation**: [Wiki](https://github.com/your-org/ai-extractor-backend/wiki)
+- **Issues**: [GitHub Issues](https://github.com/your-org/ai-extractor-backend/issues)
+- **Discussions**: [GitHub Discussions](https://github.com/your-org/ai-extractor-backend/discussions)
 
-- **express**: Web framework
-- **multer**: File upload handling
-- **axios**: HTTP client for Flask communication
-- **openai**: OpenAI API client
-- **form-data**: Multipart form data handling
+## 🔗 Related Projects
+
+- [PDF Extractor Service](https://github.com/your-org/pdf-extractor-service) - Flask microservice for PDF processing
+- [Document Extractor Frontend](https://github.com/your-org/document-extractor-frontend) - Next.js web application

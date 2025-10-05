@@ -27,8 +27,10 @@ import { getUserOrganizations } from "./database/userOrganizationMemberships.js"
 import queueService from "./queue.js";
 import authRoutes from "./routes/auth.js";
 import organizationRoutes from "./routes/organizations.js";
+import healthRoutes from "./routes/health.js";
 import { authenticateToken, optionalAuth, securityHeaders } from "./middleware/auth.js";
 import { rateLimitConfig } from "./auth.js";
+import logger from "./utils/logger.js";
 
 dotenv.config();
 
@@ -75,39 +77,42 @@ app.use('/auth', authRoutes);
 app.use('/organizations', express.json());
 app.use('/organizations', organizationRoutes);
 
+// Health check routes (no auth required)
+app.use('/', healthRoutes);
+
 // Socket.IO connection handling
 io.on('connection', (socket) => {
-    console.log(`🔌 Client connected: ${socket.id}`);
+    logger.info(`Client connected: ${socket.id}`);
 
     // Join job room for real-time updates
     socket.on('join-job', (jobId) => {
         socket.join(`job-${jobId}`);
-        console.log(`📋 Client ${socket.id} joined job room: job-${jobId}`);
+        logger.info(`Client ${socket.id} joined job room: job-${jobId}`);
     });
 
     // Leave job room
     socket.on('leave-job', (jobId) => {
         socket.leave(`job-${jobId}`);
-        console.log(`📋 Client ${socket.id} left job room: job-${jobId}`);
+        logger.info(`Client ${socket.id} left job room: job-${jobId}`);
     });
 
     socket.on('disconnect', () => {
-        console.log(`🔌 Client disconnected: ${socket.id}`);
+        logger.info(`Client disconnected: ${socket.id}`);
     });
 
     // Handle events from worker process
     socket.on('file-status-update', (data) => {
-        console.log(`📡 Received file-status-update from worker:`, data);
+        logger.info(`Received file-status-update from worker:`, data);
         // Broadcast to all clients in the job room
         io.to(`job-${data.jobId}`).emit('file-status-update', data);
-        console.log(`📡 Broadcasted file-status-update to job-${data.jobId}`);
+        logger.info(`Broadcasted file-status-update to job-${data.jobId}`);
     });
 
     socket.on('job-status-update', (data) => {
-        console.log(`📡 Received job-status-update from worker:`, data);
+        logger.info(`Received job-status-update from worker:`, data);
         // Broadcast to all clients in the job room
         io.to(`job-${data.jobId}`).emit('job-status-update', data);
-        console.log(`📡 Broadcasted job-status-update to job-${data.jobId}`);
+        logger.info(`Broadcasted job-status-update to job-${data.jobId}`);
     });
 });
 
@@ -885,7 +890,7 @@ app.post("/extract", authenticateToken, upload.array("files", 10), async (req, r
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-    console.log(`AI Extractor server running on port ${PORT}`);
-    console.log(`Flask service URL: ${FLASK_URL}`);
-    console.log(`🔌 Socket.IO server ready for connections`);
+    logger.info(`AI Extractor server running on port ${PORT}`);
+    logger.info(`Flask service URL: ${FLASK_URL}`);
+    logger.info(`Socket.IO server ready for connections`);
 });
