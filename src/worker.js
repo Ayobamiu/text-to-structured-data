@@ -248,7 +248,7 @@ class FileProcessorWorker {
             );
 
             if (processingResult.success) {
-                await updateFileProcessingStatus(file.id, 'completed', processingResult.data);
+                await updateFileProcessingStatus(file.id, 'completed', processingResult.data, null, processingResult.metadata);
                 console.log(`✅ File ${file.filename} processing completed successfully`);
 
                 // Emit WebSocket event for Stage 2 completion
@@ -441,8 +441,8 @@ class FileProcessorWorker {
             console.log('✅ OpenAI processing completed');
             return {
                 success: true,
-                data: {
-                    extracted_data: extractedData,
+                data: extractedData, // Store only the pure extracted data
+                metadata: {
                     text_length: text.length,
                     processing_time: new Date().toISOString()
                 }

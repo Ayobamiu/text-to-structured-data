@@ -118,6 +118,7 @@ CREATE TABLE IF NOT EXISTS job_files (
     extracted_tables JSONB,
     markdown TEXT, -- Markdown formatted content from Document AI + V3 converter
     result JSONB,
+    processing_metadata JSONB,
     extraction_error TEXT,
     processing_error TEXT,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),

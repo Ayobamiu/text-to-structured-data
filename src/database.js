@@ -116,7 +116,7 @@ export async function getJobStatus(jobId) {
         const filesQuery = `
             SELECT id, filename, size, s3_key, file_hash, extraction_status, 
                    processing_status, extracted_text, extracted_tables, markdown, result, 
-                   extraction_error, processing_error, created_at, processed_at
+                   processing_metadata, extraction_error, processing_error, created_at, processed_at
             FROM job_files WHERE job_id = $1
             ORDER BY created_at
         `;
@@ -181,19 +181,19 @@ export async function updateFileExtractionStatus(fileId, status, extractedText =
 }
 
 // Update file processing status
-export async function updateFileProcessingStatus(fileId, status, result = null, error = null) {
+export async function updateFileProcessingStatus(fileId, status, result = null, error = null, metadata = null) {
     const client = await pool.connect();
     try {
         const query = `
             UPDATE job_files 
             SET processing_status = $1, result = $2, processing_error = $3, 
-                processed_at = $4, updated_at = NOW()
-            WHERE id = $5
+                processed_at = $4, processing_metadata = $5, updated_at = NOW()
+            WHERE id = $6
             RETURNING id, job_id, filename
         `;
 
         const processedAt = status === 'completed' || status === 'failed' ? new Date() : null;
-        const values = [status, result ? JSON.stringify(result) : null, error, processedAt, fileId];
+        const values = [status, result ? JSON.stringify(result) : null, error, processedAt, metadata ? JSON.stringify(metadata) : null, fileId];
         const queryResult = await client.query(query, values);
 
         if (queryResult.rows.length === 0) {
