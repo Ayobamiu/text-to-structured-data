@@ -432,3 +432,48 @@ export async function getUserStats(userId) {
         client.release();
     }
 }
+
+// --- Audit Logging ---
+
+export async function createAuditLog(userId, action, resourceType = null, resourceId = null, details = null, ipAddress = null, userAgent = null) {
+    const client = await pool.connect();
+    try {
+        const query = `
+            INSERT INTO audit_logs (user_id, action, resource_type, resource_id, details, ip_address, user_agent)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            RETURNING id, created_at
+        `;
+        const values = [userId, action, resourceType, resourceId, details, ipAddress, userAgent];
+        const result = await client.query(query, values);
+        return result.rows[0];
+    } finally {
+        client.release();
+    }
+}
+
+export async function getAuditLogs(userId = null, limit = 100, offset = 0) {
+    const client = await pool.connect();
+    try {
+        let query = `
+            SELECT al.id, al.user_id, al.action, al.resource_type, al.resource_id, 
+                   al.details, al.ip_address, al.user_agent, al.created_at,
+                   u.email as user_email, u.name as user_name
+            FROM audit_logs al
+            LEFT JOIN users u ON al.user_id = u.id
+        `;
+
+        const values = [];
+        if (userId) {
+            query += ' WHERE al.user_id = $1';
+            values.push(userId);
+        }
+
+        query += ` ORDER BY al.created_at DESC LIMIT $${values.length + 1} OFFSET $${values.length + 2}`;
+        values.push(limit, offset);
+
+        const result = await client.query(query, values);
+        return result.rows;
+    } finally {
+        client.release();
+    }
+}

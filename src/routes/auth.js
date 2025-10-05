@@ -27,6 +27,7 @@ import {
     deleteAllUserSessions,
     getUserStats
 } from '../database/users.js';
+import { createDefaultOrganizationForUser } from '../database/userOrganizationMemberships.js';
 import { authenticateToken, logAuthAttempt, securityHeaders } from '../middleware/auth.js';
 
 const router = express.Router();
@@ -92,6 +93,11 @@ router.post('/register', [
             name: sanitizedName,
             role: 'user'
         });
+
+        // Create default organization for the user
+        console.log(`🏢 Creating default organization for user: ${user.name}`);
+        const { organization } = await createDefaultOrganizationForUser(user.id, user.name, user.email);
+        console.log(`✅ Created default organization: ${organization.name} (${organization.slug})`);
 
         // Generate tokens
         const accessToken = generateAccessToken({

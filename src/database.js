@@ -33,13 +33,13 @@ export async function testConnection() {
 }
 
 // Create a new job
-export async function createJob(name, schema, schemaName, userId = null) {
+export async function createJob(name, schema, schemaName, userId = null, organizationId = null) {
     const client = await pool.connect();
     try {
         const jobId = uuidv4();
         const query = `
-            INSERT INTO jobs (id, name, schema_data, status, user_id, created_at, updated_at)
-            VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
+            INSERT INTO jobs (id, name, schema_data, status, user_id, organization_id, created_at, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW())
             RETURNING id, name, status, created_at
         `;
 
@@ -48,7 +48,8 @@ export async function createJob(name, schema, schemaName, userId = null) {
             name || `Job ${new Date().toISOString()}`,
             JSON.stringify({ schema, schemaName: schemaName || 'data_extraction' }),
             'queued',
-            userId
+            userId,
+            organizationId
         ];
 
         const result = await client.query(query, values);
@@ -238,7 +239,40 @@ export async function updateJobStatus(jobId, status, summary = null) {
 }
 
 // List jobs with pagination
-export async function listJobs(limit = 10, offset = 0, userId = null) {
+export async function listJobsByOrganizations(limit = 10, offset = 0, organizationIds = []) {
+    const client = await pool.connect();
+    try {
+        if (organizationIds.length === 0) {
+            return [];
+        }
+
+        // Create placeholders for the organization IDs
+        const placeholders = organizationIds.map((_, index) => `$${index + 1}`).join(',');
+
+        const query = `
+            SELECT j.id, j.name, j.status, j.summary, j.created_at, j.updated_at,
+                   COUNT(jf.id) as file_count
+            FROM jobs j
+            LEFT JOIN job_files jf ON j.id = jf.job_id
+            WHERE j.organization_id IN (${placeholders})
+            GROUP BY j.id, j.name, j.status, j.summary, j.created_at, j.updated_at
+            ORDER BY j.created_at DESC
+            LIMIT $${organizationIds.length + 1} OFFSET $${organizationIds.length + 2}
+        `;
+
+        const values = [...organizationIds, limit, offset];
+        const result = await client.query(query, values);
+
+        return result.rows;
+    } catch (error) {
+        console.error('❌ Error listing jobs by organizations:', error.message);
+        throw error;
+    } finally {
+        client.release();
+    }
+}
+
+export async function listJobs(limit = 10, offset = 0, userId = null, organizationId = null) {
     const client = await pool.connect();
     try {
         let query = `
@@ -249,9 +283,20 @@ export async function listJobs(limit = 10, offset = 0, userId = null) {
         `;
 
         const values = [];
+        const conditions = [];
+
         if (userId) {
-            query += ' WHERE j.user_id = $1';
+            conditions.push(`j.user_id = $${values.length + 1}`);
             values.push(userId);
+        }
+
+        if (organizationId) {
+            conditions.push(`j.organization_id = $${values.length + 1}`);
+            values.push(organizationId);
+        }
+
+        if (conditions.length > 0) {
+            query += ` WHERE ${conditions.join(' AND ')}`;
         }
 
         query += `

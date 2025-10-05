@@ -18,11 +18,15 @@ import {
     updateFileProcessingStatus,
     updateJobStatus,
     listJobs,
+    listJobsByOrganizations,
     getFileResult,
     getSystemStats
 } from "./database.js";
+import { getUserById } from "./database/users.js";
+import { getUserOrganizations } from "./database/userOrganizationMemberships.js";
 import queueService from "./queue.js";
 import authRoutes from "./routes/auth.js";
+import organizationRoutes from "./routes/organizations.js";
 import { authenticateToken, optionalAuth, securityHeaders } from "./middleware/auth.js";
 import { rateLimitConfig } from "./auth.js";
 
@@ -66,6 +70,10 @@ const s3Service = new S3Service();
 // Authentication routes
 app.use('/auth', express.json());
 app.use('/auth', authRoutes);
+
+// Organization routes
+app.use('/organizations', express.json());
+app.use('/organizations', organizationRoutes);
 
 // Socket.IO connection handling
 io.on('connection', (socket) => {
@@ -310,7 +318,20 @@ app.get("/system-stats", async (req, res) => {
 app.get("/jobs", authenticateToken, async (req, res) => {
     try {
         const { limit = 10, offset = 0 } = req.query;
-        const jobs = await listJobs(parseInt(limit), parseInt(offset));
+
+        // Get user's organizations using the membership system
+        const userOrganizations = await getUserOrganizations(req.user.id);
+        const organizationIds = userOrganizations.map(org => org.id);
+
+        if (organizationIds.length === 0) {
+            return res.json({
+                status: "success",
+                jobs: []
+            });
+        }
+
+        // Get jobs for all organizations the user belongs to
+        const jobs = await listJobsByOrganizations(parseInt(limit), parseInt(offset), organizationIds);
         res.json({
             status: "success",
             jobs
@@ -333,6 +354,17 @@ app.get("/jobs/:id", authenticateToken, async (req, res) => {
             return res.status(404).json({
                 status: "error",
                 message: "Job not found"
+            });
+        }
+
+        // Check if user has access to this job's organization
+        const userOrganizations = await getUserOrganizations(req.user.id);
+        const userOrganizationIds = userOrganizations.map(org => org.id);
+
+        if (job.organization_id && !userOrganizationIds.includes(job.organization_id)) {
+            return res.status(403).json({
+                status: "error",
+                message: "Access denied to this job"
             });
         }
 
@@ -736,7 +768,18 @@ app.post("/extract", authenticateToken, upload.array("files", 10), async (req, r
 
         // Step 0: Create job in database
         console.log("Step 0: Creating job in database...");
-        job = await createJob(jobName, schema, schemaName, req.user.id);
+        // Get user's organizations using the membership system
+        const userOrganizations = await getUserOrganizations(req.user.id);
+        const organizationId = userOrganizations.length > 0 ? userOrganizations[0].id : null;
+
+        if (!organizationId) {
+            console.error("❌ User has no organizations");
+            return res.status(400).json({
+                error: "User must be part of an organization to create jobs"
+            });
+        }
+
+        job = await createJob(jobName, schema, schemaName, req.user.id, organizationId);
         console.log(`✅ Job created: ${job.id}`);
 
         // Step 1: Create file records immediately for better UX
