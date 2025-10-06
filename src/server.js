@@ -24,6 +24,7 @@ import {
 } from "./database.js";
 import { getUserById } from "./database/users.js";
 import { getUserOrganizations } from "./database/userOrganizationMemberships.js";
+import { initializeDatabase } from "./database/init.js";
 import queueService from "./queue.js";
 import authRoutes from "./routes/auth.js";
 import organizationRoutes from "./routes/organizations.js";
@@ -38,7 +39,12 @@ const app = express();
 const server = createServer(app);
 const io = new Server(server, {
     cors: {
-        origin: ['http://localhost:3001', 'http://localhost:3002', 'http://localhost:8080'],
+        origin: [
+            'http://localhost:3001',
+            'http://localhost:3002',
+            'http://localhost:8080',
+            'https://workspace.coreextract.app'
+        ],
         methods: ['GET', 'POST'],
         credentials: true
     }
@@ -46,7 +52,12 @@ const io = new Server(server, {
 
 // CORS configuration (must be before security middleware)
 app.use(cors({
-    origin: ['http://localhost:3001', 'http://localhost:3002', 'http://localhost:8080'],
+    origin: [
+        'http://localhost:3001',
+        'http://localhost:3002',
+        'http://localhost:8080',
+        'https://workspace.coreextract.app'
+    ],
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization'],
@@ -889,8 +900,23 @@ app.post("/extract", authenticateToken, upload.array("files", 10), async (req, r
 });
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, '0.0.0.0', () => {
-    logger.info(`AI Extractor server running on port ${PORT}`);
-    logger.info(`Flask service URL: ${FLASK_URL}`);
-    logger.info(`Socket.IO server ready for connections`);
-});
+
+// Initialize database and start server
+async function startServer() {
+    try {
+        // Initialize database schema
+        await initializeDatabase();
+
+        // Start the server
+        server.listen(PORT, '0.0.0.0', () => {
+            logger.info(`AI Extractor server running on port ${PORT}`);
+            logger.info(`Flask service URL: ${FLASK_URL}`);
+            logger.info(`Socket.IO server ready for connections`);
+        });
+    } catch (error) {
+        logger.error('Failed to start server:', error.message);
+        process.exit(1);
+    }
+}
+
+startServer();
