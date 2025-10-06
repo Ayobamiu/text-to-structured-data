@@ -9,29 +9,23 @@ import rateLimit from "express-rate-limit";
 import { createServer } from "http";
 import { Server } from "socket.io";
 import S3Service from "./s3Service.js";
-
-// Firebase imports
 import {
+    testConnection,
     createJob,
     addFileToJob,
-    getJobById,
+    getJobStatus,
     updateFileExtractionStatus,
     updateFileProcessingStatus,
     updateJobStatus,
+    listJobs,
     listJobsByOrganizations,
     getFileResult,
-    getUserOrganizations,
-    getJobFiles
-} from "./firebase/database.js";
-
-import {
-    authenticateUser,
-    createUserWithFirebase,
-    createFirebaseSession,
-    validateFirebaseSession,
-    deleteFirebaseSession
-} from "./firebase/auth.js";
-
+    getSystemStats
+} from "./database.js";
+import { getUserById } from "./database/users.js";
+import { getUserOrganizations } from "./database/userOrganizationMemberships.js";
+import { initializeDatabase } from "./database/init.js";
+import queueService from "./queue.js";
 import authRoutes from "./routes/auth.js";
 import organizationRoutes from "./routes/organizations.js";
 import healthRoutes from "./routes/health.js";
@@ -39,10 +33,7 @@ import { authenticateToken, optionalAuth, securityHeaders } from "./middleware/a
 import { rateLimitConfig } from "./auth.js";
 import logger from "./utils/logger.js";
 
-// Only load .env file in development
-if (process.env.NODE_ENV !== 'production') {
-    dotenv.config();
-}
+dotenv.config();
 
 const app = express();
 const server = createServer(app);
@@ -119,86 +110,441 @@ io.on('connection', (socket) => {
     socket.on('disconnect', () => {
         logger.info(`Client disconnected: ${socket.id}`);
     });
+
+    // Handle events from worker process
+    socket.on('file-status-update', (data) => {
+        logger.info(`Received file-status-update from worker:`, data);
+        // Broadcast to all clients in the job room
+        io.to(`job-${data.jobId}`).emit('file-status-update', data);
+        logger.info(`Broadcasted file-status-update to job-${data.jobId}`);
+    });
+
+    socket.on('job-status-update', (data) => {
+        logger.info(`Received job-status-update from worker:`, data);
+        // Broadcast to all clients in the job room
+        io.to(`job-${data.jobId}`).emit('job-status-update', data);
+        logger.info(`Broadcasted job-status-update to job-${data.jobId}`);
+    });
 });
 
-// API Routes with Firebase
 
-// Get jobs for user's organizations
-app.get('/jobs', authenticateToken, async (req, res) => {
+// Apply JSON parsing only to specific routes (not multipart routes)
+app.use('/jobs', express.json());
+app.use('/queue', express.json());
+app.use('/system-stats', express.json());
+app.use('/test-db', express.json());
+app.use('/test-redis', express.json());
+app.use('/test-s3', express.json());
+app.use('/storage-stats', express.json());
+app.use('/files', express.json());
+
+// Health check
+app.get("/health", (req, res) => {
+    res.json({ status: "healthy", service: "ai-extractor" });
+});
+
+// S3 connection test
+app.get("/test-s3", async (req, res) => {
     try {
+        const connection = await s3Service.testConnection();
+        const stats = await s3Service.getStorageStats();
+
+        res.json({
+            status: "success",
+            s3: connection,
+            storage_stats: stats
+        });
+    } catch (error) {
+        res.status(500).json({
+            status: "error",
+            message: error.message
+        });
+    }
+});
+
+// S3 storage statistics
+app.get("/storage-stats", async (req, res) => {
+    try {
+        const stats = await s3Service.getStorageStats();
+        res.json({
+            status: "success",
+            storage: stats
+        });
+    } catch (error) {
+        res.status(500).json({
+            status: "error",
+            message: error.message
+        });
+    }
+});
+
+// Database connection test
+app.get("/test-db", async (req, res) => {
+    try {
+        const result = await testConnection();
+        res.json({
+            status: "success",
+            database: result
+        });
+    } catch (error) {
+        res.status(500).json({
+            status: "error",
+            message: error.message
+        });
+    }
+});
+
+// Redis connection test
+app.get("/test-redis", async (req, res) => {
+    try {
+        const result = await queueService.testConnection();
+        res.json({
+            status: "success",
+            redis: {
+                connected: result,
+                message: result ? "Redis connection successful" : "Redis connection failed"
+            }
+        });
+    } catch (error) {
+        res.status(500).json({
+            status: "error",
+            message: error.message
+        });
+    }
+});
+
+// Queue statistics
+app.get("/queue-stats", async (req, res) => {
+    try {
+        const stats = await queueService.getQueueStats();
+        res.json({
+            status: "success",
+            queue: stats
+        });
+    } catch (error) {
+        res.status(500).json({
+            status: "error",
+            message: error.message
+        });
+    }
+});
+
+// Queue analytics endpoint
+app.get("/queue-analytics", async (req, res) => {
+    try {
+        const analytics = await queueService.getQueueAnalytics();
+        res.json({
+            status: "success",
+            analytics
+        });
+    } catch (error) {
+        res.status(500).json({
+            status: "error",
+            message: error.message
+        });
+    }
+});
+
+// Pause queue endpoint
+app.post("/queue/pause", async (req, res) => {
+    try {
+        await queueService.pauseQueue();
+        res.json({
+            status: "success",
+            message: "Queue paused"
+        });
+    } catch (error) {
+        res.status(500).json({
+            status: "error",
+            message: error.message
+        });
+    }
+});
+
+// Resume queue endpoint
+app.post("/queue/resume", async (req, res) => {
+    try {
+        await queueService.resumeQueue();
+        res.json({
+            status: "success",
+            message: "Queue resumed"
+        });
+    } catch (error) {
+        res.status(500).json({
+            status: "error",
+            message: error.message
+        });
+    }
+});
+
+// Clear queue endpoint
+app.post("/queue/clear", async (req, res) => {
+    try {
+        await queueService.clearQueue();
+        res.json({
+            status: "success",
+            message: "Queue cleared"
+        });
+    } catch (error) {
+        res.status(500).json({
+            status: "error",
+            message: error.message
+        });
+    }
+});
+
+// Remove specific file from queue
+app.delete("/queue/files/:fileId", async (req, res) => {
+    try {
+        const { fileId } = req.params;
+        await queueService.removeFileFromQueue(fileId);
+        res.json({
+            status: "success",
+            message: `File ${fileId} removed from queue`
+        });
+    } catch (error) {
+        res.status(500).json({
+            status: "error",
+            message: error.message
+        });
+    }
+});
+
+// Get queue status (paused/resumed)
+app.get("/queue/status", async (req, res) => {
+    try {
+        const isPaused = await queueService.isQueuePaused();
+        res.json({
+            status: "success",
+            queueStatus: {
+                paused: isPaused,
+                status: isPaused ? "paused" : "running"
+            }
+        });
+    } catch (error) {
+        res.status(500).json({
+            status: "error",
+            message: error.message
+        });
+    }
+});
+
+// System statistics
+app.get("/system-stats", async (req, res) => {
+    try {
+        const stats = await getSystemStats();
+        res.json({
+            status: "success",
+            statistics: stats
+        });
+    } catch (error) {
+        res.status(500).json({
+            status: "error",
+            message: error.message
+        });
+    }
+});
+
+// List jobs
+app.get("/jobs", authenticateToken, async (req, res) => {
+    try {
+        const { limit = 10, offset = 0 } = req.query;
+
+        // Get user's organizations using the membership system
         const userOrganizations = await getUserOrganizations(req.user.id);
         const organizationIds = userOrganizations.map(org => org.id);
 
         if (organizationIds.length === 0) {
-            return res.json([]);
+            return res.json({
+                status: "success",
+                jobs: []
+            });
         }
 
-        const jobs = await listJobsByOrganizations(organizationIds);
-        res.json(jobs);
-    } catch (error) {
-        logger.error('Error fetching jobs:', error.message);
-        res.status(500).json({ error: 'Failed to fetch jobs' });
-    }
-});
-
-// Create new job
-app.post('/jobs', authenticateToken, async (req, res) => {
-    try {
-        const { name, schema, } = req.body;
-
-        const userOrganizations = await getUserOrganizations(req.user.id);
-        if (userOrganizations.length === 0) {
-            return res.status(400).json({ error: 'User must be part of an organization' });
-        }
-
-        const job = await createJob({
-            name,
-            schemaData: schema,
-            userId: req.user.id,
-            organizationId: userOrganizations[0].id // Use first organization
+        // Get jobs for all organizations the user belongs to
+        const jobs = await listJobsByOrganizations(parseInt(limit), parseInt(offset), organizationIds);
+        res.json({
+            status: "success",
+            jobs
         });
-
-        res.status(201).json(job);
     } catch (error) {
-        logger.error('Error creating job:', error.message);
-        res.status(500).json({ error: 'Failed to create job' });
+        res.status(500).json({
+            status: "error",
+            message: error.message
+        });
     }
 });
 
-// Get job details
-app.get('/jobs/:id', authenticateToken, async (req, res) => {
+// Get job status
+app.get("/jobs/:id", authenticateToken, async (req, res) => {
     try {
-        const job = await getJobById(req.params.id);
+        const { id } = req.params;
+        const job = await getJobStatus(id);
+
         if (!job) {
-            return res.status(404).json({ error: 'Job not found' });
+            return res.status(404).json({
+                status: "error",
+                message: "Job not found"
+            });
         }
 
         // Check if user has access to this job's organization
         const userOrganizations = await getUserOrganizations(req.user.id);
-        const hasAccess = userOrganizations.some(org => org.id === job.organizationId);
-        logger.info(`User ${req.user.id} has access to job ${job.id}: ${hasAccess}`);
-        if (!hasAccess) {
-            return res.status(403).json({ error: 'Access denied' });
+        const userOrganizationIds = userOrganizations.map(org => org.id);
+
+        if (job.organization_id && !userOrganizationIds.includes(job.organization_id)) {
+            return res.status(403).json({
+                status: "error",
+                message: "Access denied to this job"
+            });
         }
 
-        // Get job files
-        const files = await getJobFiles(job.id);
-        logger.info(`Job ${job.id} has ${files.length} files`);
-
         res.json({
-            ...job,
-            files
+            status: "success",
+            job
         });
     } catch (error) {
-        logger.error('Error fetching job details:', error.message);
-        res.status(500).json({ error: 'Failed to fetch job details' });
+        res.status(500).json({
+            status: "error",
+            message: error.message
+        });
     }
 });
 
+// Get file result
+app.get("/files/:id/result", authenticateToken, async (req, res) => {
+    try {
+        const { id } = req.params;
+        const file = await getFileResult(id);
 
-// Process files asynchronously in background
+        if (!file) {
+            return res.status(404).json({
+                status: "error",
+                message: "File not found"
+            });
+        }
+
+        res.json({
+            status: "success",
+            file
+        });
+    } catch (error) {
+        res.status(500).json({
+            status: "error",
+            message: error.message
+        });
+    }
+});
+
+// Add files to existing job
+app.post("/jobs/:id/files", authenticateToken, upload.array("files", 10), async (req, res) => {
+    try {
+        const { id: jobId } = req.params;
+        const { schema, schemaName } = req.body;
+
+        if (!req.files || req.files.length === 0) {
+            return res.status(400).json({
+                status: "error",
+                message: "No files provided"
+            });
+        }
+
+        // Check if job exists
+        const job = await getJobStatus(jobId);
+        if (!job) {
+            return res.status(404).json({
+                status: "error",
+                message: "Job not found"
+            });
+        }
+
+        const addedFiles = [];
+
+        for (const file of req.files) {
+            // Upload to S3 if enabled
+            let s3FileInfo = null;
+            if (s3Service.isCloudStorageEnabled()) {
+                try {
+                    s3FileInfo = await s3Service.uploadFile(file, jobId);
+                } catch (s3Error) {
+                    console.warn(`⚠️ S3 upload failed for ${file.originalname}: ${s3Error.message}`);
+                }
+            }
+
+            // Add file record to database
+            const fileRecord = await addFileToJob(
+                jobId,
+                file.originalname,
+                file.size,
+                s3FileInfo?.s3Key || null,
+                s3FileInfo?.fileHash || null
+            );
+
+            // Add file to processing queue
+            await queueService.addFileToQueue(fileRecord.id, jobId);
+            console.log(`✅ File ${fileRecord.id} added to processing queue`);
+
+            addedFiles.push({
+                id: fileRecord.id,
+                filename: fileRecord.filename,
+                size: fileRecord.size,
+                s3Key: fileRecord.s3_key,
+                fileHash: fileRecord.file_hash
+            });
+
+            // Clean up uploaded file
+            const fs = (await import('fs')).default;
+            fs.unlink(file.path, (err) => {
+                if (err) console.error('Error deleting file:', err);
+            });
+        }
+
+        res.json({
+            status: "success",
+            message: `Added ${addedFiles.length} files to job`,
+            jobId,
+            files: addedFiles
+        });
+
+    } catch (error) {
+        console.error("Error adding files to job:", error.message);
+        res.status(500).json({
+            status: "error",
+            message: error.message
+        });
+    }
+});
+
+// List files in a job
+app.get("/jobs/:id/files", authenticateToken, async (req, res) => {
+    try {
+        const { id: jobId } = req.params;
+        const job = await getJobStatus(jobId);
+
+        if (!job) {
+            return res.status(404).json({
+                status: "error",
+                message: "Job not found"
+            });
+        }
+
+        res.json({
+            status: "success",
+            jobId,
+            files: job.files
+        });
+
+    } catch (error) {
+        console.error("Error listing job files:", error.message);
+        res.status(500).json({
+            status: "error",
+            message: error.message
+        });
+    }
+});
+
+// Async function to process files in the background
 async function processFilesAsync(job, files, schema, schemaName) {
-
     try {
         console.log(`🔄 Starting background processing for job ${job.id} with ${files.length} files`);
 
@@ -210,7 +556,8 @@ async function processFilesAsync(job, files, schema, schemaName) {
         });
 
         // Get existing file records for this job
-        const fileRecords = await getJobFiles(job.id);
+        const jobDetails = await getJobStatus(job.id);
+        const fileRecords = jobDetails.files;
 
         // Process each file
         for (let i = 0; i < files.length; i++) {
@@ -278,27 +625,12 @@ async function processFilesAsync(job, files, schema, schemaName) {
                 console.log(`Using ${markdown ? 'markdown' : rawText ? 'raw_text' : 'concatenated pages'} - length: ${extractedText.length} characters`);
 
                 // Step 3: Update file extraction status to completed
-
-                const processingMetadata = {}
-                if (rawText) {
-                    processingMetadata.textLength = rawText?.length || 0;
-                }
-                if (pages) {
-                    processingMetadata.pageCount = pages?.length || 0;
-                }
-                if (tables) {
-                    processingMetadata.tableCount = tables?.length || 0;
-                }
-
                 await updateFileExtractionStatus(
                     fileRecord.id,
                     'completed',
-                    {
-                        extractedText: rawText,
-                        extractedTables: JSON.stringify(tables), // Convert to JSON string for Firestore
-                        markdown: markdown,
-                        processingMetadata
-                    }
+                    extractedText,
+                    tables || null,
+                    markdown || null
                 );
 
                 // Emit extraction completed event
@@ -347,14 +679,7 @@ async function processFilesAsync(job, files, schema, schemaName) {
                 console.log(`OpenAI processing completed for ${file.originalname}`);
 
                 // Step 6: Update file processing status to completed
-                await updateFileProcessingStatus(fileRecord.id, 'completed', {
-                    result: extractedData,
-                    processingMetadata: {
-                        processingTime: Date.now(),
-                        model: 'gpt-4o',
-                        tokensUsed: response.usage?.total_tokens || 0
-                    }
-                });
+                await updateFileProcessingStatus(fileRecord.id, 'completed', extractedData);
 
                 // Emit file processing completed event
                 io.to(`job-${job.id}`).emit('file-status-update', {
@@ -385,13 +710,9 @@ async function processFilesAsync(job, files, schema, schemaName) {
 
                 // Update file status to failed
                 if (fileRecord.extraction_status === 'processing') {
-                    await updateFileExtractionStatus(fileRecord.id, 'failed', {
-                        extractionError: fileError.message
-                    });
+                    await updateFileExtractionStatus(fileRecord.id, 'failed', null, null, fileError.message);
                 } else if (fileRecord.processing_status === 'processing') {
-                    await updateFileProcessingStatus(fileRecord.id, 'failed', {
-                        processingError: fileError.message
-                    });
+                    await updateFileProcessingStatus(fileRecord.id, 'failed', null, fileError.message);
                 }
             } finally {
                 // Clean up uploaded file
@@ -405,8 +726,8 @@ async function processFilesAsync(job, files, schema, schemaName) {
         }
 
         // Update job status based on results
-        const updatedJobFiles = await getJobFiles(job.id);
-        const completedFiles = updatedJobFiles.filter(f => f.processing_status === 'completed').length;
+        const updatedJobDetails = await getJobStatus(job.id);
+        const completedFiles = updatedJobDetails.files.filter(f => f.processing_status === 'completed').length;
         const jobStatus = completedFiles === files.length ? 'completed' :
             completedFiles > 0 ? 'partial' : 'failed';
 
@@ -442,8 +763,8 @@ async function processFilesAsync(job, files, schema, schemaName) {
     }
 }
 
-// File extraction endpoint
-app.post('/extract', authenticateToken, upload.array('files', 10), async (req, res) => {
+// Main extraction endpoint - Updated for multiple files
+app.post("/extract", authenticateToken, upload.array("files", 10), async (req, res) => {
     let job = null;
     const fileRecords = [];
     const processedFiles = [];
@@ -452,6 +773,7 @@ app.post('/extract', authenticateToken, upload.array('files', 10), async (req, r
         console.log("=== EXTRACT ENDPOINT CALLED ===");
         console.log(`Request method: ${req.method}`);
         console.log(`Request URL: ${req.url}`);
+        console.log(`Request headers: ${JSON.stringify(req.headers)}`);
         console.log(`Request files: ${req.files ? req.files.length : 0} files`);
         console.log(`Request body keys: ${req.body ? Object.keys(req.body) : 'no body'}`);
 
@@ -477,6 +799,7 @@ app.post('/extract', authenticateToken, upload.array('files', 10), async (req, r
 
         // Step 0: Create job in database
         console.log("Step 0: Creating job in database...");
+        // Get user's organizations using the membership system
         const userOrganizations = await getUserOrganizations(req.user.id);
         const organizationId = userOrganizations.length > 0 ? userOrganizations[0].id : null;
 
@@ -487,12 +810,7 @@ app.post('/extract', authenticateToken, upload.array('files', 10), async (req, r
             });
         }
 
-        job = await createJob({
-            name: jobName || `Extraction Job ${new Date().toISOString()}`,
-            schemaData: JSON.parse(schema),
-            userId: req.user.id,
-            organizationId: organizationId
-        });
+        job = await createJob(jobName, schema, schemaName, req.user.id, organizationId);
         console.log(`✅ Job created: ${job.id}`);
 
         // Step 1: Create file records immediately for better UX
@@ -515,11 +833,13 @@ app.post('/extract', authenticateToken, upload.array('files', 10), async (req, r
             }
 
             // Create file record
-            const fileRecord = await addFileToJob(job.id, {
-                filename: file.originalname,
-                size: file.size,
-                ...(s3FileInfo || {})
-            });
+            const fileRecord = await addFileToJob(
+                job.id,
+                file.originalname,
+                file.size,
+                s3FileInfo?.s3Key || null,
+                s3FileInfo?.fileHash || null
+            );
             console.log(`✅ File record created: ${fileRecord.id}`);
 
             fileRecords.push(fileRecord);
@@ -581,10 +901,22 @@ app.post('/extract', authenticateToken, upload.array('files', 10), async (req, r
 
 const PORT = process.env.PORT || 3000;
 
-// Start the server
-server.listen(PORT, () => {
-    logger.info(`AI Extractor server running on port ${PORT}`);
-    logger.info(`Flask service URL: ${FLASK_URL}`);
-    logger.info(`Socket.IO server ready for connections`);
-    logger.info(`🔥 Firebase integration enabled`);
-});
+// Initialize database and start server
+async function startServer() {
+    try {
+        // Initialize database schema
+        await initializeDatabase();
+
+        // Start the server
+        server.listen(PORT, '0.0.0.0', () => {
+            logger.info(`AI Extractor server running on port ${PORT}`);
+            logger.info(`Flask service URL: ${FLASK_URL}`);
+            logger.info(`Socket.IO server ready for connections`);
+        });
+    } catch (error) {
+        logger.error('Failed to start server:', error.message);
+        process.exit(1);
+    }
+}
+
+startServer();

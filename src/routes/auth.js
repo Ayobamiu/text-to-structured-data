@@ -16,18 +16,14 @@ import {
     authRateLimitConfig
 } from '../auth.js';
 import {
-    createUser,
+    createUserWithFirebase,
     authenticateUser,
-    getUserById,
-    updateUser,
-    changePassword,
-    createUserSession,
-    validateUserSession,
-    deleteUserSession,
-    deleteAllUserSessions,
-    getUserStats
-} from '../database/users.js';
-import { createDefaultOrganizationForUser } from '../database/userOrganizationMemberships.js';
+    createFirebaseSession,
+    validateFirebaseSession,
+    deleteFirebaseSession,
+    deleteAllFirebaseSessions
+} from '../firebase/auth.js';
+import { createDefaultOrganizationForUser, getUserById, updateUser } from '../firebase/database.js';
 import { authenticateToken, logAuthAttempt, securityHeaders } from '../middleware/auth.js';
 
 const router = express.Router();
@@ -86,18 +82,13 @@ router.post('/register', [
         const sanitizedEmail = sanitizeInput(email);
         const sanitizedName = sanitizeInput(name);
 
-        // Create user
-        const user = await createUser({
+        // Create user with Firebase (includes organization creation)
+        const user = await createUserWithFirebase({
             email: sanitizedEmail,
             password: password,
             name: sanitizedName,
-            role: 'user'
+            role: 'member'
         });
-
-        // Create default organization for the user
-        console.log(`🏢 Creating default organization for user: ${user.name}`);
-        const { organization } = await createDefaultOrganizationForUser(user.id, user.name, user.email);
-        console.log(`✅ Created default organization: ${organization.name} (${organization.slug})`);
 
         // Generate tokens
         const accessToken = generateAccessToken({
@@ -113,7 +104,7 @@ router.post('/register', [
         });
 
         // Create session
-        await createUserSession(user.id, refreshToken, {
+        await createFirebaseSession(user.id, refreshToken, {
             ipAddress: req.ip,
             userAgent: req.get('User-Agent')
         });
@@ -146,7 +137,7 @@ router.post('/register', [
         if (error.message.includes('already exists')) {
             return res.status(409).json({
                 success: false,
-                error: 'User with this email already exists',
+                error: `An account with email ${req.body.email} already exists. Please use a different email address or try logging in instead.`,
                 code: 'USER_EXISTS'
             });
         }
@@ -212,7 +203,7 @@ router.post('/login', [
         });
 
         // Create session
-        await createUserSession(user.id, refreshToken, {
+        await createFirebaseSession(user.id, refreshToken, {
             ipAddress: req.ip,
             userAgent: req.get('User-Agent')
         });
@@ -242,6 +233,23 @@ router.post('/login', [
 
     } catch (error) {
         console.error('Login error:', error.message);
+
+        // Handle specific authentication errors
+        if (error.message.includes('No account found with email')) {
+            return res.status(404).json({
+                success: false,
+                error: error.message,
+                code: 'USER_NOT_FOUND'
+            });
+        }
+
+        if (error.message.includes('Incorrect password')) {
+            return res.status(401).json({
+                success: false,
+                error: error.message,
+                code: 'INVALID_PASSWORD'
+            });
+        }
 
         res.status(500).json({
             success: false,
@@ -312,10 +320,10 @@ router.post('/logout', authenticateToken, async (req, res) => {
 
         if (refreshToken) {
             // Delete specific session
-            await deleteUserSession(refreshToken);
+            await deleteFirebaseSession(refreshToken);
         } else {
             // Delete all user sessions
-            await deleteAllUserSessions(req.user.id);
+            await deleteAllFirebaseSessions(req.user.id);
         }
 
         console.log(`✅ User logged out: ${req.user.email}`);
