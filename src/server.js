@@ -28,6 +28,7 @@ import { initializeDatabase } from "./database/init.js";
 import queueService from "./queue.js";
 import authRoutes from "./routes/auth.js";
 import organizationRoutes from "./routes/organizations.js";
+import previewRoutes from "./routes/previews.js";
 import healthRoutes from "./routes/health.js";
 import { authenticateToken, optionalAuth, securityHeaders } from "./middleware/auth.js";
 import { rateLimitConfig } from "./auth.js";
@@ -88,6 +89,10 @@ app.use('/auth', authRoutes);
 // Organization routes
 app.use('/organizations', express.json());
 app.use('/organizations', organizationRoutes);
+
+// Preview routes
+app.use('/previews', express.json());
+app.use('/previews', previewRoutes);
 
 // Health check routes (no auth required)
 app.use('/', healthRoutes);
