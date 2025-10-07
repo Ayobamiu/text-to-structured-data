@@ -1,5 +1,4 @@
 import axios from 'axios';
-import OpenAI from 'openai';
 import dotenv from 'dotenv';
 import { io } from 'socket.io-client';
 import queueService from './queue.js';
@@ -10,12 +9,9 @@ import {
     updateJobStatus
 } from './database.js';
 import S3Service from './s3Service.js';
+import { processWithOpenAI } from './utils/openaiProcessor.js';
 
 dotenv.config();
-
-const openai = new OpenAI({
-    apiKey: process.env.OPENAI_API_KEY,
-});
 
 const FLASK_URL = process.env.FLASK_URL || "http://localhost:5001";
 const WORKER_INTERVAL_MS = parseInt(process.env.WORKER_INTERVAL_MS || '5000'); // Poll every 5 seconds
@@ -198,7 +194,9 @@ class FileProcessorWorker {
                 file.id,
                 'completed',
                 extractionResult.text,
-                extractionResult.tables
+                extractionResult.tables,
+                extractionResult.markdown,
+                extractionResult.pages
             );
             console.log(`✅ File ${file.filename} extraction completed`);
 
@@ -242,8 +240,8 @@ class FileProcessorWorker {
                 }
             }
 
-            const processingResult = await this.processWithOpenAI(
-                extractionResult.text,
+            const processingResult = await processWithOpenAI(
+                extractionResult.markdown,
                 schemaData
             );
 
@@ -280,7 +278,7 @@ class FileProcessorWorker {
 
                 if (retrySuccess) {
                     // Update status to reflect retry
-                    await updateFileExtractionStatus(fileId, 'pending', null, null, error.message);
+                    await updateFileExtractionStatus(fileId, 'pending', null, null, null, null, error.message);
 
                     // Emit WebSocket event for retry
                     this.emitFileStatusUpdate(
@@ -293,7 +291,7 @@ class FileProcessorWorker {
                     );
                 } else {
                     // Max retries reached
-                    await updateFileExtractionStatus(fileId, 'failed', null, null, error.message);
+                    await updateFileExtractionStatus(fileId, 'failed', null, null, null, null, error.message);
                     await queueService.removeFileFromProcessing(fileId);
 
                     // Emit WebSocket event for failure
@@ -308,7 +306,7 @@ class FileProcessorWorker {
                 }
             } else {
                 console.error(`❌ Max retries reached for file ${fileId}. Marking as failed.`);
-                await updateFileExtractionStatus(fileId, 'failed', null, null, error.message);
+                await updateFileExtractionStatus(fileId, 'failed', null, null, null, null, error.message);
                 await queueService.removeFileFromProcessing(fileId);
 
                 // Emit WebSocket event for failure
@@ -382,17 +380,18 @@ class FileProcessorWorker {
                 const extractedText = response.data.data.pages.map((page) => page.text).join("\n\n");
                 console.log(`📝 Extracted ${extractedText.length} characters from PDF`);
 
-                // Extract tables if available
-                let extractedTables = null;
-                if (response.data.data.tables && response.data.data.tables.length > 0) {
-                    extractedTables = response.data.data.tables;
-                    console.log(`📊 Extracted ${extractedTables.length} tables from PDF`);
-                }
+                const documentData = response.data.data;
+                const markdown = documentData.markdown || "";
+                const text = documentData.full_text || "";
+                const pages = documentData.pages || [];
+                const tables = documentData.tables || [];
 
                 return {
                     success: true,
-                    text: extractedText,
-                    tables: extractedTables
+                    text,
+                    tables,
+                    markdown,
+                    pages
                 };
 
             } finally {
@@ -406,50 +405,6 @@ class FileProcessorWorker {
 
         } catch (error) {
             console.error('❌ S3 file extraction error:', error.message);
-            return {
-                success: false,
-                error: error.message
-            };
-        }
-    }
-    async processWithOpenAI(text, schemaData) {
-        try {
-            console.log('🤖 Processing with OpenAI...');
-
-            const response = await openai.chat.completions.create({
-                model: "gpt-4o-2024-08-06",
-                messages: [
-                    {
-                        role: "system",
-                        content: "You are an expert at structured data extraction. Extract data from the provided text according to the given schema.",
-                    },
-                    {
-                        role: "user",
-                        content: `Extract data from the following text and return it in the schema format:\n\n${text}`,
-                    },
-                ],
-                response_format: {
-                    type: "json_schema",
-                    json_schema: {
-                        name: schemaData.schemaName || "data_extraction",
-                        schema: schemaData.schema,
-                    },
-                },
-            });
-
-            const extractedData = JSON.parse(response.choices[0].message.content);
-            console.log('✅ OpenAI processing completed');
-            return {
-                success: true,
-                data: extractedData, // Store only the pure extracted data
-                metadata: {
-                    text_length: text.length,
-                    processing_time: new Date().toISOString()
-                }
-            };
-
-        } catch (error) {
-            console.error('❌ OpenAI processing error:', error.message);
             return {
                 success: false,
                 error: error.message

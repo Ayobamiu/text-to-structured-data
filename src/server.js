@@ -32,6 +32,7 @@ import healthRoutes from "./routes/health.js";
 import { authenticateToken, optionalAuth, securityHeaders } from "./middleware/auth.js";
 import { rateLimitConfig } from "./auth.js";
 import logger from "./utils/logger.js";
+import { processWithOpenAI } from "./utils/openaiProcessor.js";
 
 dotenv.config();
 
@@ -620,17 +621,14 @@ async function processFilesAsync(job, files, schema, schemaName) {
 
                 console.log(`Document structure: ${pages.length} pages, ${tables.length} tables, ${rawText.length} chars raw text, ${markdown.length} chars markdown`);
 
-                // Use markdown if available, otherwise fallback to raw_text, then concatenated page text
-                const extractedText = markdown || rawText || pages.map((page) => page.text).join("\n\n");
-                console.log(`Using ${markdown ? 'markdown' : rawText ? 'raw_text' : 'concatenated pages'} - length: ${extractedText.length} characters`);
-
                 // Step 3: Update file extraction status to completed
                 await updateFileExtractionStatus(
                     fileRecord.id,
                     'completed',
-                    extractedText,
+                    rawText,
                     tables || null,
-                    markdown || null
+                    markdown || null,
+                    pages || null
                 );
 
                 // Emit extraction completed event
@@ -650,36 +648,25 @@ async function processFilesAsync(job, files, schema, schemaName) {
                 console.log(`Step 5: Processing ${file.originalname} with OpenAI using markdown content...`);
 
                 // Use markdown content for better AI processing
-                const contentForAI = markdown || extractedText;
+                const contentForAI = markdown || rawText;
                 console.log(`Using ${markdown ? 'markdown' : 'extracted text'} for OpenAI processing (${contentForAI.length} characters)`);
 
-                const response = await openai.chat.completions.create({
-                    model: "gpt-4o-2024-08-06",
-                    messages: [
-                        {
-                            role: "system",
-                            content: "You are an expert at structured data extraction from documents. Extract data accurately according to the provided schema, paying attention to document structure, tables, and contextual relationships.",
-                        },
-                        {
-                            role: "user",
-                            content: `Extract structured data from this document according to the provided schema:\n\n${contentForAI}`,
-                        },
-                    ],
-                    response_format: {
-                        type: "json_schema",
-                        json_schema: {
-                            name: schemaName || "data_extraction",
-                            schema: JSON.parse(schema),
-                        },
-                    },
+                // Step 5: Process with OpenAI using shared function
+                console.log(`Step 5: Processing ${file.originalname} with OpenAI using shared processor...`);
+
+                const processingResult = await processWithOpenAI(contentForAI, {
+                    schemaName: schemaName || "data_extraction",
+                    schema: JSON.parse(schema)
                 });
 
-                console.log(`OpenAI response received for ${file.originalname}`);
-                const extractedData = JSON.parse(response.choices[0].message.content);
+                if (!processingResult.success) {
+                    throw new Error(`OpenAI processing failed: ${processingResult.error}`);
+                }
+
                 console.log(`OpenAI processing completed for ${file.originalname}`);
 
                 // Step 6: Update file processing status to completed
-                await updateFileProcessingStatus(fileRecord.id, 'completed', extractedData);
+                await updateFileProcessingStatus(fileRecord.id, 'completed', processingResult.data, null, processingResult.metadata);
 
                 // Emit file processing completed event
                 io.to(`job-${job.id}`).emit('file-status-update', {
@@ -689,7 +676,7 @@ async function processFilesAsync(job, files, schema, schemaName) {
                     extraction_status: 'completed',
                     processing_status: 'completed',
                     message: `Successfully processed ${file.originalname}`,
-                    result: extractedData
+                    result: processingResult.data
                 });
 
                 console.log(`✅ Successfully processed ${file.originalname}`);
@@ -710,7 +697,7 @@ async function processFilesAsync(job, files, schema, schemaName) {
 
                 // Update file status to failed
                 if (fileRecord.extraction_status === 'processing') {
-                    await updateFileExtractionStatus(fileRecord.id, 'failed', null, null, fileError.message);
+                    await updateFileExtractionStatus(fileRecord.id, 'failed', null, null, null, null, fileError.message);
                 } else if (fileRecord.processing_status === 'processing') {
                     await updateFileProcessingStatus(fileRecord.id, 'failed', null, fileError.message);
                 }
@@ -908,7 +895,7 @@ async function startServer() {
         await initializeDatabase();
 
         // Start the server
-        server.listen(PORT, '0.0.0.0', () => {
+        server.listen(PORT, () => {
             logger.info(`AI Extractor server running on port ${PORT}`);
             logger.info(`Flask service URL: ${FLASK_URL}`);
             logger.info(`Socket.IO server ready for connections`);

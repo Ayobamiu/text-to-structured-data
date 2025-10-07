@@ -116,6 +116,7 @@ CREATE TABLE IF NOT EXISTS job_files (
     processing_status VARCHAR(50) NOT NULL DEFAULT 'pending',
     extracted_text TEXT,
     extracted_tables JSONB,
+    pages JSONB, -- Page-by-page content from Document AI
     markdown TEXT, -- Markdown formatted content from Document AI + V3 converter
     result JSONB,
     processing_metadata JSONB,

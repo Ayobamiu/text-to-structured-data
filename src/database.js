@@ -11,11 +11,11 @@ const { Pool } = pg;
 
 // Database connection pool
 const pool = new Pool({
-    user: process.env.PGUSER || 'postgres',
-    host: process.env.PGHOST || 'localhost',
-    database: process.env.PGDATABASE || 'batch_processor',
-    password: process.env.PGPASSWORD || 'password',
-    port: process.env.PGPORT || 5432,
+    user: process.env.DB_USER || 'postgres',
+    host: process.env.DB_HOST || 'localhost',
+    database: process.env.DB_NAME || 'batch_processor',
+    password: process.env.DB_PASSWORD || 'password',
+    port: process.env.DB_PORT || 5432,
     max: 20, // Maximum number of clients in the pool
     idleTimeoutMillis: 30000, // Close idle clients after 30 seconds
     connectionTimeoutMillis: 2000, // Return an error after 2 seconds if connection could not be established
@@ -155,18 +155,18 @@ export async function getJobStatus(jobId) {
 }
 
 // Update file extraction status
-export async function updateFileExtractionStatus(fileId, status, extractedText = null, extractedTables = null, markdown = null, error = null) {
+export async function updateFileExtractionStatus(fileId, status, extractedText = null, extractedTables = null, markdown = null, pages = null, error = null) {
     const client = await pool.connect();
     try {
         const query = `
             UPDATE job_files 
             SET extraction_status = $1, extracted_text = $2, extracted_tables = $3, 
-                markdown = $4, extraction_error = $5, updated_at = NOW()
-            WHERE id = $6
+                markdown = $4, pages = $5, extraction_error = $6, updated_at = NOW()
+            WHERE id = $7
             RETURNING id, job_id, filename
         `;
 
-        const values = [status, extractedText, extractedTables ? JSON.stringify(extractedTables) : null, markdown, error, fileId];
+        const values = [status, extractedText, extractedTables ? JSON.stringify(extractedTables) : null, markdown, pages ? JSON.stringify(pages) : null, error, fileId];
         const result = await client.query(query, values);
 
         if (result.rows.length === 0) {
@@ -325,7 +325,7 @@ export async function getFileResult(fileId) {
     const client = await pool.connect();
     try {
         const query = `
-            SELECT jf.id, jf.filename, jf.result, jf.extracted_text, jf.extracted_tables, jf.markdown,
+            SELECT jf.id, jf.filename, jf.result, jf.extracted_text, jf.extracted_tables, jf.pages, jf.markdown,
                    jf.extraction_status, jf.processing_status, jf.extraction_error, jf.processing_error, jf.processed_at,
                    j.name as job_name, j.schema_data
             FROM job_files jf
