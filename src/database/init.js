@@ -15,6 +15,12 @@ export async function initializeDatabase() {
 
     const pool = new Pool({
         connectionString: connectionString,
+        // Force IPv4 to avoid Railway IPv6 issues
+        family: 4,
+        // Additional connection options for Railway
+        connectionTimeoutMillis: 10000,
+        idleTimeoutMillis: 30000,
+        max: 10,
     });
 
     try {
