@@ -4,9 +4,17 @@ const { Pool } = pg;
 
 export async function initializeDatabase() {
     console.log('🚀 Initializing database...');
+    
+    // Debug environment variables
+    console.log('🔍 Environment check:');
+    console.log('  DATABASE_URL:', process.env.DATABASE_URL ? 'SET' : 'NOT SET');
+    console.log('  NODE_ENV:', process.env.NODE_ENV);
+    
+    const connectionString = process.env.DATABASE_URL || 'postgresql://postgres:password@localhost:5432/batch_processor';
+    console.log('🔗 Using connection string:', connectionString.replace(/:[^:@]*@/, ':***@'));
 
     const pool = new Pool({
-        connectionString: process.env.DATABASE_URL || 'postgresql://postgres:password@localhost:5432/batch_processor',
+        connectionString: connectionString,
     });
 
     try {
@@ -223,6 +231,17 @@ ON CONFLICT (id) DO NOTHING;
 
     } catch (error) {
         console.error('❌ Database initialization failed:', error.message);
+        console.error('🔍 Connection details:');
+        console.error('  Connection string:', connectionString.replace(/:[^:@]*@/, ':***@'));
+        console.error('  Error code:', error.code);
+        console.error('  Error details:', error);
+        
+        if (!process.env.DATABASE_URL) {
+            console.error('⚠️  DATABASE_URL environment variable is not set!');
+            console.error('   Please set DATABASE_URL in your production environment.');
+            console.error('   Example: DATABASE_URL=postgresql://postgres:password@host:5432/db');
+        }
+        
         throw error;
     } finally {
         await pool.end();
