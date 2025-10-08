@@ -69,22 +69,28 @@ router.get('/health', async (req, res) => {
     }
 
     try {
-        // Check Flask service
-        const axios = (await import('axios')).default;
-        const response = await axios.get(`${process.env.FLASK_URL}/health`, {
-            timeout: 5000
-        });
+        // Check Flask service (optional - only if FLASK_URL is set)
+        if (process.env.FLASK_URL) {
+            const axios = (await import('axios')).default;
+            const response = await axios.get(`${process.env.FLASK_URL}/health`, {
+                timeout: 5000
+            });
 
-        if (response.status === 200) {
-            healthCheck.services.flask = 'healthy';
+            if (response.status === 200) {
+                healthCheck.services.flask = 'healthy';
+            } else {
+                healthCheck.services.flask = 'unhealthy';
+                healthCheck.status = 'unhealthy';
+            }
         } else {
-            healthCheck.services.flask = 'unhealthy';
-            healthCheck.status = 'unhealthy';
+            healthCheck.services.flask = 'not configured';
+            logger.info('Flask service not configured (FLASK_URL not set)');
         }
     } catch (error) {
         logger.error('Flask service health check failed:', error);
         healthCheck.services.flask = 'unhealthy';
-        healthCheck.status = 'unhealthy';
+        // Don't fail the overall health check for Flask service
+        logger.warn('Flask service unavailable, but continuing with other health checks');
     }
 
     const statusCode = healthCheck.status === 'healthy' ? 200 : 503;

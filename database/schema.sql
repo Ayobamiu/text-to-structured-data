@@ -74,7 +74,25 @@ CREATE INDEX IF NOT EXISTS idx_user_org_memberships_role ON user_organization_me
 CREATE INDEX IF NOT EXISTS idx_user_org_memberships_joined_at ON user_organization_memberships(joined_at);
 
 -- Add updated_at trigger for user_organization_memberships
-CREATE TRIGGER update_user_organization_memberships_updated_at BEFORE UPDATE ON user_organization_memberships
+CREATE OR REPLACE TRIGGER update_user_organization_memberships_updated_at BEFORE UPDATE ON user_organization_memberships
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+-- Create organization_invitations table
+CREATE TABLE IF NOT EXISTS organization_invitations (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    organization_id UUID NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+    email VARCHAR(255) NOT NULL,
+    role VARCHAR(50) NOT NULL DEFAULT 'member',
+    invited_by UUID REFERENCES users(id) ON DELETE SET NULL,
+    token VARCHAR(255) UNIQUE NOT NULL,
+    expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
+    accepted_at TIMESTAMP WITH TIME ZONE,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- Add updated_at trigger for organization_invitations
+CREATE OR REPLACE TRIGGER update_organization_invitations_updated_at BEFORE UPDATE ON organization_invitations
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
 -- Create audit log table
@@ -193,16 +211,16 @@ END;
 $$ language 'plpgsql';
 
 -- Create triggers to automatically update updated_at
-CREATE TRIGGER update_organizations_updated_at BEFORE UPDATE ON organizations
+CREATE OR REPLACE TRIGGER update_organizations_updated_at BEFORE UPDATE ON organizations
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
-CREATE TRIGGER update_users_updated_at BEFORE UPDATE ON users
+CREATE OR REPLACE TRIGGER update_users_updated_at BEFORE UPDATE ON users
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
-CREATE TRIGGER update_jobs_updated_at BEFORE UPDATE ON jobs
+CREATE OR REPLACE TRIGGER update_jobs_updated_at BEFORE UPDATE ON jobs
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
-CREATE TRIGGER update_job_files_updated_at BEFORE UPDATE ON job_files
+CREATE OR REPLACE TRIGGER update_job_files_updated_at BEFORE UPDATE ON job_files
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
 -- Insert default admin user (for single-user mode)
