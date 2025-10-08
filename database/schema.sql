@@ -127,6 +127,16 @@ CREATE TABLE IF NOT EXISTS job_files (
     processed_at TIMESTAMP WITH TIME ZONE
 );
 
+-- Create preview_data_table for dynamic data previews
+CREATE TABLE IF NOT EXISTS preview_data_table (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    name VARCHAR(255) NOT NULL,
+    schema JSONB NOT NULL,
+    items_ids UUID[] DEFAULT '{}',
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
 -- Create indexes for authentication tables
 CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
 CREATE INDEX IF NOT EXISTS idx_users_role ON users(role);
@@ -155,6 +165,10 @@ CREATE INDEX IF NOT EXISTS idx_job_files_created_at ON job_files(created_at);
 CREATE INDEX IF NOT EXISTS idx_jobs_schema_data ON jobs USING GIN (schema_data);
 CREATE INDEX IF NOT EXISTS idx_job_files_extracted_tables ON job_files USING GIN (extracted_tables);
 CREATE INDEX IF NOT EXISTS idx_job_files_result ON job_files USING GIN (result);
+
+-- Create indexes for preview_data_table
+CREATE INDEX IF NOT EXISTS idx_preview_data_table_created_at ON preview_data_table(created_at);
+CREATE INDEX IF NOT EXISTS idx_preview_data_table_schema ON preview_data_table USING GIN (schema);
 
 -- Create organization-related indexes
 CREATE INDEX IF NOT EXISTS idx_organizations_slug ON organizations(slug);
