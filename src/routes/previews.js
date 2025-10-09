@@ -18,6 +18,7 @@ import {
     getPreviewsForFile,
     isFileInPreview
 } from '../database/previewDataTable.js';
+import mgsDataService from '../services/mgsDataService.js';
 
 const router = express.Router();
 
@@ -386,6 +387,100 @@ router.get('/file/:fileId/schema', async (req, res) => {
         res.status(500).json({
             success: false,
             message: 'Failed to fetch file schema',
+            error: error.message
+        });
+    }
+});
+
+/**
+ * POST /previews/file/:fileId/enrich-with-mgs
+ * Extract MGS data and update the file's result in one call
+ */
+router.post('/file/:fileId/enrich-with-mgs', async (req, res) => {
+    try {
+        const { fileId } = req.params;
+
+        // Get the file's result data to extract permit number
+        const client = await pool.connect();
+        try {
+            const query = `
+                SELECT result
+                FROM job_files
+                WHERE id = $1
+            `;
+
+            const result = await client.query(query, [fileId]);
+
+            if (result.rows.length === 0) {
+                return res.status(404).json({
+                    success: false,
+                    message: 'File not found'
+                });
+            }
+
+            const { result: fileResult } = result.rows[0];
+
+            console.log('fileResult', fileResult);
+            if (!fileResult || !fileResult.permit_number) {
+                return res.status(400).json({
+                    success: false,
+                    message: 'No permit number found in file result'
+                });
+            }
+
+            // Extract MGS data using the permit number
+            const mgsData = await mgsDataService.getMGSDataByPermitNumber(fileResult.permit_number);
+
+            if (!mgsData) {
+                return res.status(404).json({
+                    success: false,
+                    message: 'No MGS data found for this permit number'
+                });
+            }
+
+            // Merge MGS data into the existing result
+            const updatedResult = {
+                ...fileResult,
+                ...mgsData
+            };
+
+            // Update the file with merged data
+            const updateQuery = `
+                UPDATE job_files
+                SET result = $1
+                WHERE id = $2
+                RETURNING id
+            `;
+
+            const updateResult = await client.query(updateQuery, [
+                JSON.stringify(updatedResult),
+                fileId
+            ]);
+
+            if (updateResult.rows.length === 0) {
+                return res.status(500).json({
+                    success: false,
+                    message: 'Failed to update file with MGS data'
+                });
+            }
+
+            res.json({
+                success: true,
+                data: {
+                    fileId: updateResult.rows[0].id,
+                    mgsData: mgsData,
+                    message: 'File successfully enriched with MGS data'
+                }
+            });
+
+        } finally {
+            client.release();
+        }
+    } catch (error) {
+        console.error('Error enriching file with MGS data:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Failed to enrich file with MGS data',
             error: error.message
         });
     }
