@@ -1,6 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import csv from 'csv-parser';
+import landUseService from './landUseService.js';
 
 class MGSDataService {
     constructor() {
@@ -74,6 +75,18 @@ class MGSDataService {
                 deepest_formation: matchingRecord.deep_fm || null,
                 deviation: matchingRecord.Slant ? deviationMap[matchingRecord.Slant] : null
             };
+
+            // Add land use type if coordinates are available
+            if (mgsData.latitude && mgsData.longitude) {
+                try {
+                    mgsData.land_use_type = await landUseService.getLandUseType(mgsData.latitude, mgsData.longitude);
+                } catch (error) {
+                    console.log(`⚠️ Could not determine land use type for ${mgsData.latitude}, ${mgsData.longitude}: ${error.message}`);
+                    mgsData.land_use_type = null;
+                }
+            } else {
+                mgsData.land_use_type = null;
+            }
 
             return mgsData;
         } catch (error) {
