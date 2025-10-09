@@ -515,6 +515,107 @@ app.get("/files/:id/result", authenticateToken, async (req, res) => {
     }
 });
 
+// Update file results endpoint
+app.put("/files/:id/results", authenticateToken, async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { results } = req.body;
+
+        // Validate input
+        if (!results) {
+            return res.status(400).json({
+                status: "error",
+                message: "Results data is required"
+            });
+        }
+
+        // Get file details first
+        const file = await getFileResult(id);
+        if (!file) {
+            return res.status(404).json({
+                status: "error",
+                message: "File not found"
+            });
+        }
+
+        // Check if user has access to this file's job organization
+        const job = await getJobStatus(file.job_id);
+        if (!job) {
+            return res.status(404).json({
+                status: "error",
+                message: "Job not found"
+            });
+        }
+
+        const userOrganizations = await getUserOrganizations(req.user.id);
+        const userOrganizationIds = userOrganizations.map(org => org.id);
+
+        if (job.organization_id && !userOrganizationIds.includes(job.organization_id)) {
+            return res.status(403).json({
+                status: "error",
+                message: "Access denied to this file"
+            });
+        }
+
+        // Validate JSON format
+        let parsedResults;
+        try {
+            parsedResults = typeof results === 'string' ? JSON.parse(results) : results;
+        } catch (err) {
+            return res.status(400).json({
+                status: "error",
+                message: "Invalid JSON format in results"
+            });
+        }
+
+        // Update file results in database
+        const client = await pool.connect();
+        try {
+            const updateQuery = `
+                UPDATE job_files 
+                SET result = $1, updated_at = NOW()
+                WHERE id = $2
+                RETURNING id, filename, result
+            `;
+
+            const updateResult = await client.query(updateQuery, [
+                JSON.stringify(parsedResults),
+                id
+            ]);
+
+            if (updateResult.rows.length === 0) {
+                return res.status(404).json({
+                    status: "error",
+                    message: "File not found"
+                });
+            }
+
+            const updatedFile = updateResult.rows[0];
+
+            res.json({
+                status: "success",
+                message: `File results updated successfully for ${updatedFile.filename}`,
+                data: {
+                    fileId: updatedFile.id,
+                    filename: updatedFile.filename,
+                    results: parsedResults
+                }
+            });
+
+        } finally {
+            client.release();
+        }
+
+    } catch (error) {
+        console.error('Error updating file results:', error);
+        res.status(500).json({
+            status: "error",
+            message: "Failed to update file results",
+            error: error.message
+        });
+    }
+});
+
 // Add files to existing job
 app.post("/jobs/:id/files", authenticateToken, upload.array("files", 10), async (req, res) => {
     try {
