@@ -4,6 +4,7 @@
  */
 
 import express from 'express';
+import pool from '../database.js';
 import {
     createPreviewDataTable,
     getPreviewDataTables,
@@ -13,7 +14,9 @@ import {
     addItemsToPreview,
     removeItemsFromPreview,
     getJobFilesForPreview,
-    getAvailableJobFiles
+    getAvailableJobFiles,
+    getPreviewsForFile,
+    isFileInPreview
 } from '../database/previewDataTable.js';
 
 const router = express.Router();
@@ -288,6 +291,101 @@ router.get('/available-files', async (req, res) => {
         res.status(500).json({
             success: false,
             message: 'Failed to fetch available files',
+            error: error.message
+        });
+    }
+});
+
+/**
+ * GET /previews/file/:fileId
+ * Get previews that contain a specific file
+ */
+router.get('/file/:fileId', async (req, res) => {
+    try {
+        const { fileId } = req.params;
+        const previews = await getPreviewsForFile(fileId);
+
+        res.json({
+            success: true,
+            data: previews
+        });
+    } catch (error) {
+        console.error('Error fetching previews for file:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Failed to fetch previews for file',
+            error: error.message
+        });
+    }
+});
+
+/**
+ * GET /previews/:previewId/contains/:fileId
+ * Check if a file is already in a specific preview
+ */
+router.get('/:previewId/contains/:fileId', async (req, res) => {
+    try {
+        const { previewId, fileId } = req.params;
+        const exists = await isFileInPreview(fileId, previewId);
+
+        res.json({
+            success: true,
+            data: { exists }
+        });
+    } catch (error) {
+        console.error('Error checking if file is in preview:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Failed to check file in preview',
+            error: error.message
+        });
+    }
+});
+
+/**
+ * GET /previews/file/:fileId/schema
+ * Get the schema from a file's job
+ */
+router.get('/file/:fileId/schema', async (req, res) => {
+    try {
+        const { fileId } = req.params;
+
+        // Get the file and its job to extract the schema
+        const client = await pool.connect();
+        try {
+            const query = `
+                SELECT j.schema_data
+                FROM job_files jf
+                JOIN jobs j ON jf.job_id = j.id
+                WHERE jf.id = $1
+            `;
+
+            const result = await client.query(query, [fileId]);
+
+            if (result.rows.length === 0) {
+                return res.status(404).json({
+                    success: false,
+                    message: 'File not found'
+                });
+            }
+
+            const { schema_data } = result.rows[0];
+
+            res.json({
+                success: true,
+                data: {
+                    schema: schema_data,
+                    schemaName: 'Extracted Schema' // Default name since schema_name doesn't exist
+                }
+            });
+        } finally {
+            client.release();
+        }
+    } catch (error) {
+        console.error('Error fetching file schema:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Failed to fetch file schema',
             error: error.message
         });
     }

@@ -209,3 +209,43 @@ export async function getAvailableJobFiles(limit = 50) {
         client.release();
     }
 }
+
+/**
+ * Get previews that contain a specific file
+ */
+export async function getPreviewsForFile(fileId) {
+    const client = await pool.connect();
+    try {
+        const query = `
+            SELECT id, name, created_at
+            FROM preview_data_table
+            WHERE $1 = ANY(items_ids)
+            ORDER BY created_at DESC
+        `;
+
+        const result = await client.query(query, [fileId]);
+        return result.rows;
+    } finally {
+        client.release();
+    }
+}
+
+/**
+ * Check if a file is already in a specific preview
+ */
+export async function isFileInPreview(fileId, previewId) {
+    const client = await pool.connect();
+    try {
+        const query = `
+            SELECT EXISTS(
+                SELECT 1 FROM preview_data_table 
+                WHERE id = $1 AND $2 = ANY(items_ids)
+            ) as exists
+        `;
+
+        const result = await client.query(query, [previewId, fileId]);
+        return result.rows[0].exists;
+    } finally {
+        client.release();
+    }
+}
