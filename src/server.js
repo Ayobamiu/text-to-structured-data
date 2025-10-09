@@ -9,7 +9,7 @@ import rateLimit from "express-rate-limit";
 import { createServer } from "http";
 import { Server } from "socket.io";
 import S3Service from "./s3Service.js";
-import {
+import pool, {
     testConnection,
     createJob,
     addFileToJob,
@@ -413,6 +413,79 @@ app.get("/jobs/:id", authenticateToken, async (req, res) => {
         res.status(500).json({
             status: "error",
             message: error.message
+        });
+    }
+});
+
+// Update job schema
+app.put("/jobs/:id/schema", authenticateToken, async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { schema } = req.body;
+
+        // Validate schema is valid JSON
+        if (!schema || typeof schema !== 'object') {
+            return res.status(400).json({
+                status: "error",
+                message: "Invalid schema format"
+            });
+        }
+
+        // Check if user has access to this job's organization
+        const job = await getJobStatus(id);
+        if (!job) {
+            return res.status(404).json({
+                status: "error",
+                message: "Job not found"
+            });
+        }
+
+        const userOrganizations = await getUserOrganizations(req.user.id);
+        const userOrganizationIds = userOrganizations.map(org => org.id);
+
+        if (job.organization_id && !userOrganizationIds.includes(job.organization_id)) {
+            return res.status(403).json({
+                status: "error",
+                message: "Access denied to this job"
+            });
+        }
+
+        // Update schema in database
+        const client = await pool.connect();
+        try {
+            const updateQuery = `
+                UPDATE jobs 
+                SET schema_data = $1, updated_at = NOW()
+                WHERE id = $2
+                RETURNING id, schema_data
+            `;
+
+            const result = await client.query(updateQuery, [JSON.stringify(schema), id]);
+
+            if (result.rows.length === 0) {
+                return res.status(404).json({
+                    status: "error",
+                    message: "Job not found"
+                });
+            }
+
+            res.json({
+                status: "success",
+                message: "Schema updated successfully",
+                data: {
+                    jobId: result.rows[0].id,
+                    schema: result.rows[0].schema_data
+                }
+            });
+        } finally {
+            client.release();
+        }
+    } catch (error) {
+        console.error('Error updating job schema:', error);
+        res.status(500).json({
+            status: "error",
+            message: "Failed to update schema",
+            error: error.message
         });
     }
 });
