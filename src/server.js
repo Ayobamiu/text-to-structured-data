@@ -460,7 +460,14 @@ app.put("/jobs/:id/schema", authenticateToken, async (req, res) => {
                 RETURNING id, schema_data
             `;
 
-            const result = await client.query(updateQuery, [JSON.stringify(schema), id]);
+            // Preserve the original structure with schemaName
+            const existingJob = await getJobStatus(id);
+            const schemaData = {
+                schema: schema,
+                schemaName: existingJob.schema_data?.schemaName || 'data_extraction'
+            };
+
+            const result = await client.query(updateQuery, [JSON.stringify(schemaData), id]);
 
             if (result.rows.length === 0) {
                 return res.status(404).json({

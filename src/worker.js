@@ -240,6 +240,13 @@ class FileProcessorWorker {
                 }
             }
 
+            console.log('🔍 Processed schemaData:', schemaData);
+
+            // Validate schema structure
+            if (!schemaData || !schemaData.schema) {
+                throw new Error(`Missing schema in job data. Got: ${JSON.stringify(schemaData)}`);
+            }
+
             const processingResult = await processWithOpenAI(
                 extractionResult.markdown,
                 schemaData
