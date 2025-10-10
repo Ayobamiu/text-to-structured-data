@@ -46,6 +46,7 @@ export async function processWithOpenAI(text, schemaData) {
                 type: "json_schema",
                 json_schema: {
                     name: schemaData.schemaName || "data_extraction",
+                    "strict": true,
                     schema: schema,
                 },
             },

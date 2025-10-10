@@ -59,6 +59,12 @@ class MGSDataService {
                 return null;
             }
 
+            // If well_no is in the format "alphadigit/alphadigit", convert it to "alphadigit-alphadigit"
+            if (matchingRecord.well_no && typeof matchingRecord.well_no === 'string') {
+                // Replace any occurrence of "letters-or-digits/letters-or-digits" with "letters-or-digits-letters-or-digits"
+                matchingRecord.well_no = matchingRecord.well_no.replace(/^([A-Za-z0-9]+)\s*\/\s*([A-Za-z0-9]+)$/, '$1-$2');
+            }
+            const measured_depth = matchingRecord.dtd ? parseFloat(matchingRecord.dtd) : null
             // Extract the required fields
             const mgsData = {
                 api_number: matchingRecord.api_wellno || null,
@@ -68,12 +74,13 @@ class MGSDataService {
                 longitude: matchingRecord.Longitude ? parseFloat(matchingRecord.Longitude) : null,
                 elevation: matchingRecord.elev_ref ? parseFloat(matchingRecord.elev_ref) : null,
                 elevation_datum: matchingRecord.ref_tops ? datumMap[matchingRecord.ref_tops] : null, // Based on CSV structure, seems to be 'K' for most records
-                well_type: matchingRecord.well_type || null,
+                well_type: matchingRecord.well_type && wellTypeMap[matchingRecord.well_type] ? wellTypeMap[matchingRecord.well_type] : matchingRecord.well_type || null,
                 status: matchingRecord.well_stat || null,
                 measured_depth: matchingRecord.dtd ? parseFloat(matchingRecord.dtd) : null,
-                true_depth: matchingRecord.tvd ? parseFloat(matchingRecord.tvd) : null,
+                true_depth: matchingRecord.tvd ? parseFloat(matchingRecord.tvd) : measured_depth,
                 deepest_formation: matchingRecord.deep_fm || null,
-                deviation: matchingRecord.Slant ? deviationMap[matchingRecord.Slant] : null
+                deviation: matchingRecord.Slant ? deviationMap[matchingRecord.Slant] : null,
+                county: matchingRecord.CNTY_NAME || null,
             };
 
             // Add land use type if coordinates are available
@@ -123,6 +130,25 @@ const deviationMap = {
     'H': 'Horizontal',
     'D': 'Deviated',
     'V': 'Straight',
+}
+const wellTypeMap = {
+    'GAS': "Gas Production",
+    'DH': "Dry Hole",
+    'MTW': "Mineral",
+    'MNB': "Mineral",
+    'BDW': "Brine Disposal",
+    'OIL': "Oil Production",
+    'LOC': "Location",
+    'LPG': "LPG",
+    'MSM': "Min",
+    'WIW': "Water Injection",
+    'GSO': "Gas Storage",
+    'MDW': "Mineral",
+    'GS': "Gas Storage",
+    'GIW': "Gas Injection",
+    'LHL': "Lost Hole",
+    'OTH': "Other",
+    'OBS': "Observation",
 }
 
 export default new MGSDataService();
