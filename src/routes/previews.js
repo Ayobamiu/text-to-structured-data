@@ -486,4 +486,140 @@ router.post('/file/:fileId/enrich-with-mgs', async (req, res) => {
     }
 });
 
+// Bulk enrich multiple files with MGS data
+router.post('/files/bulk/enrich-with-mgs', async (req, res) => {
+    try {
+        const { fileIds } = req.body;
+        console.log('🔍 Bulk MGS enrichment request:', { fileIds, count: fileIds?.length });
+
+        if (!fileIds || !Array.isArray(fileIds) || fileIds.length === 0) {
+            console.log('❌ Invalid fileIds:', fileIds);
+            return res.status(400).json({
+                success: false,
+                message: 'File IDs array is required'
+            });
+        }
+
+        const client = await pool.connect();
+
+        try {
+            const results = [];
+            let successCount = 0;
+            let errorCount = 0;
+
+            for (const fileId of fileIds) {
+                console.log(`🔄 Processing file ${fileId}...`);
+                try {
+                    // Get file result to extract permit number
+                    const fileResultQuery = `
+                        SELECT jf.result, jf.id, jf.filename
+                        FROM job_files jf
+                        WHERE jf.id = $1
+                    `;
+                    const fileResult = await client.query(fileResultQuery, [fileId]);
+
+                    if (fileResult.rows.length === 0) {
+                        console.log(`❌ File ${fileId} not found`);
+                        results.push({
+                            fileId: fileId,
+                            success: false,
+                            error: 'File not found'
+                        });
+                        errorCount++;
+                        continue;
+                    }
+
+                    const fileData = fileResult.rows[0];
+                    const resultData = fileData.result;
+                    console.log(`📄 File ${fileId} result data:`, resultData ? 'exists' : 'null');
+
+                    if (!resultData || !resultData.permit_number) {
+                        console.log(`⚠️ File ${fileId} has no permit number, skipping MGS enrichment`);
+                        results.push({
+                            fileId: fileId,
+                            filename: fileData.filename,
+                            success: true,
+                            skipped: true,
+                            reason: 'No permit number found - skipped MGS enrichment'
+                        });
+                        successCount++;
+                        continue;
+                    }
+
+                    console.log(`🔍 Looking up MGS data for permit: ${resultData.permit_number}`);
+                    // Get MGS data
+                    const mgsData = await mgsDataService.getMGSDataByPermitNumber(resultData.permit_number);
+
+                    if (!mgsData) {
+                        console.log(`⚠️ No MGS data found for permit: ${resultData.permit_number}, skipping`);
+                        results.push({
+                            fileId: fileId,
+                            filename: fileData.filename,
+                            success: true,
+                            skipped: true,
+                            reason: `No MGS data found for permit number: ${resultData.permit_number}`
+                        });
+                        successCount++;
+                        continue;
+                    }
+
+                    console.log(`✅ Found MGS data for ${fileId}:`, Object.keys(mgsData));
+                    // Merge MGS data into existing result
+                    const updatedResult = { ...resultData, ...mgsData };
+
+                    // Update the file result
+                    const updateQuery = `
+                        UPDATE job_files 
+                        SET result = $1, updated_at = NOW()
+                        WHERE id = $2
+                        RETURNING id, filename
+                    `;
+                    const updateResult = await client.query(updateQuery, [JSON.stringify(updatedResult), fileId]);
+
+                    results.push({
+                        fileId: fileId,
+                        filename: updateResult.rows[0].filename,
+                        success: true,
+                        mgsData: mgsData
+                    });
+                    successCount++;
+                    console.log(`✅ Successfully updated file ${fileId}`);
+
+                } catch (fileError) {
+                    console.error(`❌ Error processing file ${fileId}:`, fileError);
+                    results.push({
+                        fileId: fileId,
+                        success: false,
+                        error: fileError.message
+                    });
+                    errorCount++;
+                }
+            }
+
+            console.log(`📊 Bulk MGS enrichment complete: ${successCount} successful, ${errorCount} failed`);
+            res.json({
+                success: true,
+                message: `Processed ${fileIds.length} files: ${successCount} successful, ${errorCount} failed`,
+                results: results,
+                summary: {
+                    total: fileIds.length,
+                    successful: successCount,
+                    failed: errorCount,
+                    skipped: results.filter(r => r.skipped).length
+                }
+            });
+
+        } finally {
+            client.release();
+        }
+    } catch (error) {
+        console.error('❌ Error in bulk MGS enrichment:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Failed to enrich files with MGS data',
+            error: error.message
+        });
+    }
+});
+
 export default router;
