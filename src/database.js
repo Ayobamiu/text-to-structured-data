@@ -325,7 +325,7 @@ export async function getFileResult(fileId) {
         const query = `
             SELECT jf.id, jf.filename, jf.result, jf.extracted_text, jf.extracted_tables, jf.pages, jf.markdown,
                    jf.extraction_status, jf.processing_status, jf.extraction_error, jf.processing_error, jf.processed_at,
-                   j.name as job_name, j.schema_data
+                   jf.job_id, j.name as job_name, j.schema_data
             FROM job_files jf
             JOIN jobs j ON jf.job_id = j.id
             WHERE jf.id = $1
