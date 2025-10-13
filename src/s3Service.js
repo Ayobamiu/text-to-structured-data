@@ -37,9 +37,73 @@ class S3Service {
         return `${baseName}_${timestamp}_${random}${ext}`;
     }
 
-    // Calculate file hash for integrity checking
-    calculateFileHash(fileBuffer) {
-        return crypto.createHash('sha256').update(fileBuffer).digest('hex');
+    // Upload logo file to S3
+    async uploadLogo(fileBuffer, originalName) {
+        try {
+            if (!this.enabled) {
+                throw new Error('S3 storage is disabled');
+            }
+
+            const filename = this.generateUniqueFilename(originalName);
+            const key = `logos/${filename}`;
+
+            const command = new PutObjectCommand({
+                Bucket: this.bucketName,
+                Key: key,
+                Body: fileBuffer,
+                ContentType: this.getContentType(originalName),
+                Metadata: {
+                    'original-name': originalName,
+                    'upload-type': 'logo',
+                    'uploaded-at': new Date().toISOString()
+                }
+            });
+
+            await this.s3Client.send(command);
+
+            // Return simple public URL since bucket is now public
+            return `https://${this.bucketName}.s3.${process.env.AWS_REGION || 'us-east-1'}.amazonaws.com/${key}`;
+        } catch (error) {
+            console.error('Error uploading logo to S3:', error);
+            throw error;
+        }
+    }
+
+    // Generate signed URL for existing logo
+    async getLogoSignedUrl(s3Key) {
+        try {
+            if (!this.enabled) {
+                throw new Error('S3 storage is disabled');
+            }
+
+            const getCommand = new GetObjectCommand({
+                Bucket: this.bucketName,
+                Key: s3Key
+            });
+
+            const signedUrl = await getSignedUrl(this.s3Client, getCommand, {
+                expiresIn: 604800 // 7 days in seconds
+            });
+
+            return signedUrl;
+        } catch (error) {
+            console.error('Error generating signed URL for logo:', error);
+            throw error;
+        }
+    }
+
+    // Get content type based on file extension
+    getContentType(filename) {
+        const ext = path.extname(filename).toLowerCase();
+        const contentTypes = {
+            '.png': 'image/png',
+            '.jpg': 'image/jpeg',
+            '.jpeg': 'image/jpeg',
+            '.gif': 'image/gif',
+            '.svg': 'image/svg+xml',
+            '.webp': 'image/webp'
+        };
+        return contentTypes[ext] || 'application/octet-stream';
     }
 
     // Upload file to S3

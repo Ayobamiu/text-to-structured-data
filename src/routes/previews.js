@@ -5,6 +5,8 @@
 
 import express from 'express';
 import pool from '../database.js';
+import multer from 'multer';
+import S3Service from '../s3Service.js';
 import {
     createPreviewDataTable,
     getPreviewDataTables,
@@ -21,6 +23,24 @@ import {
 import mgsDataService from '../services/mgsDataService.js';
 
 const router = express.Router();
+
+// Configure multer for logo uploads
+const upload = multer({
+    storage: multer.memoryStorage(),
+    limits: {
+        fileSize: 5 * 1024 * 1024, // 5MB limit
+    },
+    fileFilter: (req, file, cb) => {
+        const allowedTypes = ['image/jpeg', 'image/jpg', 'image/png', 'image/svg+xml', 'image/gif'];
+        if (allowedTypes.includes(file.mimetype)) {
+            cb(null, true);
+        } else {
+            cb(new Error('Only image files (JPEG, PNG, SVG, GIF) are allowed'), false);
+        }
+    }
+});
+
+const s3Service = new S3Service();
 
 /**
  * GET /previews
@@ -114,9 +134,10 @@ router.get('/:id/data', async (req, res) => {
  * POST /previews
  * Create a new preview data table
  */
-router.post('/', async (req, res) => {
+router.post('/', upload.single('logo'), async (req, res) => {
     try {
         const { name, schema } = req.body;
+        const logoFile = req.file;
 
         if (!name || !schema) {
             return res.status(400).json({
@@ -125,7 +146,23 @@ router.post('/', async (req, res) => {
             });
         }
 
-        const preview = await createPreviewDataTable(name, schema);
+        let logoUrl = null;
+
+        // Upload logo to S3 if provided
+        if (logoFile) {
+            try {
+                logoUrl = await s3Service.uploadLogo(logoFile.buffer, logoFile.originalname);
+            } catch (error) {
+                console.error('Error uploading logo:', error);
+                return res.status(500).json({
+                    success: false,
+                    message: 'Failed to upload logo',
+                    error: error.message
+                });
+            }
+        }
+
+        const preview = await createPreviewDataTable(name, schema, logoUrl);
 
         res.status(201).json({
             success: true,
@@ -145,10 +182,26 @@ router.post('/', async (req, res) => {
  * PUT /previews/:id
  * Update a preview data table
  */
-router.put('/:id', async (req, res) => {
+router.put('/:id', upload.single('logo'), async (req, res) => {
     try {
         const { id } = req.params;
         const updates = req.body;
+        const logoFile = req.file;
+
+        // Upload logo to S3 if provided
+        if (logoFile) {
+            try {
+                const logoUrl = await s3Service.uploadLogo(logoFile.buffer, logoFile.originalname);
+                updates.logo = logoUrl;
+            } catch (error) {
+                console.error('Error uploading logo:', error);
+                return res.status(500).json({
+                    success: false,
+                    message: 'Failed to upload logo',
+                    error: error.message
+                });
+            }
+        }
 
         const preview = await updatePreviewDataTable(id, updates);
 

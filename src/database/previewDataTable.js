@@ -8,16 +8,16 @@ import pool from '../database.js';
 /**
  * Create a new preview data table
  */
-export async function createPreviewDataTable(name, schema) {
+export async function createPreviewDataTable(name, schema, logo = null) {
     const client = await pool.connect();
     try {
         const query = `
-            INSERT INTO preview_data_table (name, schema)
-            VALUES ($1, $2)
-            RETURNING id, name, schema, items_ids, created_at, updated_at
+            INSERT INTO preview_data_table (name, schema, logo)
+            VALUES ($1, $2, $3)
+            RETURNING id, name, schema, logo, items_ids, created_at, updated_at
         `;
 
-        const values = [name, schema];
+        const values = [name, schema, logo];
         const result = await client.query(query, values);
 
         return result.rows[0];
@@ -33,7 +33,7 @@ export async function getPreviewDataTables() {
     const client = await pool.connect();
     try {
         const query = `
-            SELECT id, name, schema, items_ids, created_at, updated_at,
+            SELECT id, name, schema, logo, items_ids, created_at, updated_at,
                    array_length(items_ids, 1) as item_count
             FROM preview_data_table
             ORDER BY created_at DESC
@@ -53,7 +53,7 @@ export async function getPreviewDataTableById(id) {
     const client = await pool.connect();
     try {
         const query = `
-            SELECT id, name, schema, items_ids, created_at, updated_at
+            SELECT id, name, schema, logo, items_ids, created_at, updated_at
             FROM preview_data_table
             WHERE id = $1
         `;
@@ -71,7 +71,7 @@ export async function getPreviewDataTableById(id) {
 export async function updatePreviewDataTable(id, updates) {
     const client = await pool.connect();
     try {
-        const allowedFields = ['name', 'schema', 'items_ids'];
+        const allowedFields = ['name', 'schema', 'logo', 'items_ids'];
         const updateFields = [];
         const values = [];
         let paramCount = 1;
@@ -95,7 +95,7 @@ export async function updatePreviewDataTable(id, updates) {
             UPDATE preview_data_table
             SET ${updateFields.join(', ')}, updated_at = NOW()
             WHERE id = $${paramCount}
-            RETURNING id, name, schema, items_ids, created_at, updated_at
+            RETURNING id, name, schema, logo, items_ids, created_at, updated_at
         `;
 
         const result = await client.query(query, values);
