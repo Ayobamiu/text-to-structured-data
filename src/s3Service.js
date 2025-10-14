@@ -37,6 +37,11 @@ class S3Service {
         return `${baseName}_${timestamp}_${random}${ext}`;
     }
 
+    // Calculate file hash for integrity checking
+    calculateFileHash(fileBuffer) {
+        return crypto.createHash('sha256').update(fileBuffer).digest('hex');
+    }
+
     // Upload logo file to S3
     async uploadLogo(fileBuffer, originalName) {
         try {
