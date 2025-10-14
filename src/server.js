@@ -1214,6 +1214,10 @@ app.post("/files/:fileId/retry-upload", upload.single('file'), async (req, res) 
                     // Update database with S3 info
                     await updateFileS3Info(fileId, s3FileInfo.s3Key, s3FileInfo.fileHash);
                     console.log(`✅ Database updated with S3 info for file ${fileId}`);
+
+                    // Add file back to processing queue
+                    await queueService.addFileToQueue(fileId, file.job_id);
+                    console.log(`✅ File ${fileId} added back to processing queue`);
                 } else {
                     // No new file provided, just mark as retry attempt
                     console.log(`🔄 Retrying upload for file ${fileId} (attempt ${currentRetryCount + 1}) - no new file provided`);
