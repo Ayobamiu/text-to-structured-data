@@ -316,6 +316,70 @@ app.delete("/queue/files/:fileId", async (req, res) => {
     }
 });
 
+// Add specific file to queue
+app.post("/queue/files/:fileId", async (req, res) => {
+    try {
+        const { fileId } = req.params;
+        const { priority = 0 } = req.body;
+
+        // Validate file exists and get its details
+        const file = await getFileResult(fileId);
+        if (!file) {
+            return res.status(404).json({
+                status: "error",
+                message: `File ${fileId} not found`
+            });
+        }
+
+        // Check if file is already completed
+        if (file.processing_status === 'completed') {
+            return res.status(400).json({
+                status: "error",
+                message: `File ${fileId} is already completed and cannot be re-queued`
+            });
+        }
+
+        // Check if file is already in queue
+        const client = await queueService.connect();
+        const queueItems = await client.zRange(queueService.queueKey, 0, -1);
+        const isInQueue = queueItems.some(item => {
+            try {
+                const data = JSON.parse(item);
+                return data.fileId === fileId;
+            } catch {
+                return false;
+            }
+        });
+
+        if (isInQueue) {
+            return res.status(400).json({
+                status: "error",
+                message: `File ${fileId} is already in the queue`
+            });
+        }
+
+        // Add file to queue
+        await queueService.addFileToQueue(fileId, file.job_id, priority);
+
+        res.json({
+            status: "success",
+            message: `File ${fileId} added to queue with priority ${priority}`,
+            file: {
+                id: fileId,
+                filename: file.filename,
+                jobId: file.job_id,
+                priority: priority
+            }
+        });
+    } catch (error) {
+        console.error('❌ Error adding file to queue:', error);
+        res.status(500).json({
+            status: "error",
+            message: error.message
+        });
+    }
+});
+
 // Get queue status (paused/resumed)
 app.get("/queue/status", async (req, res) => {
     try {
