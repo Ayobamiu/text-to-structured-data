@@ -65,15 +65,15 @@ export async function createJob(name, schema, schemaName, userId = null, organiz
 }
 
 // Add file to job
-export async function addFileToJob(jobId, filename, size, s3Key, fileHash) {
+export async function addFileToJob(jobId, filename, size, s3Key, fileHash, uploadStatus = 'pending', uploadError = null, storageType = 's3') {
     const client = await pool.connect();
     try {
         const fileId = uuidv4();
         const query = `
             INSERT INTO job_files (id, job_id, filename, size, s3_key, file_hash, 
-                                 extraction_status, processing_status, created_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
-            RETURNING id, filename, size, s3_key, file_hash
+                                 extraction_status, processing_status, upload_status, upload_error, storage_type, retry_count, last_retry_at, created_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, NOW())
+            RETURNING id, filename, size, s3_key, file_hash, upload_status, upload_error, storage_type, retry_count, last_retry_at
         `;
 
         const values = [
@@ -84,7 +84,12 @@ export async function addFileToJob(jobId, filename, size, s3Key, fileHash) {
             s3Key,
             fileHash,
             'pending',
-            'pending'
+            'pending',
+            uploadStatus,
+            uploadError,
+            storageType,
+            0,
+            null
         ];
 
         const result = await client.query(query, values);
@@ -92,6 +97,80 @@ export async function addFileToJob(jobId, filename, size, s3Key, fileHash) {
         return result.rows[0];
     } catch (error) {
         console.error('❌ Error adding file to job:', error.message);
+        throw error;
+    } finally {
+        client.release();
+    }
+}
+
+// Update file upload status
+export async function updateFileUploadStatus(fileId, uploadStatus, uploadError = null, storageType = null, retryCount = null) {
+    const client = await pool.connect();
+    try {
+        const updateFields = ['upload_status = $2'];
+        const values = [fileId, uploadStatus];
+        let paramCount = 2;
+
+        if (uploadError !== null) {
+            paramCount++;
+            updateFields.push(`upload_error = $${paramCount}`);
+            values.push(uploadError);
+        }
+
+        if (storageType !== null) {
+            paramCount++;
+            updateFields.push(`storage_type = $${paramCount}`);
+            values.push(storageType);
+        }
+
+        if (retryCount !== null) {
+            paramCount++;
+            updateFields.push(`retry_count = $${paramCount}`);
+            values.push(retryCount);
+        }
+
+        // Always update last_retry_at when status changes
+        paramCount++;
+        updateFields.push(`last_retry_at = NOW()`);
+
+        const query = `
+            UPDATE job_files 
+            SET ${updateFields.join(', ')}
+            WHERE id = $1
+            RETURNING id, upload_status, upload_error, storage_type, retry_count, last_retry_at
+        `;
+
+        const result = await client.query(query, values);
+        return result.rows[0];
+    } catch (error) {
+        console.error('❌ Error updating file upload status:', error.message);
+        throw error;
+    } finally {
+        client.release();
+    }
+}
+
+// Update file S3 information
+export async function updateFileS3Info(fileId, s3Key, fileHash) {
+    const client = await pool.connect();
+    try {
+        const query = `
+            UPDATE job_files 
+            SET s3_key = $2, file_hash = $3, updated_at = NOW()
+            WHERE id = $1
+            RETURNING id, s3_key, file_hash, updated_at
+        `;
+
+        const values = [fileId, s3Key, fileHash];
+        const result = await client.query(query, values);
+
+        if (result.rows.length === 0) {
+            throw new Error(`File ${fileId} not found`);
+        }
+
+        return result.rows[0];
+    } catch (error) {
+        console.error('❌ Error updating file S3 info:', error.message);
         throw error;
     } finally {
         client.release();
