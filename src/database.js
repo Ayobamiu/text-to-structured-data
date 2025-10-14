@@ -196,7 +196,8 @@ export async function getJobStatus(jobId) {
         const filesQuery = `
             SELECT id, filename, size, s3_key, file_hash, extraction_status, 
                    processing_status, extracted_text, extracted_tables, markdown, result, 
-                   processing_metadata, extraction_error, processing_error, created_at, processed_at
+                   processing_metadata, extraction_error, processing_error, created_at, processed_at,
+                   upload_status, upload_error, storage_type, retry_count, last_retry_at
             FROM job_files WHERE job_id = $1
             ORDER BY created_at
         `;
@@ -404,7 +405,8 @@ export async function getFileResult(fileId) {
         const query = `
             SELECT jf.id, jf.filename, jf.result, jf.extracted_text, jf.extracted_tables, jf.pages, jf.markdown,
                    jf.extraction_status, jf.processing_status, jf.extraction_error, jf.processing_error, jf.processed_at,
-                   jf.job_id, j.name as job_name, j.schema_data
+                   jf.job_id, j.name as job_name, j.schema_data, jf.upload_status, jf.upload_error, 
+                   jf.storage_type, jf.retry_count, jf.last_retry_at
             FROM job_files jf
             JOIN jobs j ON jf.job_id = j.id
             WHERE jf.id = $1
