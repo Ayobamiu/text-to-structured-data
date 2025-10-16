@@ -209,7 +209,38 @@ class FileProcessorWorker {
                 `Text extraction completed for ${file.filename}`
             );
 
-            // Stage 2: Process with OpenAI
+            // Check if this is a text-only extraction job
+            if (job.extraction_mode === 'text_only') {
+                console.log(`📝 Text-only mode: Skipping AI processing for ${file.filename}`);
+
+                // Mark processing as completed without AI processing
+                await updateFileProcessingStatus(file.id, 'completed', null, null, {
+                    mode: 'text_only',
+                    extracted_text: extractionResult.text,
+                    extracted_tables: extractionResult.tables,
+                    markdown: extractionResult.markdown,
+                    pages: extractionResult.pages
+                });
+
+                // Emit WebSocket event for completion
+                this.emitFileStatusUpdate(
+                    jobId,
+                    file.id,
+                    'completed',
+                    'completed',
+                    `Text extraction completed for ${file.filename} (text-only mode)`
+                );
+
+                this.processedCount++;
+
+                // Remove from processing
+                await queueService.removeFileFromProcessing(file.id);
+                console.log(`🗑️ File ${file.id} processing completed (text-only)`);
+
+                return; // Skip AI processing
+            }
+
+            // Stage 2: Process with OpenAI (only for full_extraction mode)
             console.log(`🤖 Stage 2: Processing extracted data with OpenAI`);
             await updateFileProcessingStatus(file.id, 'processing');
 

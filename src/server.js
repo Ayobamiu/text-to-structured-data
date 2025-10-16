@@ -690,7 +690,7 @@ app.put("/files/:id/results", authenticateToken, async (req, res) => {
 });
 
 // Add files to existing job
-app.post("/jobs/:id/files", authenticateToken, upload.array("files", 10), async (req, res) => {
+app.post("/jobs/:id/files", authenticateToken, upload.array("files", 20), async (req, res) => {
     try {
         const { id: jobId } = req.params;
         const { schema, schemaName } = req.body;
@@ -895,55 +895,82 @@ async function processFilesAsync(job, files, schema, schemaName) {
                     pages || null
                 );
 
-                // Emit extraction completed event
-                io.to(`job-${job.id}`).emit('file-status-update', {
-                    jobId: job.id,
-                    fileId: fileRecord.id,
-                    filename: file.originalname,
-                    extraction_status: 'completed',
-                    processing_status: 'processing',
-                    message: `Extraction completed for ${file.originalname}. Starting AI processing...`
-                });
+                // Check if this is a text-only extraction job
+                if (job.extraction_mode === 'text_only') {
+                    console.log(`📝 Text-only mode: Skipping AI processing for ${file.originalname}`);
 
-                // Step 4: Update file processing status to processing
-                await updateFileProcessingStatus(fileRecord.id, 'processing');
+                    // Mark processing as completed without AI processing
+                    await updateFileProcessingStatus(fileRecord.id, 'completed', null, null, {
+                        mode: 'text_only',
+                        extracted_text: rawText,
+                        extracted_tables: tables,
+                        markdown: markdown,
+                        pages: pages
+                    });
 
-                // Step 5: Process with OpenAI using markdown content
-                console.log(`Step 5: Processing ${file.originalname} with OpenAI using markdown content...`);
+                    // Emit file processing completed event
+                    io.to(`job-${job.id}`).emit('file-status-update', {
+                        jobId: job.id,
+                        fileId: fileRecord.id,
+                        filename: file.originalname,
+                        extraction_status: 'completed',
+                        processing_status: 'completed',
+                        message: `Text extraction completed for ${file.originalname} (text-only mode)`
+                    });
 
-                // Use markdown content for better AI processing
-                const contentForAI = markdown || rawText;
-                console.log(`Using ${markdown ? 'markdown' : 'extracted text'} for OpenAI processing (${contentForAI.length} characters)`);
+                    console.log(`✅ Text-only processing completed for ${file.originalname}`);
+                } else {
+                    // Full extraction mode - continue with AI processing
+                    console.log(`🤖 Full extraction mode: Processing ${file.originalname} with AI...`);
 
-                // Step 5: Process with OpenAI using shared function
-                console.log(`Step 5: Processing ${file.originalname} with OpenAI using shared processor...`);
+                    // Emit extraction completed event
+                    io.to(`job-${job.id}`).emit('file-status-update', {
+                        jobId: job.id,
+                        fileId: fileRecord.id,
+                        filename: file.originalname,
+                        extraction_status: 'completed',
+                        processing_status: 'processing',
+                        message: `Extraction completed for ${file.originalname}. Starting AI processing...`
+                    });
 
-                const processingResult = await processWithOpenAI(contentForAI, {
-                    schemaName: schemaName || "data_extraction",
-                    schema: JSON.parse(schema)
-                });
+                    // Step 4: Update file processing status to processing
+                    await updateFileProcessingStatus(fileRecord.id, 'processing');
 
-                if (!processingResult.success) {
-                    throw new Error(`OpenAI processing failed: ${processingResult.error}`);
+                    // Step 5: Process with OpenAI using markdown content
+                    console.log(`Step 5: Processing ${file.originalname} with OpenAI using markdown content...`);
+
+                    // Use markdown content for better AI processing
+                    const contentForAI = markdown || rawText;
+                    console.log(`Using ${markdown ? 'markdown' : 'extracted text'} for OpenAI processing (${contentForAI.length} characters)`);
+
+                    // Step 5: Process with OpenAI using shared function
+                    console.log(`Step 5: Processing ${file.originalname} with OpenAI using shared processor...`);
+
+                    const processingResult = await processWithOpenAI(contentForAI, {
+                        schemaName: schemaName || "data_extraction",
+                        schema: JSON.parse(schema)
+                    });
+
+                    if (!processingResult.success) {
+                        throw new Error(`OpenAI processing failed: ${processingResult.error}`);
+                    }
+
+                    console.log(`OpenAI processing completed for ${file.originalname}`);
+
+                    // Step 6: Update file processing status to completed
+                    await updateFileProcessingStatus(fileRecord.id, 'completed', processingResult.data, null, processingResult.metadata);
+
+                    // Emit file processing completed event
+                    io.to(`job-${job.id}`).emit('file-status-update', {
+                        jobId: job.id,
+                        fileId: fileRecord.id,
+                        filename: file.originalname,
+                        extraction_status: 'completed',
+                        processing_status: 'completed',
+                        message: `Successfully processed ${file.originalname}`,
+                        result: processingResult.data
+                    });
                 }
-
-                console.log(`OpenAI processing completed for ${file.originalname}`);
-
-                // Step 6: Update file processing status to completed
-                await updateFileProcessingStatus(fileRecord.id, 'completed', processingResult.data, null, processingResult.metadata);
-
-                // Emit file processing completed event
-                io.to(`job-${job.id}`).emit('file-status-update', {
-                    jobId: job.id,
-                    fileId: fileRecord.id,
-                    filename: file.originalname,
-                    extraction_status: 'completed',
-                    processing_status: 'completed',
-                    message: `Successfully processed ${file.originalname}`,
-                    result: processingResult.data
-                });
-
-                console.log(`✅ Successfully processed ${file.originalname}`);
 
             } catch (fileError) {
                 console.error(`Error processing file ${file.originalname}:`, fileError.message);
@@ -1015,7 +1042,7 @@ async function processFilesAsync(job, files, schema, schemaName) {
 }
 
 // Main extraction endpoint - Updated for multiple files
-app.post("/extract", authenticateToken, upload.array("files", 10), async (req, res) => {
+app.post("/extract", authenticateToken, upload.array("files", 20), async (req, res) => {
     let job = null;
     const fileRecords = [];
     const processedFiles = [];
@@ -1033,7 +1060,7 @@ app.post("/extract", authenticateToken, upload.array("files", 10), async (req, r
             return res.status(400).json({ error: "No request body provided" });
         }
 
-        const { schema, schemaName, jobName } = req.body;
+        const { schema, schemaName, jobName, extractionMode = 'full_extraction' } = req.body;
 
         if (!req.files || req.files.length === 0) {
             console.error("No files provided in request");
@@ -1061,7 +1088,7 @@ app.post("/extract", authenticateToken, upload.array("files", 10), async (req, r
             });
         }
 
-        job = await createJob(jobName, schema, schemaName, req.user.id, organizationId);
+        job = await createJob(jobName, schema, schemaName, req.user.id, organizationId, extractionMode);
         console.log(`✅ Job created: ${job.id}`);
 
         // Step 1: Create file records immediately for better UX

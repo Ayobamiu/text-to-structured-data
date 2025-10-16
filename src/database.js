@@ -34,14 +34,14 @@ export async function testConnection() {
 }
 
 // Create a new job
-export async function createJob(name, schema, schemaName, userId = null, organizationId = null) {
+export async function createJob(name, schema, schemaName, userId = null, organizationId = null, extractionMode = 'full_extraction') {
     const client = await pool.connect();
     try {
         const jobId = uuidv4();
         const query = `
-            INSERT INTO jobs (id, name, schema_data, status, user_id, organization_id, created_at, updated_at)
-            VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW())
-            RETURNING id, name, status, created_at
+            INSERT INTO jobs (id, name, schema_data, status, user_id, organization_id, extraction_mode, created_at, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW())
+            RETURNING id, name, status, extraction_mode, created_at
         `;
 
         const values = [
@@ -50,7 +50,8 @@ export async function createJob(name, schema, schemaName, userId = null, organiz
             JSON.stringify({ schema, schemaName: schemaName || 'data_extraction' }),
             'queued',
             userId,
-            organizationId
+            organizationId,
+            extractionMode
         ];
 
         const result = await client.query(query, values);
@@ -183,7 +184,7 @@ export async function getJobStatus(jobId) {
     try {
         // Get job details
         const jobQuery = `
-            SELECT id, name, status, schema_data, summary, user_id, created_at, updated_at
+            SELECT id, name, status, schema_data, summary, user_id, created_at, updated_at, extraction_mode
             FROM jobs WHERE id = $1
         `;
         const jobResult = await client.query(jobQuery, [jobId]);
