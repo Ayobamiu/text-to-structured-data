@@ -306,9 +306,35 @@ app.delete("/queue/files/:fileId", async (req, res) => {
     try {
         const { fileId } = req.params;
         await queueService.removeFileFromQueue(fileId);
+
+        // Also remove from processing state if it's stuck there
+        try {
+            await queueService.removeFileFromProcessing(fileId);
+            console.log(`✅ File ${fileId} removed from processing state`);
+        } catch (processingError) {
+            console.warn(`⚠️ Could not remove file ${fileId} from processing state: ${processingError.message}`);
+        }
+
         res.json({
             status: "success",
-            message: `File ${fileId} removed from queue`
+            message: `File ${fileId} removed from queue and processing state`
+        });
+    } catch (error) {
+        res.status(500).json({
+            status: "error",
+            message: error.message
+        });
+    }
+});
+
+// Clear all stuck processing files
+app.post("/queue/clear-processing", async (req, res) => {
+    try {
+        const clearedCount = await queueService.clearAllProcessingFiles();
+        res.json({
+            status: "success",
+            message: `Cleared ${clearedCount} stuck processing files`,
+            clearedCount
         });
     } catch (error) {
         res.status(500).json({

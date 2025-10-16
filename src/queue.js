@@ -142,6 +142,27 @@ class QueueService {
         }
     }
 
+    // Clear all stuck processing files
+    async clearAllProcessingFiles() {
+        try {
+            const client = await this.connect();
+            const processingFiles = await client.hGetAll(this.processingKey);
+            const fileIds = Object.keys(processingFiles);
+
+            if (fileIds.length === 0) {
+                console.log('✅ No processing files to clear');
+                return 0;
+            }
+
+            await client.del(this.processingKey);
+            console.log(`✅ Cleared ${fileIds.length} stuck processing files:`, fileIds);
+            return fileIds.length;
+        } catch (error) {
+            console.error('❌ Error clearing processing files:', error.message);
+            throw error;
+        }
+    }
+
     // Retry failed file
     async retryFile(fileId, jobId, priority = 0) {
         try {
