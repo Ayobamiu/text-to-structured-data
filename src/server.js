@@ -1189,6 +1189,190 @@ app.post("/extract", authenticateToken, upload.array("files", 20), async (req, r
     }
 });
 
+// Delete single file from job
+app.delete("/files/:fileId", authenticateToken, async (req, res) => {
+    try {
+        const { fileId } = req.params;
+
+        // Get file details first
+        const file = await getFileResult(fileId);
+        if (!file) {
+            return res.status(404).json({
+                status: "error",
+                message: "File not found"
+            });
+        }
+
+        // Check if user has access to this file's job organization
+        const job = await getJobStatus(file.job_id);
+        if (!job) {
+            return res.status(404).json({
+                status: "error",
+                message: "Job not found"
+            });
+        }
+
+        const userOrganizations = await getUserOrganizations(req.user.id);
+        const userOrganizationIds = userOrganizations.map(org => org.id);
+
+        if (job.organization_id && !userOrganizationIds.includes(job.organization_id)) {
+            return res.status(403).json({
+                status: "error",
+                message: "Access denied to this file"
+            });
+        }
+
+        // Delete file from database
+        const client = await pool.connect();
+        try {
+            const deleteQuery = `
+                DELETE FROM job_files 
+                WHERE id = $1
+                RETURNING id, filename, job_id
+            `;
+
+            const deleteResult = await client.query(deleteQuery, [fileId]);
+
+            if (deleteResult.rows.length === 0) {
+                return res.status(404).json({
+                    status: "error",
+                    message: "File not found"
+                });
+            }
+
+            const deletedFile = deleteResult.rows[0];
+
+            // Remove file from processing queue if it exists
+            try {
+                await queueService.removeFileFromProcessing(fileId);
+                console.log(`✅ File ${fileId} removed from processing queue`);
+            } catch (queueError) {
+                console.warn(`⚠️ Could not remove file ${fileId} from queue: ${queueError.message}`);
+            }
+
+            res.json({
+                status: "success",
+                message: `File ${deletedFile.filename} deleted successfully`,
+                data: {
+                    fileId: deletedFile.id,
+                    filename: deletedFile.filename,
+                    jobId: deletedFile.job_id
+                }
+            });
+
+        } finally {
+            client.release();
+        }
+
+    } catch (error) {
+        console.error('Error deleting file:', error);
+        res.status(500).json({
+            status: "error",
+            message: "Failed to delete file",
+            error: error.message
+        });
+    }
+});
+
+// Delete multiple files from job
+app.delete("/files", authenticateToken, async (req, res) => {
+    try {
+        const { fileIds } = req.body;
+
+        if (!fileIds || !Array.isArray(fileIds) || fileIds.length === 0) {
+            return res.status(400).json({
+                status: "error",
+                message: "File IDs array is required"
+            });
+        }
+
+        const deletedFiles = [];
+        const errors = [];
+
+        // Get user's organizations for access control
+        const userOrganizations = await getUserOrganizations(req.user.id);
+        const userOrganizationIds = userOrganizations.map(org => org.id);
+
+        const client = await pool.connect();
+        try {
+            for (const fileId of fileIds) {
+                try {
+                    // Get file details
+                    const file = await getFileResult(fileId);
+                    if (!file) {
+                        errors.push({ fileId, error: "File not found" });
+                        continue;
+                    }
+
+                    // Check if user has access to this file's job organization
+                    const job = await getJobStatus(file.job_id);
+                    if (!job) {
+                        errors.push({ fileId, error: "Job not found" });
+                        continue;
+                    }
+
+                    if (job.organization_id && !userOrganizationIds.includes(job.organization_id)) {
+                        errors.push({ fileId, error: "Access denied" });
+                        continue;
+                    }
+
+                    // Delete file from database
+                    const deleteQuery = `
+                        DELETE FROM job_files 
+                        WHERE id = $1
+                        RETURNING id, filename, job_id
+                    `;
+
+                    const deleteResult = await client.query(deleteQuery, [fileId]);
+
+                    if (deleteResult.rows.length > 0) {
+                        const deletedFile = deleteResult.rows[0];
+                        deletedFiles.push({
+                            fileId: deletedFile.id,
+                            filename: deletedFile.filename,
+                            jobId: deletedFile.job_id
+                        });
+
+                        // Remove file from processing queue if it exists
+                        try {
+                            await queueService.removeFileFromProcessing(fileId);
+                            console.log(`✅ File ${fileId} removed from processing queue`);
+                        } catch (queueError) {
+                            console.warn(`⚠️ Could not remove file ${fileId} from queue: ${queueError.message}`);
+                        }
+                    } else {
+                        errors.push({ fileId, error: "File not found" });
+                    }
+
+                } catch (fileError) {
+                    console.error(`Error deleting file ${fileId}:`, fileError.message);
+                    errors.push({ fileId, error: fileError.message });
+                }
+            }
+
+            res.json({
+                status: "success",
+                message: `Deleted ${deletedFiles.length} files successfully`,
+                data: {
+                    deletedFiles,
+                    errors: errors.length > 0 ? errors : undefined
+                }
+            });
+
+        } finally {
+            client.release();
+        }
+
+    } catch (error) {
+        console.error('Error deleting files:', error);
+        res.status(500).json({
+            status: "error",
+            message: "Failed to delete files",
+            error: error.message
+        });
+    }
+});
+
 // Retry failed file upload
 app.post("/files/:fileId/retry-upload", upload.single('file'), async (req, res) => {
     try {
