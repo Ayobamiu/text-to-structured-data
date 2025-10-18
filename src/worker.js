@@ -408,15 +408,11 @@ class FileProcessorWorker {
                     headers: {
                         ...formData.getHeaders(),
                     },
-                    timeout: 60000 // 60 second timeout for PDF processing
+                    timeout: 1200000 // 20 minutes timeout for PDF processing
                 });
                 if (!response.data.success) {
                     throw new Error(`Flask extraction failed: ${response.data.error}`);
                 }
-
-                // Extract text from Flask response
-                const extractedText = response.data.data.pages.map((page) => page.text).join("\n\n");
-                console.log(`📝 Extracted ${extractedText.length} characters from PDF`);
 
                 const documentData = response.data.data;
                 const markdown = documentData.markdown || "";
