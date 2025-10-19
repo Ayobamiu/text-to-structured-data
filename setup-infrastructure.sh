@@ -102,7 +102,7 @@ REDIS_MAX_RETRIES=3
 
 # Flask Service Configuration
 FLASK_URL=http://localhost:5001
-FLASK_TIMEOUT=1200000
+FLASK_TIMEOUT=2400000
 FLASK_RETRY_ATTEMPTS=3
 
 # OpenAI Configuration

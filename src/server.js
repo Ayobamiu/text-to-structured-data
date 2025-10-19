@@ -892,7 +892,7 @@ async function processFilesAsync(job, files, schema, schemaName) {
                     headers: {
                         ...formData.getHeaders(),
                     },
-                    timeout: 1200000, // 20 minutes timeout for large files
+                    timeout: 2 * 1200000, // 40 minutes timeout for large files
                 });
 
                 console.log(`Flask response received for ${file.originalname}`);

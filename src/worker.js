@@ -408,7 +408,7 @@ class FileProcessorWorker {
                     headers: {
                         ...formData.getHeaders(),
                     },
-                    timeout: 1200000 // 20 minutes timeout for PDF processing
+                    timeout: 2 * 1200000 // 40 minutes timeout for PDF processing
                 });
                 if (!response.data.success) {
                     throw new Error(`Flask extraction failed: ${response.data.error}`);
