@@ -70,7 +70,8 @@ class QueueService {
     }
 
     // Add file to processing queue
-    async addFileToQueue(fileId, jobId, priority = 0) {
+    async addFileToQueue(fileId, jobId, priority = 0, mode = 'normal') {
+        console.log(`🔄 Adding file ${fileId} to queue with priority ${priority} (mode: ${mode})`);
         try {
             const client = await this.connect();
 
@@ -80,7 +81,8 @@ class QueueService {
                 priority,
                 timestamp: Date.now(),
                 retries: 0,
-                status: 'queued'
+                status: 'queued',
+                mode: mode // 'normal' or 'reprocess'
             };
 
             // Add to sorted set (priority queue)
@@ -89,7 +91,7 @@ class QueueService {
                 value: JSON.stringify(queueItem)
             });
 
-            console.log(`✅ File ${fileId} added to queue with priority ${priority}`);
+            console.log(`✅ File ${fileId} added to queue with priority ${priority} (mode: ${mode})`);
             return queueItem;
         } catch (error) {
             console.error('❌ Error adding file to queue:', error.message);

@@ -153,8 +153,8 @@ class FileProcessorWorker {
     }
 
     async processFile(queueItem) {
-        const { fileId, jobId, retries } = queueItem;
-        console.log(`🔄 Processing file: ${fileId} (attempt ${retries + 1})`);
+        const { fileId, jobId, retries, mode = 'normal' } = queueItem;
+        console.log(`🔄 Processing file: ${fileId} (attempt ${retries + 1}, mode: ${mode})`);
 
         try {
             // Mark file as processing
@@ -170,44 +170,71 @@ class FileProcessorWorker {
                 throw new Error(`File ${fileId} not found in job ${jobId}`);
             }
 
-            // Stage 1: Extract text from file
-            console.log(`📄 Stage 1: Extracting text from ${file.filename}`);
-            await updateFileExtractionStatus(file.id, 'processing');
+            let extractionResult;
 
-            // Emit WebSocket event for Stage 1 start
-            this.emitFileStatusUpdate(
-                jobId,
-                file.id,
-                'processing',
-                file.processing_status || 'pending',
-                `Starting text extraction for ${file.filename}`
-            );
+            if (mode === 'reprocess') {
+                // Reprocessing mode: Skip extraction, use existing text/markdown
+                console.log(`🔄 Reprocessing mode: Using existing extracted data for ${file.filename}`);
 
-            const extractionResult = await this.extractTextFromFile(file);
+                // Emit WebSocket event for reprocessing start
+                this.emitFileStatusUpdate(
+                    jobId,
+                    file.id,
+                    file.extraction_status || 'completed',
+                    'processing',
+                    `Starting reprocessing for ${file.filename}`
+                );
 
-            if (!extractionResult.success) {
-                throw new Error(`Extraction failed: ${extractionResult.error}`);
+                // Use existing extracted data
+                extractionResult = {
+                    success: true,
+                    text: file.extracted_text || '',
+                    tables: file.extracted_tables || [],
+                    markdown: file.markdown || '',
+                    pages: file.pages || []
+                };
+
+                console.log(`✅ Using existing extracted data for ${file.filename}`);
+            } else {
+                // Normal mode: Extract text from file
+                console.log(`📄 Stage 1: Extracting text from ${file.filename}`);
+                await updateFileExtractionStatus(file.id, 'processing');
+
+                // Emit WebSocket event for Stage 1 start
+                this.emitFileStatusUpdate(
+                    jobId,
+                    file.id,
+                    'processing',
+                    file.processing_status || 'pending',
+                    `Starting text extraction for ${file.filename}`
+                );
+
+                extractionResult = await this.extractTextFromFile(file);
+
+                if (!extractionResult.success) {
+                    throw new Error(`Extraction failed: ${extractionResult.error}`);
+                }
+
+                // Update extraction status
+                await updateFileExtractionStatus(
+                    file.id,
+                    'completed',
+                    extractionResult.text,
+                    extractionResult.tables,
+                    extractionResult.markdown,
+                    extractionResult.pages
+                );
+                console.log(`✅ File ${file.filename} extraction completed`);
+
+                // Emit WebSocket event for Stage 1 completion
+                this.emitFileStatusUpdate(
+                    jobId,
+                    file.id,
+                    'completed',
+                    file.processing_status || 'pending',
+                    `Text extraction completed for ${file.filename}`
+                );
             }
-
-            // Update extraction status
-            await updateFileExtractionStatus(
-                file.id,
-                'completed',
-                extractionResult.text,
-                extractionResult.tables,
-                extractionResult.markdown,
-                extractionResult.pages
-            );
-            console.log(`✅ File ${file.filename} extraction completed`);
-
-            // Emit WebSocket event for Stage 1 completion
-            this.emitFileStatusUpdate(
-                jobId,
-                file.id,
-                'completed',
-                file.processing_status || 'pending',
-                `Text extraction completed for ${file.filename}`
-            );
 
             // Check if this is a text-only extraction job
             if (job.extraction_mode === 'text_only') {
