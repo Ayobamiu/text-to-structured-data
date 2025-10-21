@@ -10,6 +10,8 @@ import {
 } from './database.js';
 import S3Service from './s3Service.js';
 import { processWithOpenAI } from './utils/openaiProcessor.js';
+import ExtractionService from './services/extractionService.js';
+import ProcessingService from './services/processingService.js';
 
 dotenv.config();
 
@@ -25,6 +27,8 @@ class FileProcessorWorker {
         this.errorCount = 0;
         this.startTime = new Date();
         this.s3Service = new S3Service();
+        this.extractionService = new ExtractionService();
+        this.processingService = new ProcessingService();
 
         // Initialize Socket.IO client for WebSocket events
         this.socket = io(SERVER_URL, {
@@ -209,7 +213,11 @@ class FileProcessorWorker {
                     `Starting text extraction for ${file.filename}`
                 );
 
-                extractionResult = await this.extractTextFromFile(file);
+                // Get extraction method from job processing config
+                const extractionMethod = job.processing_config?.extraction?.method || 'mineru';
+                const extractionOptions = job.processing_config?.extraction?.options || {};
+
+                extractionResult = await this.extractTextFromFile(file, extractionMethod, extractionOptions);
 
                 if (!extractionResult.success) {
                     throw new Error(`Extraction failed: ${extractionResult.error}`);
@@ -305,9 +313,22 @@ class FileProcessorWorker {
                 throw new Error(`Missing schema in job data. Got: ${JSON.stringify(schemaData)}`);
             }
 
-            const processingResult = await processWithOpenAI(
+            // Get processing method and model from job processing config
+            const processingMethod = job.processing_config?.processing?.method || 'openai';
+            const processingModel = job.processing_config?.processing?.model || 'gpt-4o';
+            const processingOptions = job.processing_config?.processing?.options || {};
+
+            // Merge model into options
+            const finalProcessingOptions = {
+                model: processingModel,
+                ...processingOptions
+            };
+
+            const processingResult = await this.processingService.processText(
                 extractionResult.markdown,
-                schemaData
+                schemaData,
+                processingMethod,
+                finalProcessingOptions
             );
 
             if (processingResult.success) {
@@ -387,12 +408,12 @@ class FileProcessorWorker {
         }
     }
 
-    async extractTextFromFile(file) {
+    async extractTextFromFile(file, method = 'mineru', options = {}) {
         try {
-            console.log(`📄 Extracting text from: ${file.filename}`);
+            console.log(`📄 Extracting text from: ${file.filename} using ${method}`);
             // Check if file is stored in S3
             if (file.s3_key && this.s3Service.isCloudStorageEnabled()) {
-                return await this.extractFromS3File(file);
+                return await this.extractFromS3File(file, method, options);
             } else {
                 // File is not available for processing
                 throw new Error('File not available for processing (not in S3)');
@@ -407,9 +428,9 @@ class FileProcessorWorker {
         }
     }
 
-    async extractFromS3File(file) {
+    async extractFromS3File(file, method = 'mineru', options = {}) {
         try {
-            console.log(`📄 Processing S3 file: ${file.s3_key}`);
+            console.log(`📄 Processing S3 file: ${file.s3_key} with ${method}`);
 
             // Download file from S3
             const fileBuffer = await this.s3Service.downloadFile(file.s3_key);
@@ -422,38 +443,15 @@ class FileProcessorWorker {
             fs.writeFileSync(tempPath, fileBuffer);
 
             try {
-                // Use Flask service for PDF processing
-                const FormData = (await import('form-data')).default;
-                const formData = new FormData();
-                formData.append("file", fs.createReadStream(tempPath), {
-                    filename: file.filename,
-                    contentType: "application/pdf",
-                });
+                // Use extraction service with specified method
+                const extractionResult = await this.extractionService.extractText(
+                    tempPath,
+                    file.filename,
+                    method,
+                    options
+                );
 
-                console.log(`🌐 Calling Flask service: ${FLASK_URL}/extract`);
-                const response = await axios.post(`${FLASK_URL}/extract`, formData, {
-                    headers: {
-                        ...formData.getHeaders(),
-                    },
-                    timeout: 2 * 1200000 // 40 minutes timeout for PDF processing
-                });
-                if (!response.data.success) {
-                    throw new Error(`Flask extraction failed: ${response.data.error}`);
-                }
-
-                const documentData = response.data.data;
-                const markdown = documentData.markdown || "";
-                const text = documentData.full_text || "";
-                const pages = documentData.pages || [];
-                const tables = documentData.tables || [];
-
-                return {
-                    success: true,
-                    text,
-                    tables,
-                    markdown,
-                    pages
-                };
+                return extractionResult;
 
             } finally {
                 // Clean up temporary file

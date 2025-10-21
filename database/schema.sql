@@ -116,6 +116,10 @@ CREATE TABLE IF NOT EXISTS jobs (
     status VARCHAR(50) NOT NULL DEFAULT 'queued',
     schema_data JSONB NOT NULL,
     summary JSONB,
+    processing_config JSONB DEFAULT '{
+        "extraction": {"method": "mineru", "options": {}},
+        "processing": {"method": "openai", "model": "gpt-4o", "options": {}}
+    }',
     user_id UUID REFERENCES users(id) ON DELETE SET NULL,
     organization_id UUID REFERENCES organizations(id) ON DELETE CASCADE, -- Multi-tenant support
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),

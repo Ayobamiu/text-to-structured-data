@@ -34,14 +34,23 @@ export async function testConnection() {
 }
 
 // Create a new job
-export async function createJob(name, schema, schemaName, userId = null, organizationId = null, extractionMode = 'full_extraction') {
+export async function createJob(name, schema, schemaName, userId = null, organizationId = null, extractionMode = 'full_extraction', processingConfig = null) {
     const client = await pool.connect();
     try {
         const jobId = uuidv4();
+
+        // Set default processing config if not provided
+        const defaultProcessingConfig = {
+            extraction: { method: 'mineru', options: {} },
+            processing: { method: 'openai', model: 'gpt-4o', options: {} }
+        };
+
+        const finalProcessingConfig = processingConfig || defaultProcessingConfig;
+
         const query = `
-            INSERT INTO jobs (id, name, schema_data, status, user_id, organization_id, extraction_mode, created_at, updated_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW())
-            RETURNING id, name, status, extraction_mode, created_at
+            INSERT INTO jobs (id, name, schema_data, status, user_id, organization_id, extraction_mode, processing_config, created_at, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())
+            RETURNING id, name, status, extraction_mode, processing_config, created_at
         `;
 
         const values = [
@@ -51,7 +60,8 @@ export async function createJob(name, schema, schemaName, userId = null, organiz
             'queued',
             userId,
             organizationId,
-            extractionMode
+            extractionMode,
+            JSON.stringify(finalProcessingConfig)
         ];
 
         const result = await client.query(query, values);

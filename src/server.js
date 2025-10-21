@@ -835,7 +835,7 @@ app.get("/jobs/:id/files", authenticateToken, async (req, res) => {
 });
 
 // Async function to process files in the background
-async function processFilesAsync(job, files, schema, schemaName) {
+async function processFilesAsync(job, files, schema, schemaName, processingConfig) {
     try {
         console.log(`🔄 Starting background processing for job ${job.id} with ${files.length} files`);
 
@@ -886,6 +886,13 @@ async function processFilesAsync(job, files, schema, schemaName) {
                     filename: file.originalname,
                     contentType: file.mimetype,
                 });
+                console.log(`Processing config: ${processingConfig}, job processing config: ${job.processing_config}`);
+                // Add extraction method from processing config
+                const eToJSON = JSON.parse(processingConfig);
+                const jobProcessingConfig = JSON.parse(job.processing_config);
+                const extractionMethod = eToJSON?.extraction?.method || jobProcessingConfig?.extraction?.method || 'mineru';
+                formData.append("extraction_method", extractionMethod);
+                console.log(`Using extraction method: ${extractionMethod}`);
 
                 console.log(`Sending request to Flask service: ${FLASK_URL}/extract`);
                 const flaskResponse = await axios.post(`${FLASK_URL}/extract`, formData, {
@@ -1086,7 +1093,7 @@ app.post("/extract", authenticateToken, upload.array("files", 20), async (req, r
             return res.status(400).json({ error: "No request body provided" });
         }
 
-        const { schema, schemaName, jobName, extractionMode = 'full_extraction' } = req.body;
+        const { schema, schemaName, jobName, extractionMode = 'full_extraction', processingConfig } = req.body;
 
         if (!req.files || req.files.length === 0) {
             console.error("No files provided in request");
@@ -1114,7 +1121,15 @@ app.post("/extract", authenticateToken, upload.array("files", 20), async (req, r
             });
         }
 
-        job = await createJob(jobName, schema, schemaName, req.user.id, organizationId, extractionMode);
+        // Set default processing config if not provided
+        const defaultProcessingConfig = {
+            extraction: { method: 'mineru', options: {} },
+            processing: { method: 'openai', model: 'gpt-4o', options: {} }
+        };
+
+        const finalProcessingConfig = processingConfig || defaultProcessingConfig;
+
+        job = await createJob(jobName, schema, schemaName, req.user.id, organizationId, extractionMode, finalProcessingConfig);
         console.log(`✅ Job created: ${job.id}`);
 
         // Step 1: Create file records immediately for better UX
@@ -1192,7 +1207,7 @@ app.post("/extract", authenticateToken, upload.array("files", 20), async (req, r
 
         // Process files asynchronously in the background
         console.log(`🚀 Starting background processing for job ${job.id} with ${req.files.length} files`);
-        processFilesAsync(job, req.files, schema, schemaName).catch(error => {
+        processFilesAsync(job, req.files, schema, schemaName, finalProcessingConfig).catch(error => {
             console.error(`❌ Background processing failed for job ${job.id}:`, error.message);
             console.error(`❌ Error stack:`, error.stack);
         });
