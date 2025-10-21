@@ -1399,6 +1399,160 @@ app.delete("/files", authenticateToken, async (req, res) => {
     }
 });
 
+// Reprocess files (re-run AI processing without re-extraction)
+app.post("/files/reprocess", authenticateToken, async (req, res) => {
+    try {
+        const { fileIds, priority = 0 } = req.body;
+
+        // Validate input
+        if (!fileIds || !Array.isArray(fileIds) || fileIds.length === 0) {
+            return res.status(400).json({
+                status: "error",
+                message: "File IDs array is required"
+            });
+        }
+
+        // Get user's organizations for access control
+        const userOrganizations = await getUserOrganizations(req.user.id);
+        const userOrganizationIds = userOrganizations.map(org => org.id);
+
+        if (userOrganizationIds.length === 0) {
+            return res.status(403).json({
+                status: "error",
+                message: "User must be part of an organization to reprocess files"
+            });
+        }
+
+        const queuedFiles = [];
+        const skippedFiles = [];
+        const errors = [];
+
+        // Process each file ID
+        for (const fileId of fileIds) {
+            try {
+                // Get file details
+                const file = await getFileResult(fileId);
+                if (!file) {
+                    skippedFiles.push({
+                        fileId,
+                        reason: "File not found"
+                    });
+                    continue;
+                }
+
+                // Check if user has access to this file's job organization
+                const job = await getJobStatus(file.job_id);
+                if (!job) {
+                    skippedFiles.push({
+                        fileId,
+                        reason: "Job not found"
+                    });
+                    continue;
+                }
+
+                if (job.organization_id && !userOrganizationIds.includes(job.organization_id)) {
+                    skippedFiles.push({
+                        fileId,
+                        reason: "Access denied"
+                    });
+                    continue;
+                }
+
+                // Validate file can be reprocessed
+                if (file.extraction_status !== 'completed') {
+                    console.log(`File ${fileId} extraction not completed`);
+                    skippedFiles.push({
+                        fileId,
+                        reason: "File extraction not completed"
+                    });
+                    continue;
+                }
+
+                if (!file.extracted_text && !file.markdown) {
+                    console.log(`File ${fileId} no extracted text available for reprocessing`);
+                    skippedFiles.push({
+                        fileId,
+                        reason: "No extracted text available for reprocessing"
+                    });
+                    continue;
+                }
+
+                // Check if file is already in queue
+                const client = await queueService.connect();
+                const queueItems = await client.zRange(queueService.queueKey, 0, -1);
+                const isInQueue = queueItems.some(item => {
+                    try {
+                        const data = JSON.parse(item);
+                        return data.fileId === fileId;
+                    } catch {
+                        return false;
+                    }
+                });
+
+                if (isInQueue) {
+                    console.log(`File ${fileId} already in processing queue`);
+                    skippedFiles.push({
+                        fileId,
+                        reason: "File already in processing queue"
+                    });
+                    continue;
+                }
+
+                // Check if file is currently being processed
+                const isProcessing = await client.hExists(queueService.processingKey, fileId);
+                if (isProcessing) {
+                    console.log(`File ${fileId} currently being processed`);
+                    skippedFiles.push({
+                        fileId,
+                        reason: "File currently being processed"
+                    });
+                    continue;
+                }
+
+                // Reset processing status to pending
+                await updateFileProcessingStatus(fileId, 'pending');
+                console.log(`File ${fileId} processing status reset to pending`);
+                // Add file to queue with reprocessing mode
+                await queueService.addFileToQueue(fileId, file.job_id, priority, 'reprocess');
+
+                console.log(`File ${fileId} added to queue for reprocessing`);
+
+                queuedFiles.push({
+                    fileId: file.id,
+                    filename: file.filename,
+                    jobId: file.job_id
+                });
+
+                console.log(`✅ File ${fileId} queued for reprocessing`);
+
+            } catch (fileError) {
+                console.error(`Error processing file ${fileId}:`, fileError.message);
+                errors.push({
+                    fileId,
+                    error: fileError.message
+                });
+            }
+        }
+
+        res.json({
+            status: "success",
+            message: `Queued ${queuedFiles.length} files for reprocessing`,
+            data: {
+                queuedFiles,
+                skippedFiles: skippedFiles.length > 0 ? skippedFiles : undefined,
+                errors: errors.length > 0 ? errors : undefined
+            }
+        });
+
+    } catch (error) {
+        console.error('❌ Error reprocessing files:', error);
+        res.status(500).json({
+            status: "error",
+            message: error.message
+        });
+    }
+});
+
 // Retry failed file upload
 app.post("/files/:fileId/retry-upload", upload.single('file'), async (req, res) => {
     try {
