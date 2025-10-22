@@ -208,7 +208,8 @@ export async function getJobStatus(jobId) {
             SELECT id, filename, size, s3_key, file_hash, extraction_status, 
                    processing_status, extracted_text, extracted_tables, markdown, result, 
                    processing_metadata, extraction_error, processing_error, created_at, processed_at,
-                   upload_status, upload_error, storage_type, retry_count, last_retry_at
+                   upload_status, upload_error, storage_type, retry_count, last_retry_at,
+                   extraction_time_seconds, ai_processing_time_seconds
             FROM job_files WHERE job_id = $1
             ORDER BY created_at
         `;
@@ -244,25 +245,25 @@ export async function getJobStatus(jobId) {
 }
 
 // Update file extraction status
-export async function updateFileExtractionStatus(fileId, status, extractedText = null, extractedTables = null, markdown = null, pages = null, error = null) {
+export async function updateFileExtractionStatus(fileId, status, extractedText = null, extractedTables = null, markdown = null, pages = null, error = null, extractionTimeSeconds = null) {
     const client = await pool.connect();
     try {
         const query = `
             UPDATE job_files 
             SET extraction_status = $1, extracted_text = $2, extracted_tables = $3, 
-                markdown = $4, pages = $5, extraction_error = $6, updated_at = NOW()
-            WHERE id = $7
+                markdown = $4, pages = $5, extraction_error = $6, extraction_time_seconds = $7, updated_at = NOW()
+            WHERE id = $8
             RETURNING id, job_id, filename
         `;
 
-        const values = [status, extractedText, extractedTables ? JSON.stringify(extractedTables) : null, markdown, pages ? JSON.stringify(pages) : null, error, fileId];
+        const values = [status, extractedText, extractedTables ? JSON.stringify(extractedTables) : null, markdown, pages ? JSON.stringify(pages) : null, error, extractionTimeSeconds, fileId];
         const result = await client.query(query, values);
 
         if (result.rows.length === 0) {
             throw new Error('File not found');
         }
 
-        console.log(`✅ File extraction status updated: ${fileId} -> ${status}`);
+        console.log(`✅ File extraction status updated: ${fileId} -> ${status}${extractionTimeSeconds ? ` (${extractionTimeSeconds}s)` : ''}`);
         return result.rows[0];
     } catch (error) {
         console.error('❌ Error updating file extraction status:', error.message);
@@ -273,26 +274,26 @@ export async function updateFileExtractionStatus(fileId, status, extractedText =
 }
 
 // Update file processing status
-export async function updateFileProcessingStatus(fileId, status, result = null, error = null, metadata = null) {
+export async function updateFileProcessingStatus(fileId, status, result = null, error = null, metadata = null, aiProcessingTimeSeconds = null) {
     const client = await pool.connect();
     try {
         const query = `
             UPDATE job_files 
             SET processing_status = $1, result = $2, processing_error = $3, 
-                processed_at = $4, processing_metadata = $5, updated_at = NOW()
-            WHERE id = $6
+                processed_at = $4, processing_metadata = $5, ai_processing_time_seconds = $6, updated_at = NOW()
+            WHERE id = $7
             RETURNING id, job_id, filename
         `;
 
         const processedAt = status === 'completed' || status === 'failed' ? new Date() : null;
-        const values = [status, result ? JSON.stringify(result) : null, error, processedAt, metadata ? JSON.stringify(metadata) : null, fileId];
+        const values = [status, result ? JSON.stringify(result) : null, error, processedAt, metadata ? JSON.stringify(metadata) : null, aiProcessingTimeSeconds, fileId];
         const queryResult = await client.query(query, values);
 
         if (queryResult.rows.length === 0) {
             throw new Error('File not found');
         }
 
-        console.log(`✅ File processing status updated: ${fileId} -> ${status}`);
+        console.log(`✅ File processing status updated: ${fileId} -> ${status}${aiProcessingTimeSeconds ? ` (${aiProcessingTimeSeconds}s)` : ''}`);
         return queryResult.rows[0];
     } catch (error) {
         console.error('❌ Error updating file processing status:', error.message);
@@ -417,7 +418,7 @@ export async function getFileResult(fileId) {
             SELECT jf.id, jf.filename, jf.result, jf.extracted_text, jf.extracted_tables, jf.pages, jf.markdown,
                    jf.extraction_status, jf.processing_status, jf.extraction_error, jf.processing_error, jf.processed_at,
                    jf.job_id, j.name as job_name, j.schema_data, jf.upload_status, jf.upload_error, 
-                   jf.storage_type, jf.retry_count, jf.last_retry_at
+                   jf.storage_type, jf.retry_count, jf.last_retry_at, jf.extraction_time_seconds, jf.ai_processing_time_seconds
             FROM job_files jf
             JOIN jobs j ON jf.job_id = j.id
             WHERE jf.id = $1

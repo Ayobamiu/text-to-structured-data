@@ -172,7 +172,7 @@ export async function getJobFilesForPreview(itemIds) {
     try {
         const query = `
             SELECT jf.id, jf.filename, jf.result, jf.processing_status,
-                   jf.created_at, j.name as job_name
+                   jf.created_at, j.name as job_name, jf.extraction_time_seconds, jf.ai_processing_time_seconds
             FROM job_files jf
             JOIN jobs j ON jf.job_id = j.id
             WHERE jf.id = ANY($1)
@@ -194,7 +194,7 @@ export async function getAvailableJobFiles(limit = 50) {
     try {
         const query = `
             SELECT jf.id, jf.filename, jf.processing_status, jf.created_at,
-                   j.name as job_name, j.id as job_id
+                   j.name as job_name, j.id as job_id, jf.extraction_time_seconds, jf.ai_processing_time_seconds
             FROM job_files jf
             JOIN jobs j ON jf.job_id = j.id
             WHERE jf.processing_status = 'completed'

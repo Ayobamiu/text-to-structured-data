@@ -53,6 +53,7 @@ class ExtractionService {
             const rawText = documentData.full_text || "";
             const pages = documentData.pages || [];
             const tables = documentData.tables || [];
+            const extraction_time_seconds = response.data.extraction_time_seconds || 0;
 
             console.log(`✅ Extraction completed using ${method}: ${pages.length} pages, ${tables.length} tables, ${rawText.length} chars raw text, ${markdown.length} chars markdown`);
 
@@ -63,6 +64,7 @@ class ExtractionService {
                 markdown: markdown,
                 pages: pages,
                 method: method,
+                extraction_time_seconds: extraction_time_seconds,
                 metadata: {
                     extraction_method: method,
                     extraction_options: options,

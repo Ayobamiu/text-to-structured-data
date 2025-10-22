@@ -17,6 +17,7 @@ const openai = new OpenAI({
  */
 export async function processWithOpenAI(text, schemaData) {
     try {
+        const startTime = Date.now();
         console.log('🤖 Processing with OpenAI...');
         console.log(`📝 Text length: ${text.length} characters`);
 
@@ -55,6 +56,9 @@ export async function processWithOpenAI(text, schemaData) {
         const extractedData = JSON.parse(response.choices[0].message.content);
         console.log('✅ OpenAI processing completed');
 
+        const endTime = Date.now();
+        const processingTimeSeconds = (endTime - startTime) / 1000;
+
         return {
             success: true,
             data: extractedData, // Store only the pure extracted data
@@ -62,7 +66,8 @@ export async function processWithOpenAI(text, schemaData) {
                 text_length: text.length,
                 processing_time: new Date().toISOString(),
                 model: 'gpt-4o-2024-08-06',
-                tokens_used: response.usage?.total_tokens || 0
+                tokens_used: response.usage?.total_tokens || 0,
+                processing_time_seconds: processingTimeSeconds
             }
         };
 
@@ -70,7 +75,10 @@ export async function processWithOpenAI(text, schemaData) {
         console.error('❌ OpenAI processing error:', error.message);
         return {
             success: false,
-            error: error.message
+            error: error.message,
+            metadata: {
+                processing_time_seconds: 0
+            }
         };
     }
 }

@@ -884,10 +884,11 @@ async function processFilesAsync(job, files, schema, schemaName, processingConfi
                 // Step 2: Extract text from PDF using Flask service
                 console.log(`Step 2: Calling Flask service for text extraction of ${file.originalname}...`);
                 // Add extraction method from processing config
-                const eToJSON = JSON.parse(processingConfig);
-                const jobProcessingConfig = JSON.parse(job.processing_config);
+                const eToJSON = typeof processingConfig === 'string' ? JSON.parse(processingConfig) : processingConfig;
+                const jobProcessingConfig = typeof job.processing_config === 'string' ? JSON.parse(job.processing_config) : job.processing_config;
                 const extractionMethod = eToJSON?.extraction?.method || jobProcessingConfig?.extraction?.method || 'mineru';
                 const extractionResult = await extractionService.extractText(file.path, file.originalname, extractionMethod);
+                const extractionTimeSeconds = extractionResult.extraction_time_seconds || 0
                 if (!extractionResult.success) {
                     throw new Error(`Extraction failed: ${extractionResult.error}`);
                 }
@@ -899,15 +900,18 @@ async function processFilesAsync(job, files, schema, schemaName, processingConfi
                 const tables = extractionResult.tables || [];
 
                 console.log(`Document structure: ${pages.length} pages, ${tables.length} tables, ${rawText.length} chars raw text, ${markdown.length} chars markdown`);
+                console.log(`Extraction completed in ${extractionTimeSeconds.toFixed(2)} seconds`);
 
-                // Step 3: Update file extraction status to completed
+                // Step 3: Update file extraction status to completed with timing
                 await updateFileExtractionStatus(
                     fileRecord.id,
                     'completed',
                     rawText,
                     tables || null,
                     markdown || null,
-                    pages || null
+                    pages || null,
+                    null, // error
+                    extractionTimeSeconds
                 );
 
                 // Check if this is a text-only extraction job
@@ -963,17 +967,18 @@ async function processFilesAsync(job, files, schema, schemaName, processingConfi
 
                     const processingResult = await processWithOpenAI(contentForAI, {
                         schemaName: schemaName || "data_extraction",
-                        schema: JSON.parse(schema)
+                        schema: typeof schema === 'string' ? JSON.parse(schema) : schema
                     });
+                    const aiProcessingTimeSeconds = processingResult.metadata?.processing_time_seconds || 0;
 
                     if (!processingResult.success) {
                         throw new Error(`OpenAI processing failed: ${processingResult.error}`);
                     }
 
-                    console.log(`OpenAI processing completed for ${file.originalname}`);
+                    console.log(`OpenAI processing completed for ${file.originalname} in ${aiProcessingTimeSeconds.toFixed(2)} seconds`);
 
-                    // Step 6: Update file processing status to completed
-                    await updateFileProcessingStatus(fileRecord.id, 'completed', processingResult.data, null, processingResult.metadata);
+                    // Step 6: Update file processing status to completed with timing
+                    await updateFileProcessingStatus(fileRecord.id, 'completed', processingResult.data, null, processingResult.metadata, aiProcessingTimeSeconds);
 
                     // Emit file processing completed event
                     io.to(`job-${job.id}`).emit('file-status-update', {
@@ -1001,11 +1006,15 @@ async function processFilesAsync(job, files, schema, schemaName, processingConfi
                     error: fileError.message
                 });
 
-                // Update file status to failed
+                // Update file status to failed with timing
                 if (fileRecord.extraction_status === 'processing') {
-                    await updateFileExtractionStatus(fileRecord.id, 'failed', null, null, null, null, fileError.message);
+                    // Calculate partial extraction time if extraction was started
+                    const partialExtractionTime = 0
+                    await updateFileExtractionStatus(fileRecord.id, 'failed', null, null, null, null, fileError.message, partialExtractionTime);
                 } else if (fileRecord.processing_status === 'processing') {
-                    await updateFileProcessingStatus(fileRecord.id, 'failed', null, fileError.message);
+                    // Calculate partial AI processing time if AI processing was started
+                    const partialAiProcessingTime = 0;
+                    await updateFileProcessingStatus(fileRecord.id, 'failed', null, fileError.message, null, partialAiProcessingTime);
                 }
             } finally {
                 // Clean up uploaded file
