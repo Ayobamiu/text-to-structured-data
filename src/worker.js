@@ -9,13 +9,12 @@ import {
     updateJobStatus
 } from './database.js';
 import S3Service from './s3Service.js';
-import { processWithOpenAI } from './utils/openaiProcessor.js';
 import ExtractionService from './services/extractionService.js';
 import ProcessingService from './services/processingService.js';
 
 dotenv.config();
 
-const FLASK_URL = process.env.FLASK_URL || "http://localhost:5001";
+
 const WORKER_INTERVAL_MS = parseInt(process.env.WORKER_INTERVAL_MS || '5000'); // Poll every 5 seconds
 const MAX_RETRIES = parseInt(process.env.WORKER_MAX_RETRIES || '3');
 const SERVER_URL = process.env.SERVER_URL || "http://localhost:3000";

@@ -36,6 +36,7 @@ import { authenticateToken, optionalAuth, securityHeaders } from "./middleware/a
 import { rateLimitConfig } from "./auth.js";
 import logger from "./utils/logger.js";
 import { processWithOpenAI } from "./utils/openaiProcessor.js";
+import ExtractionService from "./services/extractionService.js";
 
 dotenv.config();
 
@@ -83,6 +84,9 @@ const FLASK_URL = process.env.FLASK_URL || "http://localhost:5001";
 
 // Initialize S3 service
 const s3Service = new S3Service();
+
+// Initialize extraction service
+const extractionService = new ExtractionService();
 
 // Authentication routes
 app.use('/auth', express.json());
@@ -879,42 +883,20 @@ async function processFilesAsync(job, files, schema, schemaName, processingConfi
 
                 // Step 2: Extract text from PDF using Flask service
                 console.log(`Step 2: Calling Flask service for text extraction of ${file.originalname}...`);
-                const FormData = (await import('form-data')).default;
-
-                const formData = new FormData();
-                formData.append("file", fs.createReadStream(file.path), {
-                    filename: file.originalname,
-                    contentType: file.mimetype,
-                });
-                console.log(`Processing config: ${processingConfig}, job processing config: ${job.processing_config}`);
                 // Add extraction method from processing config
                 const eToJSON = JSON.parse(processingConfig);
                 const jobProcessingConfig = JSON.parse(job.processing_config);
                 const extractionMethod = eToJSON?.extraction?.method || jobProcessingConfig?.extraction?.method || 'mineru';
-                formData.append("extraction_method", extractionMethod);
-                console.log(`Using extraction method: ${extractionMethod}`);
-
-                console.log(`Sending request to Flask service: ${FLASK_URL}/extract`);
-                const flaskResponse = await axios.post(`${FLASK_URL}/extract`, formData, {
-                    headers: {
-                        ...formData.getHeaders(),
-                    },
-                    timeout: 2 * 1200000, // 40 minutes timeout for large files
-                });
-
-                console.log(`Flask response received for ${file.originalname}`);
-                console.log(`Flask response success: ${flaskResponse.data.success}`);
-
-                if (!flaskResponse.data.success) {
-                    throw new Error(`Flask extraction failed: ${flaskResponse.data.error}`);
+                const extractionResult = await extractionService.extractText(file.path, file.originalname, extractionMethod);
+                if (!extractionResult.success) {
+                    throw new Error(`Extraction failed: ${extractionResult.error}`);
                 }
 
                 // Extract document data from Flask response
-                const documentData = flaskResponse.data.data;
-                const markdown = documentData.markdown || "";
-                const rawText = documentData.full_text || "";
-                const pages = documentData.pages || [];
-                const tables = documentData.tables || [];
+                const markdown = extractionResult.markdown || "";
+                const rawText = extractionResult.text || "";
+                const pages = extractionResult.pages || [];
+                const tables = extractionResult.tables || [];
 
                 console.log(`Document structure: ${pages.length} pages, ${tables.length} tables, ${rawText.length} chars raw text, ${markdown.length} chars markdown`);
 
@@ -1077,8 +1059,6 @@ async function processFilesAsync(job, files, schema, schemaName, processingConfi
 // Main extraction endpoint - Updated for multiple files
 app.post("/extract", authenticateToken, upload.array("files", 20), async (req, res) => {
     let job = null;
-    const fileRecords = [];
-    const processedFiles = [];
 
     try {
         console.log("=== EXTRACT ENDPOINT CALLED ===");
