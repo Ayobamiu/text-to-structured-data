@@ -552,4 +552,106 @@ export async function getAllFiles(limit = 50, offset = 0, status = null, jobId =
     }
 }
 
+// Get job file statistics
+export async function getJobFileStats(jobId) {
+    const client = await pool.connect();
+    try {
+        const query = `
+            SELECT 
+                COUNT(*) as total,
+                COUNT(CASE WHEN jf.processing_status = 'completed' AND jf.extraction_status = 'completed' THEN 1 END) as processed,
+                COUNT(CASE WHEN jf.processing_status = 'processing' OR jf.extraction_status = 'processing' THEN 1 END) as processing,
+                COUNT(CASE WHEN jf.processing_status = 'pending' AND jf.extraction_status = 'pending' THEN 1 END) as pending
+            FROM job_files jf
+            WHERE jf.job_id = $1
+        `;
+
+        const result = await client.query(query, [jobId]);
+
+        if (result.rows.length === 0) {
+            return {
+                total: 0,
+                processed: 0,
+                processing: 0,
+                pending: 0
+            };
+        }
+
+        return {
+            total: parseInt(result.rows[0].total),
+            processed: parseInt(result.rows[0].processed),
+            processing: parseInt(result.rows[0].processing),
+            pending: parseInt(result.rows[0].pending)
+        };
+    } catch (error) {
+        console.error('Error getting job file statistics:', error.message);
+        throw error;
+    } finally {
+        client.release();
+    }
+}
+
+// Get job files by status with pagination
+export async function getJobFilesByStatus(jobId, status, limit = 50, offset = 0) {
+    const client = await pool.connect();
+    try {
+        // Build status condition
+        let statusCondition = '';
+        if (status === 'processed') {
+            statusCondition = "jf.processing_status = 'completed' AND jf.extraction_status = 'completed'";
+        } else if (status === 'processing') {
+            statusCondition = "jf.processing_status = 'processing' OR jf.extraction_status = 'processing'";
+        } else if (status === 'pending') {
+            statusCondition = "jf.processing_status = 'pending' AND jf.extraction_status = 'pending'";
+        } else {
+            throw new Error('Invalid status. Must be: processed, processing, or pending');
+        }
+
+        // Get total count for this status
+        const countQuery = `
+            SELECT COUNT(*) as total
+            FROM job_files jf
+            WHERE jf.job_id = $1 AND ${statusCondition}
+        `;
+
+        const countResult = await client.query(countQuery, [jobId]);
+        const total = parseInt(countResult.rows[0].total);
+
+        // Get paginated files
+        const filesQuery = `
+            SELECT 
+                jf.id,
+                jf.filename,
+                jf.size,
+                jf.extraction_status,
+                jf.processing_status,
+                jf.extraction_time_seconds,
+                jf.ai_processing_time_seconds,
+                jf.created_at,
+                jf.processed_at,
+                jf.job_id,
+                jf.result,
+                jf.extraction_error,
+                jf.processing_error
+            FROM job_files jf
+            WHERE jf.job_id = $1 AND ${statusCondition}
+            ORDER BY jf.created_at DESC 
+            LIMIT $2 OFFSET $3
+        `;
+
+        const filesResult = await client.query(filesQuery, [jobId, parseInt(limit), parseInt(offset)]);
+
+        return {
+            files: filesResult.rows,
+            total: total,
+            status: status
+        };
+    } catch (error) {
+        console.error('Error getting job files by status:', error.message);
+        throw error;
+    } finally {
+        client.release();
+    }
+}
+
 export default pool;

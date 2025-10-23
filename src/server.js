@@ -18,6 +18,8 @@ import pool, {
     updateFileProcessingStatus,
     updateJobStatus,
     listJobs,
+    getJobFileStats,
+    getJobFilesByStatus,
     listJobsByOrganizations,
     getFileResult,
     getSystemStats,
@@ -832,6 +834,92 @@ app.get("/jobs/:id/files", authenticateToken, async (req, res) => {
 
     } catch (error) {
         console.error("Error listing job files:", error.message);
+        res.status(500).json({
+            status: "error",
+            message: error.message
+        });
+    }
+});
+
+// Get job file statistics
+app.get("/jobs/:id/files/stats", authenticateToken, async (req, res) => {
+    try {
+        const { id: jobId } = req.params;
+
+        // Verify job exists
+        const job = await getJobStatus(jobId);
+        if (!job) {
+            return res.status(404).json({
+                status: "error",
+                message: "Job not found"
+            });
+        }
+
+        const stats = await getJobFileStats(jobId);
+
+        res.json({
+            status: "success",
+            jobId,
+            stats
+        });
+
+    } catch (error) {
+        console.error("Error getting job file statistics:", error.message);
+        res.status(500).json({
+            status: "error",
+            message: error.message
+        });
+    }
+});
+
+// Get job files by status with pagination
+app.get("/jobs/:id/files/:status", authenticateToken, async (req, res) => {
+    try {
+        const { id: jobId, status } = req.params;
+        const { limit = 50, offset = 0 } = req.query;
+
+        // Verify job exists
+        const job = await getJobStatus(jobId);
+        if (!job) {
+            return res.status(404).json({
+                status: "error",
+                message: "Job not found"
+            });
+        }
+
+        // Validate status
+        if (!['processed', 'processing', 'pending'].includes(status)) {
+            return res.status(400).json({
+                status: "error",
+                message: "Invalid status. Must be: processed, processing, or pending"
+            });
+        }
+
+        const result = await getJobFilesByStatus(
+            jobId,
+            status,
+            parseInt(limit),
+            parseInt(offset)
+        );
+
+        res.json({
+            status: "success",
+            jobId,
+            status,
+            files: result.files,
+            total: result.total,
+            limit: parseInt(limit),
+            offset: parseInt(offset),
+            pagination: {
+                current: Math.floor(parseInt(offset) / parseInt(limit)) + 1,
+                pageSize: parseInt(limit),
+                total: result.total,
+                totalPages: Math.ceil(result.total / parseInt(limit))
+            }
+        });
+
+    } catch (error) {
+        console.error("Error getting job files by status:", error.message);
         res.status(500).json({
             status: "error",
             message: error.message
