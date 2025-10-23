@@ -22,7 +22,8 @@ import pool, {
     getFileResult,
     getSystemStats,
     updateFileUploadStatus,
-    updateFileS3Info
+    updateFileS3Info,
+    getAllFiles
 } from "./database.js";
 import { getUserById } from "./database/users.js";
 import { getUserOrganizations } from "./database/userOrganizationMemberships.js";
@@ -831,6 +832,42 @@ app.get("/jobs/:id/files", authenticateToken, async (req, res) => {
 
     } catch (error) {
         console.error("Error listing job files:", error.message);
+        res.status(500).json({
+            status: "error",
+            message: error.message
+        });
+    }
+});
+
+// Get all files across all jobs
+app.get("/files", authenticateToken, async (req, res) => {
+    try {
+        const { limit = 50, offset = 0, status, jobId } = req.query;
+
+        const result = await getAllFiles(
+            parseInt(limit),
+            parseInt(offset),
+            status || null,
+            jobId || null
+        );
+
+        res.json({
+            status: "success",
+            files: result.files,
+            total: result.total,
+            stats: result.stats,
+            limit: parseInt(limit),
+            offset: parseInt(offset),
+            pagination: {
+                current: Math.floor(parseInt(offset) / parseInt(limit)) + 1,
+                pageSize: parseInt(limit),
+                total: result.total,
+                totalPages: Math.ceil(result.total / parseInt(limit))
+            }
+        });
+
+    } catch (error) {
+        console.error("Error fetching files:", error.message);
         res.status(500).json({
             status: "error",
             message: error.message

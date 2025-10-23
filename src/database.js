@@ -469,4 +469,87 @@ export async function closePool() {
     console.log('✅ Database connection pool closed');
 }
 
+// Get all files across all jobs with pagination
+export async function getAllFiles(limit = 50, offset = 0, status = null, jobId = null) {
+    const client = await pool.connect();
+    try {
+        // Build base query conditions
+        let whereConditions = 'WHERE 1=1';
+        const params = [];
+        let paramCount = 0;
+
+        if (status) {
+            paramCount++;
+            whereConditions += ` AND (jf.extraction_status = $${paramCount} OR jf.processing_status = $${paramCount})`;
+            params.push(status);
+        }
+
+        if (jobId) {
+            paramCount++;
+            whereConditions += ` AND jf.job_id = $${paramCount}`;
+            params.push(jobId);
+        }
+
+        // Get total count and file statistics
+        const countQuery = `
+            SELECT 
+                COUNT(*) as total,
+                COUNT(CASE WHEN jf.processing_status = 'completed' THEN 1 END) as completed,
+                COUNT(CASE WHEN jf.processing_status = 'processing' THEN 1 END) as processing,
+                COUNT(CASE WHEN jf.processing_status = 'failed' THEN 1 END) as failed,
+                COUNT(CASE WHEN jf.processing_status = 'pending' THEN 1 END) as pending
+            FROM job_files jf
+            LEFT JOIN jobs j ON jf.job_id = j.id
+            ${whereConditions}
+        `;
+
+        const countResult = await client.query(countQuery, params);
+        const stats = {
+            total: parseInt(countResult.rows[0].total),
+            completed: parseInt(countResult.rows[0].completed),
+            processing: parseInt(countResult.rows[0].processing),
+            failed: parseInt(countResult.rows[0].failed),
+            pending: parseInt(countResult.rows[0].pending)
+        };
+
+        // Get paginated files
+        const filesQuery = `
+            SELECT 
+                jf.id,
+                jf.filename,
+                jf.size,
+                jf.extraction_status,
+                jf.processing_status,
+                jf.extraction_time_seconds,
+                jf.ai_processing_time_seconds,
+                jf.created_at,
+                jf.processed_at,
+                jf.job_id,
+                j.name as job_name,
+                jf.result,
+                jf.extraction_error,
+                jf.processing_error
+            FROM job_files jf
+            LEFT JOIN jobs j ON jf.job_id = j.id
+            ${whereConditions}
+            ORDER BY jf.created_at DESC 
+            LIMIT $${++paramCount} OFFSET $${++paramCount}
+        `;
+
+        params.push(parseInt(limit), parseInt(offset));
+        const filesResult = await client.query(filesQuery, params);
+
+        return {
+            files: filesResult.rows,
+            total: stats.total,
+            stats: stats
+        };
+    } catch (error) {
+        console.error('Error fetching all files:', error.message);
+        throw error;
+    } finally {
+        client.release();
+    }
+}
+
 export default pool;
