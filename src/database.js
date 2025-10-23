@@ -512,7 +512,7 @@ export async function getAllFiles(limit = 50, offset = 0, status = null, jobId =
             pending: parseInt(countResult.rows[0].pending)
         };
 
-        // Get paginated files
+        // Get paginated files with preview data
         const filesQuery = `
             SELECT 
                 jf.id,
@@ -528,10 +528,28 @@ export async function getAllFiles(limit = 50, offset = 0, status = null, jobId =
                 j.name as job_name,
                 jf.result,
                 jf.extraction_error,
-                jf.processing_error
+                jf.processing_error,
+                COALESCE(
+                    JSON_AGG(
+                        CASE 
+                            WHEN pdt.id IS NOT NULL 
+                            THEN JSON_BUILD_OBJECT(
+                                'id', pdt.id,
+                                'name', pdt.name,
+                                'created_at', pdt.created_at
+                            )
+                            ELSE NULL
+                        END
+                    ) FILTER (WHERE pdt.id IS NOT NULL),
+                    '[]'::json
+                ) as previews
             FROM job_files jf
             LEFT JOIN jobs j ON jf.job_id = j.id
+            LEFT JOIN preview_data_table pdt ON jf.id = ANY(pdt.items_ids)
             ${whereConditions}
+            GROUP BY jf.id, jf.filename, jf.size, jf.extraction_status, jf.processing_status,
+                     jf.extraction_time_seconds, jf.ai_processing_time_seconds, jf.created_at,
+                     jf.processed_at, jf.job_id, j.name, jf.result, jf.extraction_error, jf.processing_error
             ORDER BY jf.created_at DESC 
             LIMIT $${++paramCount} OFFSET $${++paramCount}
         `;
@@ -617,7 +635,7 @@ export async function getJobFilesByStatus(jobId, status, limit = 50, offset = 0)
         const countResult = await client.query(countQuery, [jobId]);
         const total = parseInt(countResult.rows[0].total);
 
-        // Get paginated files
+        // Get paginated files with preview data
         const filesQuery = `
             SELECT 
                 jf.id,
@@ -632,9 +650,27 @@ export async function getJobFilesByStatus(jobId, status, limit = 50, offset = 0)
                 jf.job_id,
                 jf.result,
                 jf.extraction_error,
-                jf.processing_error
+                jf.processing_error,
+                COALESCE(
+                    JSON_AGG(
+                        CASE 
+                            WHEN pdt.id IS NOT NULL 
+                            THEN JSON_BUILD_OBJECT(
+                                'id', pdt.id,
+                                'name', pdt.name,
+                                'created_at', pdt.created_at
+                            )
+                            ELSE NULL
+                        END
+                    ) FILTER (WHERE pdt.id IS NOT NULL),
+                    '[]'::json
+                ) as previews
             FROM job_files jf
+            LEFT JOIN preview_data_table pdt ON jf.id = ANY(pdt.items_ids)
             WHERE jf.job_id = $1 AND ${statusCondition}
+            GROUP BY jf.id, jf.filename, jf.size, jf.extraction_status, jf.processing_status,
+                     jf.extraction_time_seconds, jf.ai_processing_time_seconds, jf.created_at,
+                     jf.processed_at, jf.job_id, jf.result, jf.extraction_error, jf.processing_error
             ORDER BY jf.created_at DESC 
             LIMIT $2 OFFSET $3
         `;
