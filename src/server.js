@@ -698,6 +698,19 @@ app.put("/files/:id/results", authenticateToken, async (req, res) => {
 
             const updatedFile = updateResult.rows[0];
 
+            // Emit file update event via WebSocket
+            io.to(`job-${file.job_id}`).emit('file-status-update', {
+                jobId: file.job_id,
+                fileId: updatedFile.id,
+                filename: updatedFile.filename,
+                result: parsedResults,
+                message: `File results updated for ${updatedFile.filename}`,
+                updated_at: new Date().toISOString()
+            });
+
+            // Create log entry for the update
+            await createLogAndEmit(file.job_id, updatedFile.id, 'info', `File results updated for ${updatedFile.filename}`, updatedFile.filename);
+
             res.json({
                 status: "success",
                 message: `File results updated successfully for ${updatedFile.filename}`,
