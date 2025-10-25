@@ -33,7 +33,7 @@ import { initializeDatabase } from "./database/init.js";
 import queueService from "./queue.js";
 import authRoutes from "./routes/auth.js";
 import organizationRoutes from "./routes/organizations.js";
-import previewRoutes from "./routes/previews.js";
+import previewRoutes, { setWebSocketInstance } from "./routes/previews.js";
 import healthRoutes from "./routes/health.js";
 import { authenticateToken, optionalAuth, securityHeaders } from "./middleware/auth.js";
 import { rateLimitConfig } from "./auth.js";
@@ -57,6 +57,9 @@ const io = new Server(server, {
         credentials: true
     }
 });
+
+// Set WebSocket instance for preview routes
+setWebSocketInstance(io);
 
 // CORS configuration (must be before security middleware)
 app.use(cors({

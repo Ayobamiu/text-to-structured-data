@@ -110,13 +110,26 @@ class MGSDataService {
             return existingResult;
         }
 
-        // Create a copy of the existing result
-        const mergedResult = JSON.parse(JSON.stringify(existingResult));
+        const margedData = {
+            ...existingResult,
+            api_number: mgsData.api_number,
+            latitude: mgsData.latitude,
+            longitude: mgsData.longitude,
+            land_use_type: mgsData.land_use_type,
+            lease_name: existingResult.lease_name || mgsData.lease_name,
+            well_number: existingResult.well_number || mgsData.well_number,
+            elevation: existingResult.elevation || mgsData.elevation,
+            elevation_datum: existingResult.elevation_datum || mgsData.elevation_datum,
+            well_type: existingResult.well_type || mgsData.well_type,
+            status: existingResult.status || mgsData.status,
+            measured_depth: existingResult.measured_depth || mgsData.measured_depth,
+            true_depth: existingResult.true_depth || mgsData.true_depth,
+            deepest_formation: existingResult.deepest_formation || mgsData.deepest_formation,
+            deviation: existingResult.deviation || mgsData.deviation,
+            county: existingResult.county || mgsData.county,
 
-        // Add MGS data section
-        mergedResult.mgs_data = mgsData;
-
-        return mergedResult;
+        }
+        return margedData;
     }
 }
 

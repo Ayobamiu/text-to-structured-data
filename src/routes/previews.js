@@ -24,6 +24,13 @@ import mgsDataService from '../services/mgsDataService.js';
 
 const router = express.Router();
 
+// WebSocket instance will be set by the main server
+let io = null;
+
+export const setWebSocketInstance = (socketInstance) => {
+    io = socketInstance;
+};
+
 // Configure multer for logo uploads
 const upload = multer({
     storage: multer.memoryStorage(),
@@ -282,6 +289,33 @@ router.post('/:id/items', async (req, res) => {
             });
         }
 
+        // Emit WebSocket event for preview update
+        if (io) {
+            // Get job IDs for the added files to emit to the correct rooms
+            const client = await pool.connect();
+            try {
+                const jobQuery = `
+                    SELECT DISTINCT job_id 
+                    FROM job_files 
+                    WHERE id = ANY($1)
+                `;
+                const jobResult = await client.query(jobQuery, [itemIds]);
+
+                // Emit to all relevant job rooms
+                jobResult.rows.forEach(row => {
+                    io.to(`job-${row.job_id}`).emit('preview-updated', {
+                        previewId: id,
+                        previewName: preview.name,
+                        addedFileIds: itemIds,
+                        message: `Files added to preview "${preview.name}"`,
+                        updated_at: new Date().toISOString()
+                    });
+                });
+            } finally {
+                client.release();
+            }
+        }
+
         res.json({
             success: true,
             data: preview
@@ -492,10 +526,7 @@ router.post('/file/:fileId/enrich-with-mgs', async (req, res) => {
             }
 
             // Merge MGS data into the existing result
-            const updatedResult = {
-                ...fileResult,
-                ...mgsData
-            };
+            const updatedResult = mgsDataService.mergeMGSData(fileResult, mgsData);
 
             // Update the file with merged data
             const updateQuery = `
@@ -618,7 +649,7 @@ router.post('/files/bulk/enrich-with-mgs', async (req, res) => {
 
                     console.log(`✅ Found MGS data for ${fileId}:`, Object.keys(mgsData));
                     // Merge MGS data into existing result
-                    const updatedResult = { ...resultData, ...mgsData };
+                    const updatedResult = mgsDataService.mergeMGSData(resultData, mgsData);
 
                     // Update the file result
                     const updateQuery = `
