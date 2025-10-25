@@ -131,6 +131,91 @@ class MGSDataService {
         }
         return margedData;
     }
+
+
+    /**
+ * Extract permit number from file result data
+ */
+    extractPermitFromData(result) {
+        if (!result) return null;
+
+        // Try common field names for permit numbers
+        const permitFields = [
+            'permit_number',
+            'permitNumber',
+            'permit_no',
+            'permitNo',
+            'permit',
+            'permit_id',
+            'permitId',
+            'well_permit',
+            'wellPermit',
+            'drilling_permit',
+            'drillingPermit'
+        ];
+
+        for (const field of permitFields) {
+            if (result[field] && typeof result[field] === 'string') {
+                // Clean up the permit number (remove spaces, special chars)
+                const cleaned = result[field].replace(/[^\d]/g, '');
+                if (cleaned.length > 0) {
+                    return cleaned;
+                }
+            }
+        }
+
+        return null;
+    }
+
+    normalizePermitNumber(permit) {
+        if (!permit) return null;
+        return permit.trim().replace(/^0+/, '') || '0';
+    }
+    /**
+     * Check if permit numbers match between filename and extracted data
+     */
+    getPermitNumberFromData(filename, result) {
+        const filenamePermit = this.extractPermitFromFilename(filename);
+        const dataPermit = this.extractPermitFromData(result);
+
+        const normalizedFilename = this.normalizePermitNumber(filenamePermit);
+        const normalizedData = this.normalizePermitNumber(dataPermit);
+
+        return {
+            permitNumber: normalizedFilename || normalizedData || null,
+            correct: normalizedFilename === normalizedData
+        };
+    }
+
+
+    /**
+ * Extract permit number from filename
+ * Supports various patterns like:
+ * - PERMIT12345.pdf
+ * - permit_12345.pdf
+ * - 12345_permit.pdf
+ * - permit-12345.pdf
+ */
+    extractPermitFromFilename(filename) {
+        if (!filename) return null;
+
+        const patterns = [
+            /(\d+)/,                    // Any number
+            /permit[_-]?(\d+)/i,        // permit123, permit_123, permit-123
+            /(\d+)[_-]?permit/i,        // 123permit, 123_permit, 123-permit
+            /permit[_-]?(\d+)[_-]?/i,   // permit_123_, permit-123-
+            /[_-](\d+)[_-]?permit/i,    // _123_permit, -123-permit
+        ];
+
+        for (const pattern of patterns) {
+            const match = filename.match(pattern);
+            if (match) {
+                return match[1];
+            }
+        }
+
+        return null;
+    }
 }
 
 const datumMap = {

@@ -1,6 +1,23 @@
 import pg from 'pg';
 import { v4 as uuidv4 } from 'uuid';
 import dotenv from 'dotenv';
+import mgsDataService from './services/mgsDataService.js';
+
+// Auto-fix missing permit numbers by extracting from filename
+function autoFixPermitNumber(result, filename) {
+    if (!result || !filename) return result;
+
+    const { permitNumber, correct } = mgsDataService.getPermitNumberFromData(result, filename);
+
+    if (!correct) {
+        return {
+            ...result,
+            permit_number: permitNumber
+        };
+    }
+
+    return result;
+}
 
 // Only load .env file in development
 if (process.env.NODE_ENV !== 'production') {
@@ -277,6 +294,23 @@ export async function updateFileExtractionStatus(fileId, status, extractedText =
 export async function updateFileProcessingStatus(fileId, status, result = null, error = null, metadata = null, aiProcessingTimeSeconds = null) {
     const client = await pool.connect();
     try {
+        // Auto-fix permit number if result is being saved and status is completed
+        let finalResult = result;
+        if (status === 'completed' && result) {
+            // Get filename and job_id for permit extraction
+            const fileQuery = `SELECT filename, job_id FROM job_files WHERE id = $1`;
+            const fileResult = await client.query(fileQuery, [fileId]);
+
+            if (fileResult.rows.length > 0) {
+                const { filename, job_id } = fileResult.rows[0];
+
+                // Only run auto-fix for MGS job
+                if (job_id === '5667fe82-63e1-47fa-a640-b182b5c5d034') {
+                    finalResult = autoFixPermitNumber(result, filename);
+                }
+            }
+        }
+
         const query = `
             UPDATE job_files 
             SET processing_status = $1, result = $2, processing_error = $3, 
@@ -286,7 +320,7 @@ export async function updateFileProcessingStatus(fileId, status, result = null, 
         `;
 
         const processedAt = status === 'completed' || status === 'failed' ? new Date() : null;
-        const values = [status, result ? JSON.stringify(result) : null, error, processedAt, metadata ? JSON.stringify(metadata) : null, aiProcessingTimeSeconds, fileId];
+        const values = [status, finalResult ? JSON.stringify(finalResult) : null, error, processedAt, metadata ? JSON.stringify(metadata) : null, aiProcessingTimeSeconds, fileId];
         const queryResult = await client.query(query, values);
 
         if (queryResult.rows.length === 0) {
