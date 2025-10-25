@@ -1544,16 +1544,52 @@ app.delete("/files", authenticateToken, async (req, res) => {
     }
 });
 
-// Reprocess files (re-run AI processing without re-extraction)
+// Reprocess files (re-run AI processing and/or extraction)
 app.post("/files/reprocess", authenticateToken, async (req, res) => {
     try {
-        const { fileIds, priority = 0 } = req.body;
+        const { fileIds, priority = 0, options = {}, processingConfig } = req.body;
 
         // Validate input
         if (!fileIds || !Array.isArray(fileIds) || fileIds.length === 0) {
             return res.status(400).json({
                 status: "error",
                 message: "File IDs array is required"
+            });
+        }
+
+        // Parse and validate options with backward compatibility
+        // Support both old 'options' format and new 'processingConfig.reprocess' format
+        let reprocessOptions = {};
+
+        if (processingConfig && processingConfig.reprocess) {
+            // New format: processingConfig.reprocess
+            reprocessOptions = processingConfig.reprocess;
+        } else {
+            // Old format: direct options
+            reprocessOptions = options;
+        }
+
+        const {
+            reExtract = true,      // Default to true (both extraction + AI processing)
+            reProcess = true,      // Default to true (both extraction + AI processing)
+            forceExtraction = false, // Force extraction even if completed
+            preview = false        // Return preview without queuing
+        } = reprocessOptions;
+
+        // Validate options
+        if (typeof reExtract !== 'boolean' || typeof reProcess !== 'boolean' ||
+            typeof forceExtraction !== 'boolean' || typeof preview !== 'boolean') {
+            return res.status(400).json({
+                status: "error",
+                message: "Options must contain boolean values for reExtract, reProcess, forceExtraction, and preview"
+            });
+        }
+
+        // Validate that at least one operation is requested
+        if (!reExtract && !reProcess) {
+            return res.status(400).json({
+                status: "error",
+                message: "At least one of reExtract or reProcess must be true"
             });
         }
 
@@ -1571,6 +1607,7 @@ app.post("/files/reprocess", authenticateToken, async (req, res) => {
         const queuedFiles = [];
         const skippedFiles = [];
         const errors = [];
+        const previewData = [];
 
         // Process each file ID
         for (const fileId of fileIds) {
@@ -1603,22 +1640,49 @@ app.post("/files/reprocess", authenticateToken, async (req, res) => {
                     continue;
                 }
 
-                // Validate file can be reprocessed
-                if (file.extraction_status !== 'completed') {
-                    console.log(`File ${fileId} extraction not completed`);
+                // Determine what operations will be performed
+                const willExtract = reExtract && (forceExtraction || file.extraction_status !== 'completed');
+                const willProcess = reProcess && (file.extracted_text || file.markdown || willExtract);
+
+                // Validate file can be reprocessed based on options
+                if (reProcess && !willExtract && !file.extracted_text && !file.markdown) {
+                    console.log(`File ${fileId} no extracted text available for AI processing`);
                     skippedFiles.push({
                         fileId,
-                        reason: "File extraction not completed"
+                        reason: "No extracted text available for AI processing"
                     });
                     continue;
                 }
 
-                if (!file.extracted_text && !file.markdown) {
-                    console.log(`File ${fileId} no extracted text available for reprocessing`);
+                if (reExtract && !forceExtraction && file.extraction_status === 'completed') {
+                    console.log(`File ${fileId} extraction already completed (use forceExtraction: true to override)`);
                     skippedFiles.push({
                         fileId,
-                        reason: "No extracted text available for reprocessing"
+                        reason: "Extraction already completed (use forceExtraction: true to override)"
                     });
+                    continue;
+                }
+
+                // Create preview data
+                const filePreview = {
+                    fileId: file.id,
+                    filename: file.filename,
+                    jobId: file.job_id,
+                    currentStatus: {
+                        extraction: file.extraction_status,
+                        processing: file.processing_status
+                    },
+                    operations: {
+                        willExtract,
+                        willProcess,
+                        hasExtractedText: !!(file.extracted_text || file.markdown)
+                    }
+                };
+
+                previewData.push(filePreview);
+
+                // If preview mode, skip queuing
+                if (preview) {
                     continue;
                 }
 
@@ -1654,18 +1718,40 @@ app.post("/files/reprocess", authenticateToken, async (req, res) => {
                     continue;
                 }
 
-                // Reset processing status to pending
-                await updateFileProcessingStatus(fileId, 'pending');
-                console.log(`File ${fileId} processing status reset to pending`);
-                // Add file to queue with reprocessing mode
-                await queueService.addFileToQueue(fileId, file.job_id, priority, 'reprocess');
+                // Determine queue mode based on operations
+                let queueMode;
+                if (willExtract && willProcess) {
+                    queueMode = forceExtraction ? 'force-full' : 'both';
+                } else if (willExtract && !willProcess) {
+                    queueMode = 'extraction-only';
+                } else if (!willExtract && willProcess) {
+                    queueMode = 'reprocess'; // AI processing only (backward compatible)
+                }
 
-                console.log(`File ${fileId} added to queue for reprocessing`);
+                // Reset statuses based on operations
+                if (willExtract) {
+                    await updateFileExtractionStatus(fileId, 'pending');
+                    console.log(`File ${fileId} extraction status reset to pending`);
+                }
+                if (willProcess) {
+                    await updateFileProcessingStatus(fileId, 'pending');
+                    console.log(`File ${fileId} processing status reset to pending`);
+                }
+
+                // Add file to queue with appropriate mode
+                await queueService.addFileToQueue(fileId, file.job_id, priority, queueMode);
+
+                console.log(`File ${fileId} added to queue for reprocessing (mode: ${queueMode})`);
 
                 queuedFiles.push({
                     fileId: file.id,
                     filename: file.filename,
-                    jobId: file.job_id
+                    jobId: file.job_id,
+                    mode: queueMode,
+                    operations: {
+                        willExtract,
+                        willProcess
+                    }
                 });
 
                 console.log(`✅ File ${fileId} queued for reprocessing`);
@@ -1679,13 +1765,48 @@ app.post("/files/reprocess", authenticateToken, async (req, res) => {
             }
         }
 
+        // Handle preview mode
+        if (preview) {
+            return res.json({
+                status: "success",
+                message: `Preview for ${previewData.length} files`,
+                data: {
+                    preview: previewData,
+                    skippedFiles,
+                    errors,
+                    summary: {
+                        total: fileIds.length,
+                        preview: previewData.length,
+                        skipped: skippedFiles.length,
+                        errors: errors.length
+                    },
+                    options: {
+                        reExtract,
+                        reProcess,
+                        forceExtraction
+                    }
+                }
+            });
+        }
+
         res.json({
             status: "success",
             message: `Queued ${queuedFiles.length} files for reprocessing`,
             data: {
                 queuedFiles,
                 skippedFiles: skippedFiles.length > 0 ? skippedFiles : undefined,
-                errors: errors.length > 0 ? errors : undefined
+                errors: errors.length > 0 ? errors : undefined,
+                summary: {
+                    total: fileIds.length,
+                    queued: queuedFiles.length,
+                    skipped: skippedFiles.length,
+                    errors: errors.length
+                },
+                options: {
+                    reExtract,
+                    reProcess,
+                    forceExtraction
+                }
             }
         });
 

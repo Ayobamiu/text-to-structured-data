@@ -82,7 +82,7 @@ class QueueService {
                 timestamp: Date.now(),
                 retries: 0,
                 status: 'queued',
-                mode: mode // 'normal' or 'reprocess'
+                mode: mode // 'normal', 'reprocess', 'extraction-only', 'both', 'force-full'
             };
 
             // Add to sorted set (priority queue)

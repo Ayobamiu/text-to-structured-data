@@ -198,9 +198,106 @@ class FileProcessorWorker {
                 };
 
                 console.log(`✅ Using existing extracted data for ${file.filename}`);
+
+            } else if (mode === 'extraction-only') {
+                // Extraction-only mode: Extract text but skip AI processing
+                console.log(`📄 Extraction-only mode: Extracting text from ${file.filename}`);
+
+                // Emit WebSocket event for extraction start
+                this.emitFileStatusUpdate(
+                    jobId,
+                    file.id,
+                    'processing',
+                    file.processing_status || 'pending',
+                    `Starting text extraction for ${file.filename}`
+                );
+
+                // Get extraction method from job processing config
+                const extractionMethod = job.processing_config?.extraction?.method || 'mineru';
+                const extractionOptions = job.processing_config?.extraction?.options || {};
+
+                extractionResult = await this.extractTextFromFile(file, extractionMethod, extractionOptions);
+
+                if (!extractionResult.success) {
+                    throw new Error(`Extraction failed: ${extractionResult.error}`);
+                }
+
+                console.log(`✅ Extraction completed for ${file.filename}. Skipping AI processing.`);
+
+                // Update extraction status and skip AI processing
+                await updateFileExtractionStatus(
+                    file.id,
+                    'completed',
+                    extractionResult.text,
+                    extractionResult.tables,
+                    extractionResult.markdown,
+                    extractionResult.pages,
+                    null,
+                    extractionResult.extractionTimeSeconds
+                );
+
+                // Emit completion event
+                this.emitFileStatusUpdate(
+                    jobId,
+                    file.id,
+                    'completed',
+                    file.processing_status || 'pending',
+                    `Extraction completed for ${file.filename}`
+                );
+
+                return; // Skip AI processing
+
+            } else if (mode === 'both' || mode === 'force-full') {
+                // Both modes: Extract text and run AI processing
+                console.log(`📄 ${mode} mode: Extracting text from ${file.filename}`);
+
+                // Emit WebSocket event for extraction start
+                this.emitFileStatusUpdate(
+                    jobId,
+                    file.id,
+                    'processing',
+                    file.processing_status || 'pending',
+                    `Starting text extraction for ${file.filename}`
+                );
+
+                // Get extraction method from job processing config
+                const extractionMethod = job.processing_config?.extraction?.method || 'mineru';
+                const extractionOptions = job.processing_config?.extraction?.options || {};
+
+                extractionResult = await this.extractTextFromFile(file, extractionMethod, extractionOptions);
+
+                if (!extractionResult.success) {
+                    throw new Error(`Extraction failed: ${extractionResult.error}`);
+                }
+
+                console.log(`✅ Extraction completed for ${file.filename}. Proceeding to AI processing.`);
+
+                // Update extraction status for both modes
+                await updateFileExtractionStatus(
+                    file.id,
+                    'completed',
+                    extractionResult.text,
+                    extractionResult.tables,
+                    extractionResult.markdown,
+                    extractionResult.pages,
+                    null,
+                    extractionResult.extractionTimeSeconds
+                );
+
+                console.log(`✅ File ${file.filename} extraction completed`);
+
+                // Emit WebSocket event for extraction completion
+                this.emitFileStatusUpdate(
+                    jobId,
+                    file.id,
+                    'completed',
+                    file.processing_status || 'pending',
+                    `Text extraction completed for ${file.filename}`
+                );
+
             } else {
                 // Normal mode: Extract text from file
-                console.log(`📄 Stage 1: Extracting text from ${file.filename}`);
+                console.log(`📄 Normal mode: Extracting text from ${file.filename}`);
                 await updateFileExtractionStatus(file.id, 'processing');
 
                 // Emit WebSocket event for Stage 1 start
@@ -243,6 +340,12 @@ class FileProcessorWorker {
                 );
             }
 
+            // Handle mode-specific AI processing logic
+            if (mode === 'extraction-only') {
+                // Already handled above - skip AI processing
+                return;
+            }
+
             // Check if this is a text-only extraction job
             if (job.extraction_mode === 'text_only') {
                 console.log(`📝 Text-only mode: Skipping AI processing for ${file.filename}`);
@@ -275,7 +378,10 @@ class FileProcessorWorker {
             }
 
             // Stage 2: Process with OpenAI (only for full_extraction mode)
-            console.log(`🤖 Stage 2: Processing extracted data with OpenAI`);
+            const modeDescription = mode === 'reprocess' ? 'reprocessing' :
+                mode === 'both' ? 'both extraction and AI processing' :
+                    mode === 'force-full' ? 'force-full reprocessing' : 'normal processing';
+            console.log(`🤖 Stage 2: Processing extracted data with OpenAI (${modeDescription})`);
             await updateFileProcessingStatus(file.id, 'processing');
 
             // Emit WebSocket event for Stage 2 start
@@ -284,7 +390,7 @@ class FileProcessorWorker {
                 file.id,
                 'completed',
                 'processing',
-                `Starting AI processing for ${file.filename}`
+                `Starting AI processing for ${file.filename} (${modeDescription})`
             );
             // Parse schema data if it's a string
             let schemaData = job.schema_data;
