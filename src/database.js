@@ -2,6 +2,7 @@ import pg from 'pg';
 import { v4 as uuidv4 } from 'uuid';
 import dotenv from 'dotenv';
 import mgsDataService from './services/mgsDataService.js';
+import { addItemsToPreview } from './database/previewDataTable.js';
 
 // Auto-fix missing permit numbers by extracting from filename
 function autoFixPermitNumber(result, filename) {
@@ -303,10 +304,41 @@ export async function updateFileProcessingStatus(fileId, status, result = null, 
 
             if (fileResult.rows.length > 0) {
                 const { filename, job_id } = fileResult.rows[0];
+                console.log({ filename, job_id });
 
                 // Only run auto-fix for MGS job
                 if (job_id === '5667fe82-63e1-47fa-a640-b182b5c5d034') {
+                    console.log(`🔧 Starting MGS processing for file ${fileId}`);
+
+                    // Step 1: Fix permit number
                     finalResult = autoFixPermitNumber(result, filename);
+                    console.log(`✅ Step 1: Permit number fixed for ${filename}`);
+
+                    const permitNumber = mgsDataService.extractPermitFromData(finalResult);
+                    if (permitNumber) {
+                        console.log(`🔍 Step 2: Looking up MGS data for permit ${permitNumber}`);
+                        try {
+                            const mgsData = await mgsDataService.getMGSDataByPermitNumber(permitNumber);
+                            if (mgsData) {
+                                // Step 2: Populate MGS data
+                                finalResult = mgsDataService.mergeMGSData(finalResult, mgsData);
+                                console.log(`✅ Step 2: MGS data populated for permit ${permitNumber}`);
+
+                                // Step 3: Add to preview (only if MGS data was found)
+                                console.log(`📋 Step 3: Adding file ${fileId} to preview`);
+                                await addItemsToPreview('550bff46-db7d-4691-8503-e819273977ee', [fileId]);
+                                console.log(`✅ Step 3: File ${fileId} added to preview successfully`);
+                            } else {
+                                console.log(`⚠️ Step 2: No MGS data found for permit ${permitNumber}`);
+                            }
+                        } catch (error) {
+                            console.error(`❌ Step 2: Error looking up MGS data for permit ${permitNumber}:`, error.message);
+                        }
+                    } else {
+                        console.log(`⚠️ Step 2: No permit number found in result, skipping MGS data lookup`);
+                    }
+
+                    console.log(`🎉 MGS processing completed for file ${fileId}`);
                 }
             }
         }

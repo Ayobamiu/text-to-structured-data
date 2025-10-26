@@ -197,7 +197,7 @@ class MGSDataService {
  * - permit-12345.pdf
  */
     extractPermitFromFilename(filename) {
-        if (!filename) return null;
+        if (!filename || typeof filename !== 'string') return null;
 
         const patterns = [
             /(\d+)/,                    // Any number
