@@ -595,6 +595,10 @@ export async function getAllFiles(limit = 50, offset = 0, status = null, jobId =
                 jf.result,
                 jf.extraction_error,
                 jf.processing_error,
+                jf.extracted_text, 
+                jf.extracted_tables, 
+                jf.pages, 
+                jf.markdown,
                 COALESCE(
                     JSON_AGG(
                         CASE 
@@ -615,7 +619,7 @@ export async function getAllFiles(limit = 50, offset = 0, status = null, jobId =
             ${whereConditions}
             GROUP BY jf.id, jf.filename, jf.size, jf.extraction_status, jf.processing_status,
                      jf.extraction_time_seconds, jf.ai_processing_time_seconds, jf.created_at,
-                     jf.processed_at, jf.job_id, j.name, jf.result, jf.extraction_error, jf.processing_error
+                     jf.processed_at, jf.job_id, j.name, jf.result, jf.extraction_error, jf.processing_error, jf.markdown
             ORDER BY jf.created_at DESC 
             LIMIT $${++paramCount} OFFSET $${++paramCount}
         `;
