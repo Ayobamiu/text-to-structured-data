@@ -624,6 +624,95 @@ app.get("/files/:id/result", authenticateToken, async (req, res) => {
     }
 });
 
+// Download file endpoint - generates signed URL for S3 files or serves local files
+app.get("/files/:id/download", authenticateToken, async (req, res) => {
+    try {
+        const { id } = req.params;
+        const client = await pool.connect();
+
+        try {
+            // Get file info including s3_key
+            const query = `
+                SELECT jf.id, jf.filename, jf.s3_key, jf.file_hash, jf.storage_type, jf.job_id
+                FROM job_files jf
+                WHERE jf.id = $1
+            `;
+
+            const result = await client.query(query, [id]);
+
+            if (result.rows.length === 0) {
+                return res.status(404).json({
+                    status: "error",
+                    message: "File not found"
+                });
+            }
+
+            const file = result.rows[0];
+
+            // Check if user has access to this file's job organization
+            const job = await getJobStatus(file.job_id);
+            if (!job) {
+                return res.status(404).json({
+                    status: "error",
+                    message: "Job not found"
+                });
+            }
+
+            const userOrganizations = await getUserOrganizations(req.user.id);
+            const userOrganizationIds = userOrganizations.map(org => org.id);
+
+            if (job.organization_id && !userOrganizationIds.includes(job.organization_id)) {
+                return res.status(403).json({
+                    status: "error",
+                    message: "Access denied to this file"
+                });
+            }
+
+            // If file is stored in S3, generate signed URL
+            if (file.s3_key && file.storage_type === 's3' && s3Service.isCloudStorageEnabled()) {
+                try {
+                    // Generate signed URL that expires in 1 hour
+                    const signedUrl = await s3Service.generateSignedUrl(file.s3_key, 3600);
+
+                    // If JSON format requested (for iframe embedding), return JSON
+                    if (req.query.format === 'json' || req.headers.accept?.includes('application/json')) {
+                        return res.json({
+                            status: "success",
+                            url: signedUrl,
+                            filename: file.filename
+                        });
+                    }
+
+                    // Otherwise redirect to the signed URL (for direct downloads)
+                    return res.redirect(signedUrl);
+                } catch (s3Error) {
+                    console.error(`❌ Error generating signed URL for file ${id}:`, s3Error.message);
+                    return res.status(500).json({
+                        status: "error",
+                        message: "Failed to generate download URL"
+                    });
+                }
+            } else {
+                // File is stored locally or S3 is not enabled
+                return res.status(404).json({
+                    status: "error",
+                    message: "File is not available for download (not stored in S3)"
+                });
+            }
+
+        } finally {
+            client.release();
+        }
+
+    } catch (error) {
+        console.error('❌ Error downloading file:', error.message);
+        res.status(500).json({
+            status: "error",
+            message: error.message
+        });
+    }
+});
+
 // Update file results endpoint
 app.put("/files/:id/results", authenticateToken, async (req, res) => {
     try {
