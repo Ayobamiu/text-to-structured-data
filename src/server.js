@@ -1037,11 +1037,16 @@ app.get("/files", authenticateToken, async (req, res) => {
     try {
         const { limit = 50, offset = 0, status, jobId } = req.query;
 
+        // Restrict by user's organizations
+        const userOrganizations = await getUserOrganizations(req.user.id);
+        const organizationIds = userOrganizations.map(org => org.id);
+
         const result = await getAllFiles(
             parseInt(limit),
             parseInt(offset),
             status || null,
-            jobId || null
+            jobId || null,
+            organizationIds
         );
 
         res.json({

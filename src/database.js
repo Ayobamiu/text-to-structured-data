@@ -575,7 +575,7 @@ export async function closePool() {
 }
 
 // Get all files across all jobs with pagination
-export async function getAllFiles(limit = 50, offset = 0, status = null, jobId = null) {
+export async function getAllFiles(limit = 50, offset = 0, status = null, jobId = null, organizationIds = null) {
     const client = await pool.connect();
     try {
         // Build base query conditions
@@ -593,6 +593,12 @@ export async function getAllFiles(limit = 50, offset = 0, status = null, jobId =
             paramCount++;
             whereConditions += ` AND jf.job_id = $${paramCount}`;
             params.push(jobId);
+        }
+
+        if (organizationIds && Array.isArray(organizationIds) && organizationIds.length > 0) {
+            const placeholders = organizationIds.map(() => `$${++paramCount}`).join(',');
+            whereConditions += ` AND j.organization_id IN (${placeholders})`;
+            params.push(...organizationIds);
         }
 
         // Get total count and file statistics
