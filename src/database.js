@@ -224,7 +224,7 @@ export async function getJobStatus(jobId) {
         // Get job files
         const filesQuery = `
             SELECT id, filename, size, s3_key, file_hash, extraction_status, 
-                   processing_status, extracted_text, extracted_tables, markdown, result, 
+                   processing_status, extracted_text, extracted_tables, markdown, result, actual_result,
                    processing_metadata, extraction_error, processing_error, created_at, processed_at,
                    upload_status, upload_error, storage_type, retry_count, last_retry_at,
                    extraction_time_seconds, ai_processing_time_seconds
@@ -295,6 +295,19 @@ export async function updateFileExtractionStatus(fileId, status, extractedText =
 export async function updateFileProcessingStatus(fileId, status, result = null, error = null, metadata = null, aiProcessingTimeSeconds = null) {
     const client = await pool.connect();
     try {
+        // Check if we need to save actual_result (original AI result before modifications)
+        let actualResultToSave = null;
+        if (status === 'completed' && result) {
+            // Check if actual_result is NULL - if so, this is the first time saving, store original
+            const checkActualQuery = `SELECT actual_result FROM job_files WHERE id = $1`;
+            const checkActualResult = await client.query(checkActualQuery, [fileId]);
+
+            if (checkActualResult.rows.length > 0 && checkActualResult.rows[0].actual_result === null) {
+                // First time saving - store original AI result before any modifications
+                actualResultToSave = result;
+            }
+        }
+
         // Auto-fix permit number if result is being saved and status is completed
         let finalResult = result;
         if (status === 'completed' && result) {
@@ -343,16 +356,42 @@ export async function updateFileProcessingStatus(fileId, status, result = null, 
             }
         }
 
-        const query = `
-            UPDATE job_files 
-            SET processing_status = $1, result = $2, processing_error = $3, 
-                processed_at = $4, processing_metadata = $5, ai_processing_time_seconds = $6, updated_at = NOW()
-            WHERE id = $7
-            RETURNING id, job_id, filename
-        `;
+        // Build update query - include actual_result if we need to set it
+        let query;
+        let values;
 
-        const processedAt = status === 'completed' || status === 'failed' ? new Date() : null;
-        const values = [status, finalResult ? JSON.stringify(finalResult) : null, error, processedAt, metadata ? JSON.stringify(metadata) : null, aiProcessingTimeSeconds, fileId];
+        if (actualResultToSave !== null) {
+            // First time saving - set both actual_result and result
+            query = `
+                UPDATE job_files 
+                SET processing_status = $1, result = $2, actual_result = $3, processing_error = $4, 
+                    processed_at = $5, processing_metadata = $6, ai_processing_time_seconds = $7, updated_at = NOW()
+                WHERE id = $8
+                RETURNING id, job_id, filename
+            `;
+            const processedAt = status === 'completed' || status === 'failed' ? new Date() : null;
+            values = [
+                status,
+                finalResult ? JSON.stringify(finalResult) : null,
+                JSON.stringify(actualResultToSave),
+                error,
+                processedAt,
+                metadata ? JSON.stringify(metadata) : null,
+                aiProcessingTimeSeconds,
+                fileId
+            ];
+        } else {
+            // Not first time - only update result (actual_result stays unchanged)
+            query = `
+                UPDATE job_files 
+                SET processing_status = $1, result = $2, processing_error = $3, 
+                    processed_at = $4, processing_metadata = $5, ai_processing_time_seconds = $6, updated_at = NOW()
+                WHERE id = $7
+                RETURNING id, job_id, filename
+            `;
+            const processedAt = status === 'completed' || status === 'failed' ? new Date() : null;
+            values = [status, finalResult ? JSON.stringify(finalResult) : null, error, processedAt, metadata ? JSON.stringify(metadata) : null, aiProcessingTimeSeconds, fileId];
+        }
         const queryResult = await client.query(query, values);
 
         if (queryResult.rows.length === 0) {
@@ -481,7 +520,7 @@ export async function getFileResult(fileId) {
     const client = await pool.connect();
     try {
         const query = `
-            SELECT jf.id, jf.filename, jf.result, jf.extracted_text, jf.extracted_tables, jf.pages, jf.markdown,
+            SELECT jf.id, jf.filename, jf.result, jf.actual_result, jf.extracted_text, jf.extracted_tables, jf.pages, jf.markdown,
                    jf.extraction_status, jf.processing_status, jf.extraction_error, jf.processing_error, jf.processed_at,
                    jf.job_id, j.name as job_name, j.schema_data, jf.upload_status, jf.upload_error, 
                    jf.storage_type, jf.retry_count, jf.last_retry_at, jf.extraction_time_seconds, jf.ai_processing_time_seconds
@@ -593,6 +632,7 @@ export async function getAllFiles(limit = 50, offset = 0, status = null, jobId =
                 jf.job_id,
                 j.name as job_name,
                 jf.result,
+                jf.actual_result,
                 jf.extraction_error,
                 jf.processing_error,
                 jf.extracted_text, 
@@ -619,7 +659,7 @@ export async function getAllFiles(limit = 50, offset = 0, status = null, jobId =
             ${whereConditions}
             GROUP BY jf.id, jf.filename, jf.size, jf.extraction_status, jf.processing_status,
                      jf.extraction_time_seconds, jf.ai_processing_time_seconds, jf.created_at,
-                     jf.processed_at, jf.job_id, j.name, jf.result, jf.extraction_error, jf.processing_error, jf.markdown
+                     jf.processed_at, jf.job_id, j.name, jf.result, jf.actual_result, jf.extraction_error, jf.processing_error, jf.markdown
             ORDER BY jf.created_at DESC 
             LIMIT $${++paramCount} OFFSET $${++paramCount}
         `;
