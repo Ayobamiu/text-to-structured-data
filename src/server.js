@@ -30,6 +30,7 @@ import pool, {
 } from "./database.js";
 import { getUserById } from "./database/users.js";
 import { getUserOrganizations } from "./database/userOrganizationMemberships.js";
+import { getUserOrganizationIds, getUserFirstOrganizationId, requireUserFirstOrganizationId } from "./utils/organizationHelpers.js";
 import { initializeDatabase } from "./database/init.js";
 import queueService from "./queue.js";
 import authRoutes from "./routes/auth.js";
@@ -459,9 +460,8 @@ app.get("/jobs", authenticateToken, async (req, res) => {
     try {
         const { limit = 10, offset = 0 } = req.query;
 
-        // Get user's organizations using the membership system
-        const userOrganizations = await getUserOrganizations(req.user.id);
-        const organizationIds = userOrganizations.map(org => org.id);
+        // Get user's organization IDs (with JWT optimization)
+        const organizationIds = await getUserOrganizationIds(req.user);
 
         if (organizationIds.length === 0) {
             return res.json({
@@ -497,9 +497,8 @@ app.get("/jobs/:id", authenticateToken, async (req, res) => {
             });
         }
 
-        // Check if user has access to this job's organization
-        const userOrganizations = await getUserOrganizations(req.user.id);
-        const userOrganizationIds = userOrganizations.map(org => org.id);
+        // Check if user has access to this job's organization (with JWT optimization)
+        const userOrganizationIds = await getUserOrganizationIds(req.user);
 
         if (job.organization_id && !userOrganizationIds.includes(job.organization_id)) {
             return res.status(403).json({
@@ -543,8 +542,8 @@ app.put("/jobs/:id/schema", authenticateToken, async (req, res) => {
             });
         }
 
-        const userOrganizations = await getUserOrganizations(req.user.id);
-        const userOrganizationIds = userOrganizations.map(org => org.id);
+        // Check if user has access to this job's organization (with JWT optimization)
+        const userOrganizationIds = await getUserOrganizationIds(req.user);
 
         if (job.organization_id && !userOrganizationIds.includes(job.organization_id)) {
             return res.status(403).json({
@@ -659,8 +658,8 @@ app.get("/files/:id/download", authenticateToken, async (req, res) => {
                 });
             }
 
-            const userOrganizations = await getUserOrganizations(req.user.id);
-            const userOrganizationIds = userOrganizations.map(org => org.id);
+            // Check if user has access to this file's job organization (with JWT optimization)
+            const userOrganizationIds = await getUserOrganizationIds(req.user);
 
             if (job.organization_id && !userOrganizationIds.includes(job.organization_id)) {
                 return res.status(403).json({
@@ -746,8 +745,8 @@ app.put("/files/:id/results", authenticateToken, async (req, res) => {
             });
         }
 
-        const userOrganizations = await getUserOrganizations(req.user.id);
-        const userOrganizationIds = userOrganizations.map(org => org.id);
+        // Check if user has access to this file's job organization (with JWT optimization)
+        const userOrganizationIds = await getUserOrganizationIds(req.user);
 
         if (job.organization_id && !userOrganizationIds.includes(job.organization_id)) {
             return res.status(403).json({
@@ -1083,13 +1082,8 @@ app.get("/files", authenticateToken, async (req, res) => {
     try {
         const { limit = 50, offset = 0, status, jobId } = req.query;
 
-        // Use organization IDs from JWT if available (optimization), otherwise fetch from database
-        let organizationIds = req.user.organizationIds;
-        if (!organizationIds || organizationIds.length === 0) {
-            // Fallback to database query for backward compatibility (old tokens without org IDs)
-            const userOrganizations = await getUserOrganizations(req.user.id);
-            organizationIds = userOrganizations.map(org => org.id);
-        }
+        // Get user's organization IDs (with JWT optimization)
+        const organizationIds = await getUserOrganizationIds(req.user);
 
         const result = await getAllFiles(
             parseInt(limit),
@@ -1384,15 +1378,10 @@ app.post("/extract", authenticateToken, upload.array("files", 20), async (req, r
 
         // Step 0: Create job in database
         console.log("Step 0: Creating job in database...");
-        // Get user's organizations using the membership system
-        const userOrganizations = await getUserOrganizations(req.user.id);
-        const organizationId = userOrganizations.length > 0 ? userOrganizations[0].id : null;
-
+        // Get user's first organization ID (with JWT optimization)
+        const organizationId = await requireUserFirstOrganizationId(req.user, res);
         if (!organizationId) {
-            console.error("❌ User has no organizations");
-            return res.status(400).json({
-                error: "User must be part of an organization to create jobs"
-            });
+            return; // Error response already sent by helper
         }
 
         // Set default processing config if not provided
@@ -1527,8 +1516,8 @@ app.delete("/files/:fileId", authenticateToken, async (req, res) => {
             });
         }
 
-        const userOrganizations = await getUserOrganizations(req.user.id);
-        const userOrganizationIds = userOrganizations.map(org => org.id);
+        // Check if user has access to this file's job organization (with JWT optimization)
+        const userOrganizationIds = await getUserOrganizationIds(req.user);
 
         if (job.organization_id && !userOrganizationIds.includes(job.organization_id)) {
             return res.status(403).json({
@@ -1604,9 +1593,8 @@ app.delete("/files", authenticateToken, async (req, res) => {
         const deletedFiles = [];
         const errors = [];
 
-        // Get user's organizations for access control
-        const userOrganizations = await getUserOrganizations(req.user.id);
-        const userOrganizationIds = userOrganizations.map(org => org.id);
+        // Get user's organization IDs for access control (with JWT optimization)
+        const userOrganizationIds = await getUserOrganizationIds(req.user);
 
         const client = await pool.connect();
         try {
@@ -1737,9 +1725,8 @@ app.post("/files/reprocess", authenticateToken, async (req, res) => {
             });
         }
 
-        // Get user's organizations for access control
-        const userOrganizations = await getUserOrganizations(req.user.id);
-        const userOrganizationIds = userOrganizations.map(org => org.id);
+        // Get user's organization IDs for access control (with JWT optimization)
+        const userOrganizationIds = await getUserOrganizationIds(req.user);
 
         if (userOrganizationIds.length === 0) {
             return res.status(403).json({
