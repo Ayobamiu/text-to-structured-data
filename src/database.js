@@ -227,7 +227,7 @@ export async function getJobStatus(jobId) {
                    processing_status, extracted_text, extracted_tables, markdown, result, actual_result,
                    processing_metadata, extraction_error, processing_error, created_at, processed_at,
                    upload_status, upload_error, storage_type, retry_count, last_retry_at,
-                   extraction_time_seconds, ai_processing_time_seconds
+                   extraction_time_seconds, ai_processing_time_seconds, admin_verified, customer_verified
             FROM job_files WHERE job_id = $1
             ORDER BY created_at
         `;
@@ -523,7 +523,8 @@ export async function getFileResult(fileId) {
             SELECT jf.id, jf.filename, jf.result, jf.actual_result, jf.extracted_text, jf.extracted_tables, jf.pages, jf.markdown,
                    jf.extraction_status, jf.processing_status, jf.extraction_error, jf.processing_error, jf.processed_at,
                    jf.job_id, j.name as job_name, j.schema_data, jf.upload_status, jf.upload_error, 
-                   jf.storage_type, jf.retry_count, jf.last_retry_at, jf.extraction_time_seconds, jf.ai_processing_time_seconds
+                   jf.storage_type, jf.retry_count, jf.last_retry_at, jf.extraction_time_seconds, jf.ai_processing_time_seconds,
+                   jf.admin_verified, jf.customer_verified
             FROM job_files jf
             JOIN jobs j ON jf.job_id = j.id
             WHERE jf.id = $1
@@ -538,6 +539,56 @@ export async function getFileResult(fileId) {
         return result.rows[0];
     } catch (error) {
         console.error('❌ Error getting file result:', error.message);
+        throw error;
+    } finally {
+        client.release();
+    }
+}
+
+// Update file verification status
+export async function updateFileVerification(fileId, adminVerified = null, customerVerified = null) {
+    const client = await pool.connect();
+    try {
+        const updates = [];
+        const values = [];
+        let paramCount = 0;
+
+        if (adminVerified !== null) {
+            paramCount++;
+            updates.push(`admin_verified = $${paramCount}`);
+            values.push(adminVerified);
+        }
+
+        if (customerVerified !== null) {
+            paramCount++;
+            updates.push(`customer_verified = $${paramCount}`);
+            values.push(customerVerified);
+        }
+
+        if (updates.length === 0) {
+            throw new Error('At least one verification field must be provided');
+        }
+
+        paramCount++;
+        values.push(fileId);
+
+        const query = `
+            UPDATE job_files 
+            SET ${updates.join(', ')}, updated_at = NOW()
+            WHERE id = $${paramCount}
+            RETURNING id, filename, admin_verified, customer_verified
+        `;
+
+        const result = await client.query(query, values);
+
+        if (result.rows.length === 0) {
+            throw new Error('File not found');
+        }
+
+        console.log(`✅ File verification updated: ${fileId} - admin: ${adminVerified}, customer: ${customerVerified}`);
+        return result.rows[0];
+    } catch (error) {
+        console.error('❌ Error updating file verification:', error.message);
         throw error;
     } finally {
         client.release();
@@ -645,6 +696,8 @@ export async function getAllFiles(limit = 50, offset = 0, status = null, jobId =
                 jf.extracted_tables, 
                 jf.pages, 
                 jf.markdown,
+                jf.admin_verified,
+                jf.customer_verified,
                 COALESCE(
                     JSON_AGG(
                         CASE 
@@ -665,7 +718,7 @@ export async function getAllFiles(limit = 50, offset = 0, status = null, jobId =
             ${whereConditions}
             GROUP BY jf.id, jf.filename, jf.size, jf.extraction_status, jf.processing_status,
                      jf.extraction_time_seconds, jf.ai_processing_time_seconds, jf.created_at,
-                     jf.processed_at, jf.job_id, j.name, jf.result, jf.actual_result, jf.extraction_error, jf.processing_error, jf.markdown
+                     jf.processed_at, jf.job_id, j.name, jf.result, jf.actual_result, jf.extraction_error, jf.processing_error, jf.markdown, jf.admin_verified, jf.customer_verified
             ORDER BY jf.created_at DESC 
             LIMIT $${++paramCount} OFFSET $${++paramCount}
         `;

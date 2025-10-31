@@ -25,7 +25,8 @@ import pool, {
     getSystemStats,
     updateFileUploadStatus,
     updateFileS3Info,
-    getAllFiles
+    getAllFiles,
+    updateFileVerification
 } from "./database.js";
 import { getUserById } from "./database/users.js";
 import { getUserOrganizations } from "./database/userOrganizationMemberships.js";
@@ -35,7 +36,7 @@ import authRoutes from "./routes/auth.js";
 import organizationRoutes from "./routes/organizations.js";
 import previewRoutes, { setWebSocketInstance } from "./routes/previews.js";
 import healthRoutes from "./routes/health.js";
-import { authenticateToken, optionalAuth, securityHeaders } from "./middleware/auth.js";
+import { authenticateToken, optionalAuth, securityHeaders, requireRole } from "./middleware/auth.js";
 import { rateLimitConfig } from "./auth.js";
 import logger from "./utils/logger.js";
 import { processWithOpenAI } from "./utils/openaiProcessor.js";
@@ -822,6 +823,51 @@ app.put("/files/:id/results", authenticateToken, async (req, res) => {
         res.status(500).json({
             status: "error",
             message: "Failed to update file results",
+            error: error.message
+        });
+    }
+});
+
+// Update file verification status
+app.put("/files/:id/verify", authenticateToken, requireRole('admin'), async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { adminVerified, customerVerified } = req.body;
+
+        // Only admins can update admin_verified
+        // Anyone can update customer_verified (for now)
+        const updateData = {};
+        if (req.user.role === 'admin' && adminVerified !== undefined) {
+            updateData.adminVerified = adminVerified;
+        }
+        if (customerVerified !== undefined) {
+            updateData.customerVerified = customerVerified;
+        }
+
+        if (Object.keys(updateData).length === 0) {
+            return res.status(400).json({
+                status: "error",
+                message: "At least one verification field must be provided"
+            });
+        }
+
+        const result = await updateFileVerification(
+            id,
+            updateData.adminVerified !== undefined ? updateData.adminVerified : null,
+            updateData.customerVerified !== undefined ? updateData.customerVerified : null
+        );
+
+        res.json({
+            status: "success",
+            message: "File verification updated successfully",
+            data: result
+        });
+
+    } catch (error) {
+        console.error('Error updating file verification:', error);
+        res.status(500).json({
+            status: "error",
+            message: "Failed to update file verification",
             error: error.message
         });
     }
