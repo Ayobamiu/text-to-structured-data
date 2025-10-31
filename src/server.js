@@ -94,7 +94,7 @@ const FLASK_URL = process.env.FLASK_URL || "http://localhost:5001";
 const s3Service = new S3Service();
 
 // Initialize extraction service
-const extractionService = new ExtractionService();
+const extractionService = new ExtractionService(s3Service);
 
 // Authentication routes
 app.use('/auth', express.json());
@@ -1183,38 +1183,83 @@ async function processFilesAsync(job, files, schema, schemaName, processingConfi
                 await updateFileExtractionStatus(fileRecord.id, 'processing');
                 console.log(`✅ Step 1 completed for ${file.originalname}`);
 
-                // Step 2: Extract text from PDF using Flask service
-                console.log(`Step 2: Calling Flask service for text extraction of ${file.originalname}...`);
+                // Step 2: Extract text from PDF
+                console.log(`Step 2: Extracting text from ${file.originalname}...`);
                 // Add extraction method from processing config
                 const eToJSON = typeof processingConfig === 'string' ? JSON.parse(processingConfig) : processingConfig;
                 const jobProcessingConfig = typeof job.processing_config === 'string' ? JSON.parse(job.processing_config) : job.processing_config;
                 const extractionMethod = eToJSON?.extraction?.method || jobProcessingConfig?.extraction?.method || 'mineru';
-                const extractionResult = await extractionService.extractText(file.path, file.originalname, extractionMethod);
-                const extractionTimeSeconds = extractionResult.extraction_time_seconds || 0
+                const extractionOptions = eToJSON?.extraction?.options || jobProcessingConfig?.extraction?.options || {};
+
+                // Get S3 key from file record if available
+                const s3Key = fileRecord.s3_key || null;
+
+                // Extract text (with fallback if extendai fails)
+                let extractionResult;
+                if (extractionMethod === 'extendai') {
+                    // Try ExtendAI with fallback to mineru
+                    console.log(`🚀 Attempting ExtendAI extraction for ${file.originalname}`);
+                    extractionResult = await extractionService.extractWithExtendAI(file.originalname, s3Key, extractionOptions);
+
+                    // If ExtendAI fails, fallback to mineru
+                    if (!extractionResult.success) {
+                        console.log(`⚠️ ExtendAI failed: ${extractionResult.error}`);
+                        console.log(`🔄 Falling back to mineru for ${file.originalname}`);
+                        extractionResult = await extractionService.extractText(file.path, file.originalname, 'mineru', extractionOptions);
+
+                        // Ensure fallback result has proper structure
+                        if (!extractionResult.success) {
+                            throw new Error(`Extraction failed after fallback: ${extractionResult.error}`);
+                        }
+                        console.log(`✅ MinerU fallback extraction successful for ${file.originalname}`);
+                    }
+                } else {
+                    // Use specified method (mineru/documentai) via Flask
+                    extractionResult = await extractionService.extractText(file.path, file.originalname, extractionMethod, extractionOptions);
+                }
+
+                const extractionTimeSeconds = extractionResult.extraction_time_seconds || 0;
                 if (!extractionResult.success) {
                     throw new Error(`Extraction failed: ${extractionResult.error}`);
                 }
 
-                // Extract document data from Flask response
+                // Extract document data from extraction response
                 const markdown = extractionResult.markdown || "";
                 const rawText = extractionResult.text || "";
                 const pages = extractionResult.pages || [];
                 const tables = extractionResult.tables || [];
 
-                console.log(`Document structure: ${pages.length} pages, ${tables.length} tables, ${rawText.length} chars raw text, ${markdown.length} chars markdown`);
+                // Extract page count (pages could be array or number)
+                let pageCount = null;
+                if (Array.isArray(pages)) {
+                    pageCount = pages.length;
+                } else if (typeof pages === 'number') {
+                    pageCount = pages;
+                } else if (pages) {
+                    // If pages is an object, try to get count
+                    pageCount = pages.length || pages.count || pages.total || null;
+                }
+
+                console.log(`Document structure: ${pageCount || 0} pages, ${tables.length} tables, ${rawText.length} chars raw text, ${markdown.length} chars markdown`);
                 console.log(`Extraction completed in ${extractionTimeSeconds.toFixed(2)} seconds`);
+                console.log(`📊 Extracted data: markdown=${markdown.length} chars, text=${rawText.length} chars, pages=${pageCount}, tables=${tables.length}`);
 
                 // Step 3: Update file extraction status to completed with timing
+                // Store pages array or page count based on what we have
+                const pagesToStore = Array.isArray(pages) && pages.length > 0 ? pages : (pageCount || null);
+
                 await updateFileExtractionStatus(
                     fileRecord.id,
                     'completed',
                     rawText,
-                    tables || null,
+                    Array.isArray(tables) && tables.length > 0 ? tables : null,
                     markdown || null,
-                    pages || null,
+                    pagesToStore,
                     null, // error
                     extractionTimeSeconds
                 );
+
+                console.log(`✅ File extraction status updated for ${file.originalname}`);
 
                 // Check if this is a text-only extraction job
                 if (job.extraction_mode === 'text_only') {

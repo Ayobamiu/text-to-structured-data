@@ -216,7 +216,7 @@ export async function getJobStatus(jobId) {
     try {
         // Get job details
         const jobQuery = `
-            SELECT id, name, status, schema_data, schema_data_array, summary, user_id, created_at, updated_at, extraction_mode
+            SELECT id, name, status, schema_data, schema_data_array, summary, user_id, created_at, updated_at, extraction_mode, processing_config
             FROM jobs WHERE id = $1
         `;
         const jobResult = await client.query(jobQuery, [jobId]);

@@ -26,7 +26,7 @@ class FileProcessorWorker {
         this.errorCount = 0;
         this.startTime = new Date();
         this.s3Service = new S3Service();
-        this.extractionService = new ExtractionService();
+        this.extractionService = new ExtractionService(this.s3Service);
         this.processingService = new ProcessingService();
 
         // Initialize Socket.IO client for WebSocket events
@@ -213,10 +213,31 @@ class FileProcessorWorker {
                 );
 
                 // Get extraction method from job processing config
-                const extractionMethod = job.processing_config?.extraction?.method || 'mineru';
-                const extractionOptions = job.processing_config?.extraction?.options || {};
+                // Parse processing_config if it's a string (JSON stored as text)
+                const jobProcessingConfig = typeof job.processing_config === 'string' ? JSON.parse(job.processing_config) : job.processing_config;
+                const extractionMethod = jobProcessingConfig?.extraction?.method || 'mineru';
+                const extractionOptions = jobProcessingConfig?.extraction?.options || {};
 
-                extractionResult = await this.extractTextFromFile(file, extractionMethod, extractionOptions);
+                console.log(`📋 Using extraction method: ${extractionMethod} (from job processing config)`);
+
+                // Handle ExtendAI with fallback to mineru
+                if (extractionMethod === 'extendai') {
+                    extractionResult = await this.extractWithExtendAI(file, extractionOptions);
+                    if (!extractionResult.success) {
+                        console.log(`⚠️ ExtendAI failed: ${extractionResult.error}`);
+                        console.log(`🔄 Falling back to mineru for ${file.filename}`);
+                        // Fallback to mineru - extractFromS3File will download and process
+                        extractionResult = await this.extractFromS3File(file, 'mineru', extractionOptions);
+
+                        // Ensure fallback result has proper structure
+                        if (!extractionResult.success) {
+                            throw new Error(`Extraction failed after fallback: ${extractionResult.error}`);
+                        }
+                        console.log(`✅ MinerU fallback extraction successful for ${file.filename}`);
+                    }
+                } else {
+                    extractionResult = await this.extractTextFromFile(file, extractionMethod, extractionOptions);
+                }
 
                 if (!extractionResult.success) {
                     throw new Error(`Extraction failed: ${extractionResult.error}`);
@@ -224,17 +245,35 @@ class FileProcessorWorker {
 
                 console.log(`✅ Extraction completed for ${file.filename}. Skipping AI processing.`);
 
+                // Prepare data for database update
+                const pages = extractionResult.pages || [];
+                const tables = extractionResult.tables || [];
+
+                // Extract page count - pages could be array, number, or object
+                let pageCount = null;
+                let pagesToStore = null;
+                if (Array.isArray(pages) && pages.length > 0) {
+                    pageCount = pages.length;
+                    // Store the array if it has content
+                    pagesToStore = pages;
+                } else if (typeof pages === 'number') {
+                    pageCount = pages;
+                    pagesToStore = pages;
+                }
+
                 // Update extraction status and skip AI processing
                 await updateFileExtractionStatus(
                     file.id,
                     'completed',
-                    extractionResult.text,
-                    extractionResult.tables,
-                    extractionResult.markdown,
-                    extractionResult.pages,
+                    extractionResult.text || null,
+                    Array.isArray(tables) && tables.length > 0 ? tables : null,
+                    extractionResult.markdown || null,
+                    pagesToStore,
                     null,
-                    extractionResult.extractionTimeSeconds
+                    extractionResult.extraction_time_seconds || extractionResult.extractionTimeSeconds || null
                 );
+
+                console.log(`✅ File extraction status updated for ${file.filename}`);
 
                 // Emit completion event
                 this.emitFileStatusUpdate(
@@ -261,10 +300,25 @@ class FileProcessorWorker {
                 );
 
                 // Get extraction method from job processing config
-                const extractionMethod = job.processing_config?.extraction?.method || 'mineru';
-                const extractionOptions = job.processing_config?.extraction?.options || {};
+                // Parse processing_config if it's a string (JSON stored as text)
+                const jobProcessingConfig = typeof job.processing_config === 'string' ? JSON.parse(job.processing_config) : job.processing_config;
+                const extractionMethod = jobProcessingConfig?.extraction?.method || 'mineru';
+                const extractionOptions = jobProcessingConfig?.extraction?.options || {};
 
-                extractionResult = await this.extractTextFromFile(file, extractionMethod, extractionOptions);
+                console.log(`📋 Using extraction method: ${extractionMethod} (from job processing config)`);
+
+                // Handle ExtendAI with fallback to mineru
+                if (extractionMethod === 'extendai') {
+                    extractionResult = await this.extractWithExtendAI(file, extractionOptions);
+                    if (!extractionResult.success) {
+                        console.log(`⚠️ ExtendAI failed: ${extractionResult.error}`);
+                        console.log(`🔄 Falling back to mineru for ${file.filename}`);
+                        // Fallback to mineru - extractFromS3File will download and process
+                        extractionResult = await this.extractFromS3File(file, 'mineru', extractionOptions);
+                    }
+                } else {
+                    extractionResult = await this.extractTextFromFile(file, extractionMethod, extractionOptions);
+                }
 
                 if (!extractionResult.success) {
                     throw new Error(`Extraction failed: ${extractionResult.error}`);
@@ -310,25 +364,64 @@ class FileProcessorWorker {
                 );
 
                 // Get extraction method from job processing config
-                const extractionMethod = job.processing_config?.extraction?.method || 'mineru';
-                const extractionOptions = job.processing_config?.extraction?.options || {};
+                // Parse processing_config if it's a string (JSON stored as text)
+                const jobProcessingConfig = typeof job.processing_config === 'string' ? JSON.parse(job.processing_config) : job.processing_config;
+                const extractionMethod = jobProcessingConfig?.extraction?.method || 'mineru';
+                const extractionOptions = jobProcessingConfig?.extraction?.options || {};
 
-                extractionResult = await this.extractTextFromFile(file, extractionMethod, extractionOptions);
+                console.log(`📋 Using extraction method: ${extractionMethod} (from job processing config)`);
+
+                // Handle ExtendAI with fallback to mineru
+                if (extractionMethod === 'extendai') {
+                    extractionResult = await this.extractWithExtendAI(file, extractionOptions);
+                    if (!extractionResult.success) {
+                        console.log(`⚠️ ExtendAI failed: ${extractionResult.error}`);
+                        console.log(`🔄 Falling back to mineru for ${file.filename}`);
+                        // Fallback to mineru - extractFromS3File will download and process
+                        extractionResult = await this.extractFromS3File(file, 'mineru', extractionOptions);
+
+                        // Ensure fallback result has proper structure
+                        if (!extractionResult.success) {
+                            throw new Error(`Extraction failed after fallback: ${extractionResult.error}`);
+                        }
+                        console.log(`✅ MinerU fallback extraction successful for ${file.filename}`);
+                    }
+                } else {
+                    extractionResult = await this.extractTextFromFile(file, extractionMethod, extractionOptions);
+                }
 
                 if (!extractionResult.success) {
                     throw new Error(`Extraction failed: ${extractionResult.error}`);
+                }
+
+                // Prepare data for database update
+                const pages = extractionResult.pages || [];
+                const tables = extractionResult.tables || [];
+
+                // Extract page count - pages could be array, number, or object
+                let pageCount = null;
+                let pagesToStore = null;
+                if (Array.isArray(pages) && pages.length > 0) {
+                    pageCount = pages.length;
+                    // Store the array if it has content
+                    pagesToStore = pages;
+                } else if (typeof pages === 'number') {
+                    pageCount = pages;
+                    pagesToStore = pages;
                 }
 
                 // Update extraction status
                 await updateFileExtractionStatus(
                     file.id,
                     'completed',
-                    extractionResult.text,
-                    extractionResult.tables,
-                    extractionResult.markdown,
-                    extractionResult.pages
+                    extractionResult.text || null,
+                    Array.isArray(tables) && tables.length > 0 ? tables : null,
+                    extractionResult.markdown || null,
+                    pagesToStore,
+                    null,
+                    extractionResult.extraction_time_seconds || extractionResult.extractionTimeSeconds || null
                 );
-                console.log(`✅ File ${file.filename} extraction completed`);
+                console.log(`✅ File ${file.filename} extraction completed and updated in database`);
 
                 // Emit WebSocket event for Stage 1 completion
                 this.emitFileStatusUpdate(
@@ -513,9 +606,38 @@ class FileProcessorWorker {
         }
     }
 
+    /**
+     * Extract with ExtendAI (requires S3 file)
+     * @param {Object} file - File record with s3_key
+     * @param {Object} options - Extraction options
+     * @returns {Promise<Object>} Extraction result
+     */
+    async extractWithExtendAI(file, options = {}) {
+        try {
+            if (!file.s3_key) {
+                throw new Error('S3 key required for ExtendAI extraction');
+            }
+
+            console.log(`🚀 Attempting ExtendAI extraction for ${file.filename} (S3: ${file.s3_key})`);
+            return await this.extractionService.extractWithExtendAI(file.filename, file.s3_key, options);
+        } catch (error) {
+            console.error('❌ ExtendAI extraction error:', error.message);
+            return {
+                success: false,
+                error: error.message
+            };
+        }
+    }
+
     async extractTextFromFile(file, method = 'mineru', options = {}) {
         try {
             console.log(`📄 Extracting text from: ${file.filename} using ${method}`);
+
+            // Handle ExtendAI extraction (requires S3)
+            if (method === 'extendai') {
+                return await this.extractWithExtendAI(file, options);
+            }
+
             // Check if file is stored in S3
             if (file.s3_key && this.s3Service.isCloudStorageEnabled()) {
                 return await this.extractFromS3File(file, method, options);
@@ -537,6 +659,12 @@ class FileProcessorWorker {
         try {
             console.log(`📄 Processing S3 file: ${file.s3_key} with ${method}`);
 
+            // For ExtendAI, use direct S3 URL (no need to download)
+            if (method === 'extendai') {
+                return await this.extractWithExtendAI(file, options);
+            }
+
+            // For other methods, download file and use Flask service
             // Download file from S3
             const fileBuffer = await this.s3Service.downloadFile(file.s3_key);
 
