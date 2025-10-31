@@ -65,16 +65,20 @@ export async function createJob(name, schema, schemaName, userId = null, organiz
 
         const finalProcessingConfig = processingConfig || defaultProcessingConfig;
 
+        // Create initial schema data object
+        const initialSchemaData = { schema, schemaName: schemaName || 'data_extraction' };
+
         const query = `
-            INSERT INTO jobs (id, name, schema_data, status, user_id, organization_id, extraction_mode, processing_config, created_at, updated_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())
+            INSERT INTO jobs (id, name, schema_data, schema_data_array, status, user_id, organization_id, extraction_mode, processing_config, created_at, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW(), NOW())
             RETURNING id, name, status, extraction_mode, processing_config, created_at
         `;
 
         const values = [
             jobId,
             name || `Job ${new Date().toISOString()}`,
-            JSON.stringify({ schema, schemaName: schemaName || 'data_extraction' }),
+            JSON.stringify(initialSchemaData),
+            JSON.stringify([initialSchemaData]), // Initialize schema_data_array with first version
             'queued',
             userId,
             organizationId,
@@ -212,7 +216,7 @@ export async function getJobStatus(jobId) {
     try {
         // Get job details
         const jobQuery = `
-            SELECT id, name, status, schema_data, summary, user_id, created_at, updated_at, extraction_mode
+            SELECT id, name, status, schema_data, schema_data_array, summary, user_id, created_at, updated_at, extraction_mode
             FROM jobs WHERE id = $1
         `;
         const jobResult = await client.query(jobQuery, [jobId]);
@@ -522,7 +526,7 @@ export async function getFileResult(fileId) {
         const query = `
             SELECT jf.id, jf.filename, jf.result, jf.actual_result, jf.extracted_text, jf.extracted_tables, jf.pages, jf.markdown,
                    jf.extraction_status, jf.processing_status, jf.extraction_error, jf.processing_error, jf.processed_at,
-                   jf.job_id, j.name as job_name, j.schema_data, jf.upload_status, jf.upload_error, 
+                   jf.job_id, j.name as job_name, j.schema_data, j.schema_data_array, jf.upload_status, jf.upload_error, 
                    jf.storage_type, jf.retry_count, jf.last_retry_at, jf.extraction_time_seconds, jf.ai_processing_time_seconds,
                    jf.admin_verified, jf.customer_verified
             FROM job_files jf

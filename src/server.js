@@ -555,21 +555,43 @@ app.put("/jobs/:id/schema", authenticateToken, async (req, res) => {
         // Update schema in database
         const client = await pool.connect();
         try {
-            const updateQuery = `
-                UPDATE jobs 
-                SET schema_data = $1, updated_at = NOW()
-                WHERE id = $2
-                RETURNING id, schema_data
-            `;
-
             // Preserve the original structure with schemaName
             const existingJob = await getJobStatus(id);
-            const schemaData = {
+            const newSchemaData = {
                 schema: schema,
                 schemaName: existingJob.schema_data?.schemaName || 'data_extraction'
             };
 
-            const result = await client.query(updateQuery, [JSON.stringify(schemaData), id]);
+            // Add new schema version to schema_data_array and update schema_data
+            // Get existing schema_data_array or initialize as empty array
+            const existingSchemaArray = existingJob.schema_data_array || [];
+
+            // Check if this schema is different from the current one
+            const currentSchemaStr = JSON.stringify(existingJob.schema_data);
+            const newSchemaStr = JSON.stringify(newSchemaData);
+
+            let updatedSchemaArray = [...existingSchemaArray];
+
+            // Only add to history if it's different from current
+            if (currentSchemaStr !== newSchemaStr) {
+                // Add new version to the array
+                updatedSchemaArray.push(newSchemaData);
+            }
+
+            const updateQuery = `
+                UPDATE jobs 
+                SET schema_data = $1, 
+                    schema_data_array = $2,
+                    updated_at = NOW()
+                WHERE id = $3
+                RETURNING id, schema_data, schema_data_array
+            `;
+
+            const result = await client.query(updateQuery, [
+                JSON.stringify(newSchemaData),
+                JSON.stringify(updatedSchemaArray),
+                id
+            ]);
 
             if (result.rows.length === 0) {
                 return res.status(404).json({
@@ -583,7 +605,8 @@ app.put("/jobs/:id/schema", authenticateToken, async (req, res) => {
                 message: "Schema updated successfully",
                 data: {
                     jobId: result.rows[0].id,
-                    schema: result.rows[0].schema_data
+                    schema: result.rows[0].schema_data,
+                    schema_data_array: result.rows[0].schema_data_array
                 }
             });
         } finally {
