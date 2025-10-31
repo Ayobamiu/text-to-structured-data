@@ -27,7 +27,7 @@ import {
     deleteAllUserSessions,
     getUserStats
 } from '../database/users.js';
-import { createDefaultOrganizationForUser } from '../database/userOrganizationMemberships.js';
+import { createDefaultOrganizationForUser, getUserOrganizations } from '../database/userOrganizationMemberships.js';
 import { authenticateToken, logAuthAttempt, securityHeaders } from '../middleware/auth.js';
 
 const router = express.Router();
@@ -99,17 +99,23 @@ router.post('/register', [
         const { organization } = await createDefaultOrganizationForUser(user.id, user.name, user.email);
         console.log(`✅ Created default organization: ${organization.name} (${organization.slug})`);
 
-        // Generate tokens
+        // Get user organizations for JWT
+        const userOrganizations = await getUserOrganizations(user.id);
+        const organizationIds = userOrganizations.map(org => org.id);
+
+        // Generate tokens with organization IDs
         const accessToken = generateAccessToken({
             userId: user.id,
             email: user.email,
-            role: user.role
+            role: user.role,
+            organizationIds: organizationIds
         });
 
         const refreshToken = generateRefreshToken({
             userId: user.id,
             email: user.email,
-            role: user.role
+            role: user.role,
+            organizationIds: organizationIds
         });
 
         // Create session
@@ -198,17 +204,23 @@ router.post('/login', [
             });
         }
 
-        // Generate tokens
+        // Get user organizations for JWT
+        const userOrganizations = await getUserOrganizations(user.id);
+        const organizationIds = userOrganizations.map(org => org.id);
+
+        // Generate tokens with organization IDs
         const accessToken = generateAccessToken({
             userId: user.id,
             email: user.email,
-            role: user.role
+            role: user.role,
+            organizationIds: organizationIds
         });
 
         const refreshToken = generateRefreshToken({
             userId: user.id,
             email: user.email,
-            role: user.role
+            role: user.role,
+            organizationIds: organizationIds
         });
 
         // Create session
@@ -273,11 +285,16 @@ router.post('/refresh', [
             });
         }
 
-        // Generate new access token
+        // Get user organizations for JWT (organizations may have changed since token was issued)
+        const userOrganizations = await getUserOrganizations(session.user_id);
+        const organizationIds = userOrganizations.map(org => org.id);
+
+        // Generate new access token with organization IDs
         const accessToken = generateAccessToken({
             userId: session.user_id,
             email: session.email,
-            role: session.role
+            role: session.role,
+            organizationIds: organizationIds
         });
 
         console.log(`✅ Token refreshed for user: ${session.email}`);

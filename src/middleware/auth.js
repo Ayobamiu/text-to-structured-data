@@ -32,7 +32,9 @@ export function authenticateToken(req, res, next) {
             id: decoded.userId,
             email: decoded.email,
             role: decoded.role || 'user',
-            token: token
+            token: token,
+            // Extract organization IDs from JWT (backward compatible - may be undefined for old tokens)
+            organizationIds: decoded.organizationIds || undefined
         };
 
         next();
@@ -139,7 +141,9 @@ export function optionalAuth(req, res, next) {
                 id: decoded.userId,
                 email: decoded.email,
                 role: decoded.role || 'user',
-                token: token
+                token: token,
+                // Extract organization IDs from JWT (backward compatible)
+                organizationIds: decoded.organizationIds || undefined
             };
         }
 

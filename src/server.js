@@ -1083,9 +1083,13 @@ app.get("/files", authenticateToken, async (req, res) => {
     try {
         const { limit = 50, offset = 0, status, jobId } = req.query;
 
-        // Restrict by user's organizations
-        const userOrganizations = await getUserOrganizations(req.user.id);
-        const organizationIds = userOrganizations.map(org => org.id);
+        // Use organization IDs from JWT if available (optimization), otherwise fetch from database
+        let organizationIds = req.user.organizationIds;
+        if (!organizationIds || organizationIds.length === 0) {
+            // Fallback to database query for backward compatibility (old tokens without org IDs)
+            const userOrganizations = await getUserOrganizations(req.user.id);
+            organizationIds = userOrganizations.map(org => org.id);
+        }
 
         const result = await getAllFiles(
             parseInt(limit),
