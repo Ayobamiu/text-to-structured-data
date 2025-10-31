@@ -635,6 +635,25 @@ app.get("/files/:id/result", authenticateToken, async (req, res) => {
             });
         }
 
+        // Check if user has access to this file's job organization
+        const job = await getJobStatus(file.job_id);
+        if (!job) {
+            return res.status(404).json({
+                status: "error",
+                message: "Job not found"
+            });
+        }
+
+        // Check if user has access to this file's job organization (with JWT optimization)
+        const userOrganizationIds = await getUserOrganizationIds(req.user);
+
+        if (job.organization_id && !userOrganizationIds.includes(job.organization_id)) {
+            return res.status(403).json({
+                status: "error",
+                message: "Access denied to this file"
+            });
+        }
+
         res.json({
             status: "success",
             file
