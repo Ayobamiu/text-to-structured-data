@@ -261,6 +261,31 @@ class FileProcessorWorker {
                     pagesToStore = pages;
                 }
 
+                // Extract OpenAI feed data (if available, e.g., from PaddleOCR)
+                const openaiFeedBlocked = extractionResult.openai_feed?.blocked || null;
+                const openaiFeedUnblocked = extractionResult.openai_feed?.unblocked || null;
+
+                // Extract extraction metadata
+                const extractionMetadata = extractionResult.metadata ? {
+                    ...extractionResult.metadata,
+                    extraction_time_seconds: extractionResult.metadata.extraction_time_seconds || extractionResult.extraction_time_seconds || extractionResult.extractionTimeSeconds || null,
+                } : {
+                    extraction_method: extractionResult.method || null,
+                    extraction_time_seconds: extractionResult.extraction_time_seconds || extractionResult.extractionTimeSeconds || null,
+                    total_pages: pageCount || null,
+                    total_tables: (extractionResult.tables || [])?.length || null,
+                    text_length: (extractionResult.text || '')?.length || null,
+                    markdown_length: (extractionResult.markdown || '')?.length || null,
+                };
+
+                // Add OpenAI feed lengths if available
+                if (openaiFeedBlocked) {
+                    extractionMetadata.openai_feed_blocked_length = openaiFeedBlocked.length;
+                }
+                if (openaiFeedUnblocked) {
+                    extractionMetadata.openai_feed_unblocked_length = openaiFeedUnblocked.length;
+                }
+
                 // Update extraction status and skip AI processing
                 await updateFileExtractionStatus(
                     file.id,
@@ -270,7 +295,10 @@ class FileProcessorWorker {
                     extractionResult.markdown || null,
                     pagesToStore,
                     null,
-                    extractionResult.extraction_time_seconds || extractionResult.extractionTimeSeconds || null
+                    extractionResult.extraction_time_seconds || extractionResult.extractionTimeSeconds || null,
+                    openaiFeedBlocked,
+                    openaiFeedUnblocked,
+                    extractionMetadata
                 );
 
                 console.log(`✅ File extraction status updated for ${file.filename}`);
@@ -410,6 +438,31 @@ class FileProcessorWorker {
                     pagesToStore = pages;
                 }
 
+                // Extract OpenAI feed data (if available, e.g., from PaddleOCR)
+                const openaiFeedBlocked = extractionResult.openai_feed?.blocked || null;
+                const openaiFeedUnblocked = extractionResult.openai_feed?.unblocked || null;
+
+                // Extract extraction metadata
+                const extractionMetadata = extractionResult.metadata ? {
+                    ...extractionResult.metadata,
+                    extraction_time_seconds: extractionResult.metadata.extraction_time_seconds || extractionResult.extraction_time_seconds || extractionResult.extractionTimeSeconds || null,
+                } : {
+                    extraction_method: extractionResult.method || null,
+                    extraction_time_seconds: extractionResult.extraction_time_seconds || extractionResult.extractionTimeSeconds || null,
+                    total_pages: pageCount || null,
+                    total_tables: (extractionResult.tables || [])?.length || null,
+                    text_length: (extractionResult.text || '')?.length || null,
+                    markdown_length: (extractionResult.markdown || '')?.length || null,
+                };
+
+                // Add OpenAI feed lengths if available
+                if (openaiFeedBlocked) {
+                    extractionMetadata.openai_feed_blocked_length = openaiFeedBlocked.length;
+                }
+                if (openaiFeedUnblocked) {
+                    extractionMetadata.openai_feed_unblocked_length = openaiFeedUnblocked.length;
+                }
+
                 // Update extraction status
                 await updateFileExtractionStatus(
                     file.id,
@@ -419,7 +472,10 @@ class FileProcessorWorker {
                     extractionResult.markdown || null,
                     pagesToStore,
                     null,
-                    extractionResult.extraction_time_seconds || extractionResult.extractionTimeSeconds || null
+                    extractionResult.extraction_time_seconds || extractionResult.extractionTimeSeconds || null,
+                    openaiFeedBlocked,
+                    openaiFeedUnblocked,
+                    extractionMetadata
                 );
                 console.log(`✅ File ${file.filename} extraction completed and updated in database`);
 

@@ -231,7 +231,8 @@ export async function getJobStatus(jobId) {
                    processing_status, extracted_text, extracted_tables, markdown, result, actual_result,
                    processing_metadata, extraction_error, processing_error, created_at, processed_at,
                    upload_status, upload_error, storage_type, retry_count, last_retry_at,
-                   extraction_time_seconds, ai_processing_time_seconds, admin_verified, customer_verified
+                   extraction_time_seconds, ai_processing_time_seconds, admin_verified, customer_verified,
+                   pages, openai_feed_blocked, openai_feed_unblocked, extraction_metadata
             FROM job_files WHERE job_id = $1
             ORDER BY created_at
         `;
@@ -267,18 +268,44 @@ export async function getJobStatus(jobId) {
 }
 
 // Update file extraction status
-export async function updateFileExtractionStatus(fileId, status, extractedText = null, extractedTables = null, markdown = null, pages = null, error = null, extractionTimeSeconds = null) {
+export async function updateFileExtractionStatus(
+    fileId, 
+    status, 
+    extractedText = null, 
+    extractedTables = null, 
+    markdown = null, 
+    pages = null, 
+    error = null, 
+    extractionTimeSeconds = null,
+    openaiFeedBlocked = null,
+    openaiFeedUnblocked = null,
+    extractionMetadata = null
+) {
     const client = await pool.connect();
     try {
         const query = `
             UPDATE job_files 
             SET extraction_status = $1, extracted_text = $2, extracted_tables = $3, 
-                markdown = $4, pages = $5, extraction_error = $6, extraction_time_seconds = $7, updated_at = NOW()
-            WHERE id = $8
+                markdown = $4, pages = $5, extraction_error = $6, extraction_time_seconds = $7,
+                openai_feed_blocked = $8, openai_feed_unblocked = $9, extraction_metadata = $10,
+                updated_at = NOW()
+            WHERE id = $11
             RETURNING id, job_id, filename
         `;
 
-        const values = [status, extractedText, extractedTables ? JSON.stringify(extractedTables) : null, markdown, pages ? JSON.stringify(pages) : null, error, extractionTimeSeconds, fileId];
+        const values = [
+            status, 
+            extractedText, 
+            extractedTables ? JSON.stringify(extractedTables) : null, 
+            markdown, 
+            pages ? JSON.stringify(pages) : null, 
+            error, 
+            extractionTimeSeconds,
+            openaiFeedBlocked,
+            openaiFeedUnblocked,
+            extractionMetadata ? JSON.stringify(extractionMetadata) : null,
+            fileId
+        ];
         const result = await client.query(query, values);
 
         if (result.rows.length === 0) {
@@ -528,7 +555,7 @@ export async function getFileResult(fileId) {
                    jf.extraction_status, jf.processing_status, jf.extraction_error, jf.processing_error, jf.processed_at,
                    jf.job_id, j.name as job_name, j.schema_data, j.schema_data_array, jf.upload_status, jf.upload_error, 
                    jf.storage_type, jf.retry_count, jf.last_retry_at, jf.extraction_time_seconds, jf.ai_processing_time_seconds,
-                   jf.admin_verified, jf.customer_verified
+                   jf.admin_verified, jf.customer_verified, jf.openai_feed_blocked, jf.openai_feed_unblocked, jf.extraction_metadata
             FROM job_files jf
             JOIN jobs j ON jf.job_id = j.id
             WHERE jf.id = $1
@@ -702,6 +729,9 @@ export async function getAllFiles(limit = 50, offset = 0, status = null, jobId =
                 jf.markdown,
                 jf.admin_verified,
                 jf.customer_verified,
+                jf.openai_feed_blocked,
+                jf.openai_feed_unblocked,
+                jf.extraction_metadata,
                 COALESCE(
                     JSON_AGG(
                         CASE 

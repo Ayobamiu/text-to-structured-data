@@ -1248,6 +1248,32 @@ async function processFilesAsync(job, files, schema, schemaName, processingConfi
                 const pages = extractionResult.pages || [];
                 const tables = extractionResult.tables || [];
 
+                // Extract OpenAI feed data (if available, e.g., from PaddleOCR)
+                const openaiFeedBlocked = extractionResult.openai_feed?.blocked || null;
+                const openaiFeedUnblocked = extractionResult.openai_feed?.unblocked || null;
+
+                // Extract extraction metadata (consolidate all metadata fields)
+                const extractionMetadata = extractionResult.metadata ? {
+                    ...extractionResult.metadata,
+                    // Ensure extraction_time_seconds is included if not already in metadata
+                    extraction_time_seconds: extractionResult.metadata.extraction_time_seconds || extractionTimeSeconds || null,
+                } : {
+                    extraction_method: extractionResult.method || extractionMethod,
+                    extraction_time_seconds: extractionTimeSeconds || null,
+                    total_pages: pages?.length || null,
+                    total_tables: tables?.length || null,
+                    text_length: rawText?.length || null,
+                    markdown_length: markdown?.length || null,
+                };
+
+                // Add OpenAI feed lengths if available
+                if (openaiFeedBlocked) {
+                    extractionMetadata.openai_feed_blocked_length = openaiFeedBlocked.length;
+                }
+                if (openaiFeedUnblocked) {
+                    extractionMetadata.openai_feed_unblocked_length = openaiFeedUnblocked.length;
+                }
+
                 // Extract page count (pages could be array or number)
                 let pageCount = null;
                 if (Array.isArray(pages)) {
@@ -1275,7 +1301,10 @@ async function processFilesAsync(job, files, schema, schemaName, processingConfi
                     markdown || null,
                     pagesToStore,
                     null, // error
-                    extractionTimeSeconds
+                    extractionTimeSeconds,
+                    openaiFeedBlocked,
+                    openaiFeedUnblocked,
+                    extractionMetadata
                 );
 
                 console.log(`✅ File extraction status updated for ${file.originalname}`);
