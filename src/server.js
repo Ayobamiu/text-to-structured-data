@@ -1431,6 +1431,84 @@ async function processFilesAsync(job, files, schema, schemaName, processingConfi
     }
 }
 
+
+/**
+ * POST /extract
+ * 
+ * Main document extraction endpoint. Accepts multiple files, extracts text/content,
+ * and optionally processes with AI using structured schemas.
+ * 
+ * @route POST /extract
+ * @requires Authentication (JWT token via Bearer header)
+ * @contentType multipart/form-data
+ * 
+ * @param {File[]} files - Form data file uploads (max 20 files)
+ *                         Accepts: PDF files, image files
+ *                         Required: At least 1 file
+ * 
+ * @param {Object} schema - JSON schema object defining the structure for data extraction
+ *                          Used by OpenAI for structured output
+ *                          Required: true
+ *                          Example: { "type": "object", "properties": {...}, "required": [...] }
+ * 
+ * @param {string} schemaName - Name/identifier for the schema
+ *                              Used for schema versioning and tracking
+ *                              Optional, defaults to 'data_extraction'
+ * 
+ * @param {string} jobName - Name/description for this extraction job
+ *                           Optional, used for job identification and display
+ * 
+ * @param {string} extractionMode - Processing mode
+ *                                  Options: 'extraction_only' | 'full_extraction'
+ *                                  Default: 'full_extraction'
+ *                                  - 'extraction_only': Extract text only, skip AI processing
+ *                                  - 'full_extraction': Extract text + process with AI
+ * 
+ * @param {Object} processingConfig - Configuration for extraction and processing methods
+ *                                    Optional, defaults provided below
+ *                                    Structure: {
+ *                                      extraction: {
+ *                                        method: string,  // 'mineru' | 'documentai' | 'paddleocr' | 'extendai'
+ *                                        options: Object  // Method-specific options
+ *                                      },
+ *                                      processing: {
+ *                                        method: string,  // 'openai'
+ *                                        model: string,   // 'gpt-4o' | 'gpt-4o-2024-08-06' | etc.
+ *                                        options: Object  // Processing options
+ *                                      }
+ *                                    }
+ *                                    Default: {
+ *                                      extraction: { method: 'mineru', options: {} },
+ *                                      processing: { method: 'openai', model: 'gpt-4o', options: {} }
+ *                                    }
+ * 
+ * @returns {Object} Response object with job ID and status
+ *                   {
+ *                     jobId: string,
+ *                     status: string,
+ *                     message: string,
+ *                     files: Array<{id: string, filename: string, status: string}>
+ *                   }
+ * 
+ * @example
+ * // Using multipart/form-data with FormData
+ * const formData = new FormData();
+ * formData.append('files', file1);
+ * formData.append('files', file2);
+ * formData.append('schema', JSON.stringify(schemaObject));
+ * formData.append('schemaName', 'well_log_schema');
+ * formData.append('jobName', 'Batch Extraction Job');
+ * formData.append('extractionMode', 'full_extraction');
+ * formData.append('processingConfig', JSON.stringify({
+ *   extraction: { method: 'paddleocr', options: {} },
+ *   processing: { method: 'openai', model: 'gpt-4o', options: {} }
+ * }));
+ * 
+ * @response 200 - Job created successfully, processing started
+ * @response 400 - Missing required fields (files, schema) or validation error
+ * @response 401 - Authentication failed (invalid/missing token)
+ * @response 500 - Server error during job creation or file processing
+ */
 // Main extraction endpoint - Updated for multiple files
 app.post("/extract", authenticateToken, upload.array("files", 20), async (req, res) => {
     let job = null;
