@@ -1478,7 +1478,7 @@ async function processFilesAsync(job, files, schema, schemaName, processingConfi
  *                                      }
  *                                    }
  *                                    Default: {
- *                                      extraction: { method: 'mineru', options: {} },
+ *                                      extraction: { method: 'paddleocr', options: {} },
  *                                      processing: { method: 'openai', model: 'gpt-4o', options: {} }
  *                                    }
  * 
@@ -1551,7 +1551,7 @@ app.post("/extract", authenticateToken, upload.array("files", 20), async (req, r
 
         // Set default processing config if not provided
         const defaultProcessingConfig = {
-            extraction: { method: 'mineru', options: {} },
+            extraction: { method: 'paddleocr', options: {} },
             processing: { method: 'openai', model: 'gpt-4o', options: {} }
         };
 
