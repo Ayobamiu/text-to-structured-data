@@ -232,7 +232,7 @@ export async function getJobStatus(jobId) {
                    processing_metadata, extraction_error, processing_error, created_at, processed_at,
                    upload_status, upload_error, storage_type, retry_count, last_retry_at,
                    extraction_time_seconds, ai_processing_time_seconds, admin_verified, customer_verified,
-                   pages, openai_feed_blocked, openai_feed_unblocked, extraction_metadata
+                   pages, openai_feed_blocked, openai_feed_unblocked, extraction_metadata, source_locations
             FROM job_files WHERE job_id = $1
             ORDER BY created_at
         `;
@@ -269,13 +269,13 @@ export async function getJobStatus(jobId) {
 
 // Update file extraction status
 export async function updateFileExtractionStatus(
-    fileId, 
-    status, 
-    extractedText = null, 
-    extractedTables = null, 
-    markdown = null, 
-    pages = null, 
-    error = null, 
+    fileId,
+    status,
+    extractedText = null,
+    extractedTables = null,
+    markdown = null,
+    pages = null,
+    error = null,
     extractionTimeSeconds = null,
     openaiFeedBlocked = null,
     openaiFeedUnblocked = null,
@@ -294,12 +294,12 @@ export async function updateFileExtractionStatus(
         `;
 
         const values = [
-            status, 
-            extractedText, 
-            extractedTables ? JSON.stringify(extractedTables) : null, 
-            markdown, 
-            pages ? JSON.stringify(pages) : null, 
-            error, 
+            status,
+            extractedText,
+            extractedTables ? JSON.stringify(extractedTables) : null,
+            markdown,
+            pages ? JSON.stringify(pages) : null,
+            error,
             extractionTimeSeconds,
             openaiFeedBlocked,
             openaiFeedUnblocked,
@@ -326,6 +326,18 @@ export async function updateFileExtractionStatus(
 export async function updateFileProcessingStatus(fileId, status, result = null, error = null, metadata = null, aiProcessingTimeSeconds = null) {
     const client = await pool.connect();
     try {
+        // Extract source_locations from result if present, and remove it from result
+        let sourceLocations = null;
+        let resultWithoutSourceLocations = result;
+
+        if (result && typeof result === 'object' && result.source_locations !== undefined) {
+            sourceLocations = result.source_locations;
+            // Create a copy without source_locations
+            const { source_locations, ...rest } = result;
+            resultWithoutSourceLocations = rest;
+            console.log(`📍 Extracted source_locations from result for file ${fileId}`);
+        }
+
         // Check if we need to save actual_result (original AI result before modifications)
         let actualResultToSave = null;
         if (status === 'completed' && result) {
@@ -335,12 +347,13 @@ export async function updateFileProcessingStatus(fileId, status, result = null, 
 
             if (checkActualResult.rows.length > 0 && checkActualResult.rows[0].actual_result === null) {
                 // First time saving - store original AI result before any modifications
-                actualResultToSave = result;
+                // Store the result with source_locations removed for actual_result too
+                actualResultToSave = resultWithoutSourceLocations;
             }
         }
 
         // Auto-fix permit number if result is being saved and status is completed
-        let finalResult = result;
+        let finalResult = resultWithoutSourceLocations;
         if (status === 'completed' && result) {
             // Get filename and job_id for permit extraction
             const fileQuery = `SELECT filename, job_id FROM job_files WHERE id = $1`;
@@ -392,12 +405,13 @@ export async function updateFileProcessingStatus(fileId, status, result = null, 
         let values;
 
         if (actualResultToSave !== null) {
-            // First time saving - set both actual_result and result
+            // First time saving - set both actual_result and result, plus source_locations
             query = `
                 UPDATE job_files 
                 SET processing_status = $1, result = $2, actual_result = $3, processing_error = $4, 
-                    processed_at = $5, processing_metadata = $6, ai_processing_time_seconds = $7, updated_at = NOW()
-                WHERE id = $8
+                    processed_at = $5, processing_metadata = $6, ai_processing_time_seconds = $7, 
+                    source_locations = $8, updated_at = NOW()
+                WHERE id = $9
                 RETURNING id, job_id, filename
             `;
             const processedAt = status === 'completed' || status === 'failed' ? new Date() : null;
@@ -409,19 +423,30 @@ export async function updateFileProcessingStatus(fileId, status, result = null, 
                 processedAt,
                 metadata ? JSON.stringify(metadata) : null,
                 aiProcessingTimeSeconds,
+                sourceLocations ? JSON.stringify(sourceLocations) : null,
                 fileId
             ];
         } else {
-            // Not first time - only update result (actual_result stays unchanged)
+            // Not first time - only update result and source_locations (actual_result stays unchanged)
             query = `
                 UPDATE job_files 
                 SET processing_status = $1, result = $2, processing_error = $3, 
-                    processed_at = $4, processing_metadata = $5, ai_processing_time_seconds = $6, updated_at = NOW()
-                WHERE id = $7
+                    processed_at = $4, processing_metadata = $5, ai_processing_time_seconds = $6, 
+                    source_locations = $7, updated_at = NOW()
+                WHERE id = $8
                 RETURNING id, job_id, filename
             `;
             const processedAt = status === 'completed' || status === 'failed' ? new Date() : null;
-            values = [status, finalResult ? JSON.stringify(finalResult) : null, error, processedAt, metadata ? JSON.stringify(metadata) : null, aiProcessingTimeSeconds, fileId];
+            values = [
+                status,
+                finalResult ? JSON.stringify(finalResult) : null,
+                error,
+                processedAt,
+                metadata ? JSON.stringify(metadata) : null,
+                aiProcessingTimeSeconds,
+                sourceLocations ? JSON.stringify(sourceLocations) : null,
+                fileId
+            ];
         }
         const queryResult = await client.query(query, values);
 
@@ -555,7 +580,8 @@ export async function getFileResult(fileId) {
                    jf.extraction_status, jf.processing_status, jf.extraction_error, jf.processing_error, jf.processed_at,
                    jf.job_id, j.name as job_name, j.schema_data, j.schema_data_array, jf.upload_status, jf.upload_error, 
                    jf.storage_type, jf.retry_count, jf.last_retry_at, jf.extraction_time_seconds, jf.ai_processing_time_seconds,
-                   jf.admin_verified, jf.customer_verified, jf.openai_feed_blocked, jf.openai_feed_unblocked, jf.extraction_metadata
+                   jf.admin_verified, jf.customer_verified, jf.openai_feed_blocked, jf.openai_feed_unblocked, jf.extraction_metadata,
+                   jf.source_locations
             FROM job_files jf
             JOIN jobs j ON jf.job_id = j.id
             WHERE jf.id = $1
@@ -732,6 +758,7 @@ export async function getAllFiles(limit = 50, offset = 0, status = null, jobId =
                 jf.openai_feed_blocked,
                 jf.openai_feed_unblocked,
                 jf.extraction_metadata,
+                jf.source_locations,
                 COALESCE(
                     JSON_AGG(
                         CASE 

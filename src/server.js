@@ -808,18 +808,31 @@ app.put("/files/:id/results", authenticateToken, async (req, res) => {
             });
         }
 
+        // Extract source_locations from results if present, and remove it from result
+        let sourceLocations = null;
+        let resultWithoutSourceLocations = parsedResults;
+
+        if (parsedResults && typeof parsedResults === 'object' && parsedResults.source_locations !== undefined) {
+            sourceLocations = parsedResults.source_locations;
+            // Create a copy without source_locations
+            const { source_locations, ...rest } = parsedResults;
+            resultWithoutSourceLocations = rest;
+            console.log(`📍 Extracted source_locations from manual result update for file ${id}`);
+        }
+
         // Update file results in database
         const client = await pool.connect();
         try {
             const updateQuery = `
                 UPDATE job_files 
-                SET result = $1, updated_at = NOW()
-                WHERE id = $2
+                SET result = $1, source_locations = $2, updated_at = NOW()
+                WHERE id = $3
                 RETURNING id, filename, result
             `;
 
             const updateResult = await client.query(updateQuery, [
-                JSON.stringify(parsedResults),
+                JSON.stringify(resultWithoutSourceLocations),
+                sourceLocations ? JSON.stringify(sourceLocations) : null,
                 id
             ]);
 
