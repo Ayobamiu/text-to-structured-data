@@ -17,6 +17,7 @@ import pool, {
     updateFileExtractionStatus,
     updateFileProcessingStatus,
     updateJobStatus,
+    updateJobConfig,
     listJobs,
     getJobFileStats,
     getJobFilesByStatus,
@@ -618,6 +619,128 @@ app.put("/jobs/:id/schema", authenticateToken, async (req, res) => {
             status: "error",
             message: "Failed to update schema",
             error: error.message
+        });
+    }
+});
+
+// Update job configuration endpoint
+app.put("/jobs/:id/config", authenticateToken, async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { name, extraction_mode, processing_config } = req.body;
+
+        // Validate input - at least one field must be provided
+        if (name === undefined && extraction_mode === undefined && processing_config === undefined) {
+            return res.status(400).json({
+                status: "error",
+                message: "At least one field (name, extraction_mode, or processing_config) must be provided"
+            });
+        }
+
+        // Validate extraction_mode if provided
+        if (extraction_mode !== undefined && !['full_extraction', 'text_only'].includes(extraction_mode)) {
+            return res.status(400).json({
+                status: "error",
+                message: "Invalid extraction_mode. Must be 'full_extraction' or 'text_only'"
+            });
+        }
+
+        // Validate processing_config structure if provided
+        if (processing_config !== undefined) {
+            if (typeof processing_config !== 'object' || processing_config === null) {
+                return res.status(400).json({
+                    status: "error",
+                    message: "processing_config must be an object"
+                });
+            }
+
+            // Validate extraction method if provided
+            if (processing_config.extraction?.method && 
+                !['mineru', 'documentai', 'extendai', 'paddleocr'].includes(processing_config.extraction.method)) {
+                return res.status(400).json({
+                    status: "error",
+                    message: "Invalid extraction.method. Must be one of: mineru, documentai, extendai, paddleocr"
+                });
+            }
+
+            // Validate processing method if provided
+            if (processing_config.processing?.method && 
+                processing_config.processing.method !== 'openai') {
+                return res.status(400).json({
+                    status: "error",
+                    message: "Invalid processing.method. Currently only 'openai' is supported"
+                });
+            }
+
+            // Validate model if provided
+            if (processing_config.processing?.model && 
+                !['gpt-4o', 'gpt-4', 'gpt-3.5-turbo'].includes(processing_config.processing.model)) {
+                return res.status(400).json({
+                    status: "error",
+                    message: "Invalid processing.model. Must be one of: gpt-4o, gpt-4, gpt-3.5-turbo"
+                });
+            }
+        }
+
+        // Check if user has access to this job's organization
+        const job = await getJobStatus(id);
+        if (!job) {
+            return res.status(404).json({
+                status: "error",
+                message: "Job not found"
+            });
+        }
+
+        // Check if user has access to this job's organization
+        const userOrganizationIds = await getUserOrganizationIds(req.user);
+
+        if (job.organization_id && !userOrganizationIds.includes(job.organization_id)) {
+            return res.status(403).json({
+                status: "error",
+                message: "Access denied to this job"
+            });
+        }
+
+        // Prepare updates object
+        const updates = {};
+        if (name !== undefined) updates.name = name;
+        if (extraction_mode !== undefined) updates.extraction_mode = extraction_mode;
+        if (processing_config !== undefined) {
+            // Merge with existing processing_config if it exists
+            const existingConfig = job.processing_config || {};
+            updates.processing_config = {
+                ...existingConfig,
+                ...processing_config,
+                // Deep merge extraction and processing objects
+                extraction: {
+                    ...(existingConfig.extraction || {}),
+                    ...(processing_config.extraction || {})
+                },
+                processing: {
+                    ...(existingConfig.processing || {}),
+                    ...(processing_config.processing || {})
+                }
+            };
+        }
+
+        // Update job configuration
+        const updatedJob = await updateJobConfig(id, updates);
+
+        res.json({
+            status: "success",
+            message: "Job configuration updated successfully",
+            data: {
+                jobId: updatedJob.id,
+                name: updatedJob.name,
+                extraction_mode: updatedJob.extraction_mode,
+                processing_config: updatedJob.processing_config
+            }
+        });
+    } catch (error) {
+        console.error('❌ Error updating job configuration:', error.message);
+        res.status(500).json({
+            status: "error",
+            message: error.message
         });
     }
 });

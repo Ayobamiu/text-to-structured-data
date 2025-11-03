@@ -464,6 +464,61 @@ export async function updateFileProcessingStatus(fileId, status, result = null, 
     }
 }
 
+// Update job configuration
+export async function updateJobConfig(jobId, updates) {
+    const client = await pool.connect();
+    try {
+        // Build dynamic update query based on provided updates
+        const updatesList = [];
+        const values = [];
+        let paramIndex = 1;
+
+        if (updates.name !== undefined) {
+            updatesList.push(`name = $${paramIndex++}`);
+            values.push(updates.name);
+        }
+
+        if (updates.extraction_mode !== undefined) {
+            updatesList.push(`extraction_mode = $${paramIndex++}`);
+            values.push(updates.extraction_mode);
+        }
+
+        if (updates.processing_config !== undefined) {
+            updatesList.push(`processing_config = $${paramIndex++}`);
+            values.push(JSON.stringify(updates.processing_config));
+        }
+
+        if (updatesList.length === 0) {
+            throw new Error('No updates provided');
+        }
+
+        // Always update updated_at timestamp
+        updatesList.push(`updated_at = NOW()`);
+        values.push(jobId);
+
+        const query = `
+            UPDATE jobs 
+            SET ${updatesList.join(', ')}
+            WHERE id = $${paramIndex}
+            RETURNING id, name, extraction_mode, processing_config, updated_at
+        `;
+
+        const result = await client.query(query, values);
+
+        if (result.rows.length === 0) {
+            throw new Error('Job not found');
+        }
+
+        console.log(`✅ Job configuration updated: ${jobId}`);
+        return result.rows[0];
+    } catch (error) {
+        console.error('❌ Error updating job configuration:', error.message);
+        throw error;
+    } finally {
+        client.release();
+    }
+}
+
 // Update job status
 export async function updateJobStatus(jobId, status, summary = null) {
     const client = await pool.connect();
