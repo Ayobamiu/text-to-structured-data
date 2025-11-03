@@ -127,9 +127,19 @@ class ExtractionService {
                 timeout: 2 * 1200000, // 40 minutes timeout for large files
             });
 
-            // PaddleOCR returns storage_data directly, convert to expected format
+            // PaddleOCR Flask service returns storage_data with raw_response field
             const storageData = response.data;
-            const converted = this.convertPaddleOCRToStandardFormat(storageData, filename);
+
+            // Extract raw PaddleOCR response (unconverted) from Flask response
+            const rawPaddleOCRResponse = storageData.raw_response || null;
+
+            // Remove raw_response from storageData before conversion to avoid conflicts
+            const { raw_response, ...storageDataForConversion } = storageData;
+
+            const converted = this.convertPaddleOCRToStandardFormat(storageDataForConversion, filename);
+
+            // Store the completely raw, unconverted PaddleOCR API response
+            converted.raw_data = rawPaddleOCRResponse;
 
             console.log(`✅ PaddleOCR extraction completed: ${converted.pages.length} pages, ${converted.tables.length} tables`);
 
@@ -207,6 +217,8 @@ class ExtractionService {
         const blockedMarkdown = this.generateOpenAIFeedMarkdown(storageData, true);
         const unblockedMarkdown = this.generateOpenAIFeedMarkdown(storageData, false);
 
+        const extractionTimeSeconds = extractionMetadata.extractionTimeSeconds || extractionMetadata.extraction_time_seconds || 0;
+
         return {
             success: true,
             text: fullText,
@@ -218,9 +230,11 @@ class ExtractionService {
                 unblocked: unblockedMarkdown,
             },
             method: 'paddleocr',
-            extraction_time_seconds: extractionMetadata.extractionTimeSeconds || 0,
+            extraction_time_seconds: extractionTimeSeconds,
+            extractionTimeSeconds: extractionTimeSeconds, // Also include camelCase version
             metadata: {
                 extraction_method: 'paddleocr',
+                extraction_time_seconds: extractionTimeSeconds,
                 total_pages: pages.length,
                 total_tables: tables.length,
                 text_length: fullText.length,
@@ -228,6 +242,9 @@ class ExtractionService {
                 openai_feed_blocked_length: blockedMarkdown.length,
                 openai_feed_unblocked_length: unblockedMarkdown.length,
                 document_id: storageData.documentId || filename,
+                logId: extractionMetadata.logId || null,
+                timestamp: extractionMetadata.timestamp || null,
+                fileType: extractionMetadata.fileType || null,
             }
         };
     }

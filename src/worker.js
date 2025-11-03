@@ -286,6 +286,18 @@ class FileProcessorWorker {
                     extractionMetadata.openai_feed_unblocked_length = openaiFeedUnblocked.length;
                 }
 
+                // Debug logging to check values
+                console.log('🔍 Extraction result debug (extraction-only mode):', {
+                    filename: file.filename,
+                    hasOpenAIFeed: !!extractionResult.openai_feed,
+                    hasMetadata: !!extractionResult.metadata,
+                    hasRawData: !!extractionResult.raw_data,
+                    extractionTimeSeconds: extractionResult.extraction_time_seconds || extractionResult.extractionTimeSeconds,
+                    openaiFeedBlocked: openaiFeedBlocked ? `${openaiFeedBlocked.length} chars` : 'null',
+                    openaiFeedUnblocked: openaiFeedUnblocked ? `${openaiFeedUnblocked.length} chars` : 'null',
+                    rawDataExists: !!extractionResult.raw_data,
+                });
+
                 // Update extraction status and skip AI processing
                 await updateFileExtractionStatus(
                     file.id,
@@ -298,7 +310,8 @@ class FileProcessorWorker {
                     extractionResult.extraction_time_seconds || extractionResult.extractionTimeSeconds || null,
                     openaiFeedBlocked,
                     openaiFeedUnblocked,
-                    extractionMetadata
+                    extractionMetadata,
+                    extractionResult.raw_data || null
                 );
 
                 console.log(`✅ File extraction status updated for ${file.filename}`);
@@ -463,6 +476,18 @@ class FileProcessorWorker {
                     extractionMetadata.openai_feed_unblocked_length = openaiFeedUnblocked.length;
                 }
 
+                // Debug logging to check values
+                console.log('🔍 Extraction result debug (full extraction mode):', {
+                    filename: file.filename,
+                    hasOpenAIFeed: !!extractionResult.openai_feed,
+                    hasMetadata: !!extractionResult.metadata,
+                    hasRawData: !!extractionResult.raw_data,
+                    extractionTimeSeconds: extractionResult.extraction_time_seconds || extractionResult.extractionTimeSeconds,
+                    openaiFeedBlocked: openaiFeedBlocked ? `${openaiFeedBlocked.length} chars` : 'null',
+                    openaiFeedUnblocked: openaiFeedUnblocked ? `${openaiFeedUnblocked.length} chars` : 'null',
+                    rawDataExists: !!extractionResult.raw_data,
+                });
+
                 // Update extraction status
                 await updateFileExtractionStatus(
                     file.id,
@@ -475,7 +500,8 @@ class FileProcessorWorker {
                     extractionResult.extraction_time_seconds || extractionResult.extractionTimeSeconds || null,
                     openaiFeedBlocked,
                     openaiFeedUnblocked,
-                    extractionMetadata
+                    extractionMetadata,
+                    extractionResult.raw_data || null
                 );
                 console.log(`✅ File ${file.filename} extraction completed and updated in database`);
 
@@ -586,7 +612,20 @@ class FileProcessorWorker {
             );
 
             if (processingResult.success) {
-                await updateFileProcessingStatus(file.id, 'completed', processingResult.data, null, processingResult.metadata);
+                // Extract ai_processing_time_seconds from metadata
+                const aiProcessingTimeSeconds = processingResult.metadata?.processing_time_seconds || 
+                                                processingResult.metadata?.ai_processing_time_seconds ||
+                                                processingResult.ai_processing_time_seconds ||
+                                                null;
+                
+                await updateFileProcessingStatus(
+                    file.id, 
+                    'completed', 
+                    processingResult.data, 
+                    null, 
+                    processingResult.metadata,
+                    aiProcessingTimeSeconds
+                );
                 console.log(`✅ File ${file.filename} processing completed successfully`);
 
                 // Emit WebSocket event for Stage 2 completion

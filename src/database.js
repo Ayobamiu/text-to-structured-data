@@ -279,7 +279,8 @@ export async function updateFileExtractionStatus(
     extractionTimeSeconds = null,
     openaiFeedBlocked = null,
     openaiFeedUnblocked = null,
-    extractionMetadata = null
+    extractionMetadata = null,
+    rawData = null
 ) {
     const client = await pool.connect();
     try {
@@ -288,10 +289,14 @@ export async function updateFileExtractionStatus(
             SET extraction_status = $1, extracted_text = $2, extracted_tables = $3, 
                 markdown = $4, pages = $5, extraction_error = $6, extraction_time_seconds = $7,
                 openai_feed_blocked = $8, openai_feed_unblocked = $9, extraction_metadata = $10,
-                updated_at = NOW()
-            WHERE id = $11
+                raw_data = $11, updated_at = NOW()
+            WHERE id = $12
             RETURNING id, job_id, filename
         `;
+
+        // Handle empty strings - convert to null for consistency
+        const openaiFeedBlockedValue = (openaiFeedBlocked && openaiFeedBlocked.trim().length > 0) ? openaiFeedBlocked : null;
+        const openaiFeedUnblockedValue = (openaiFeedUnblocked && openaiFeedUnblocked.trim().length > 0) ? openaiFeedUnblocked : null;
 
         const values = [
             status,
@@ -301,11 +306,27 @@ export async function updateFileExtractionStatus(
             pages ? JSON.stringify(pages) : null,
             error,
             extractionTimeSeconds,
-            openaiFeedBlocked,
-            openaiFeedUnblocked,
+            openaiFeedBlockedValue,
+            openaiFeedUnblockedValue,
             extractionMetadata ? JSON.stringify(extractionMetadata) : null,
+            rawData ? JSON.stringify(rawData) : null,
             fileId
         ];
+
+        // Debug logging
+        console.log('🔍 updateFileExtractionStatus debug:', {
+            fileId,
+            status,
+            extractionTimeSeconds,
+            openaiFeedBlocked: openaiFeedBlockedValue ? `${openaiFeedBlockedValue.length} chars` : 'null',
+            openaiFeedUnblocked: openaiFeedUnblockedValue ? `${openaiFeedUnblockedValue.length} chars` : 'null',
+            hasExtractionMetadata: !!extractionMetadata,
+            extractionMetadataKeys: extractionMetadata ? Object.keys(extractionMetadata) : null,
+            hasRawData: !!rawData,
+            rawDataType: rawData ? typeof rawData : 'null',
+            rawDataKeys: rawData && typeof rawData === 'object' ? Object.keys(rawData).slice(0, 5) : null,
+        });
+
         const result = await client.query(query, values);
 
         if (result.rows.length === 0) {

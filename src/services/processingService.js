@@ -42,6 +42,8 @@ class ProcessingService {
      * @returns {Promise<Object>} Processing result
      */
     async processWithOpenAI(text, schemaData, options = {}) {
+        const startTime = Date.now();
+        
         try {
             // Merge default options with provided options
             const defaultOptions = {
@@ -97,28 +99,42 @@ class ProcessingService {
 
             const extractedData = JSON.parse(response.choices[0].message.content);
 
-            console.log(`✅ OpenAI processing completed with ${defaultOptions.model}`);
+            const endTime = Date.now();
+            const processingTimeSeconds = (endTime - startTime) / 1000;
+
+            console.log(`✅ OpenAI processing completed with ${defaultOptions.model} in ${processingTimeSeconds.toFixed(2)}s`);
 
             return {
                 success: true,
                 data: extractedData,
                 method: 'openai',
+                ai_processing_time_seconds: processingTimeSeconds,
                 metadata: {
                     processing_method: 'openai',
                     model: defaultOptions.model,
                     temperature: defaultOptions.temperature,
                     max_tokens: defaultOptions.max_tokens,
                     tokens_used: response.usage?.total_tokens || 0,
-                    processing_time: new Date().toISOString()
+                    processing_time: new Date().toISOString(),
+                    processing_time_seconds: processingTimeSeconds,
+                    ai_processing_time_seconds: processingTimeSeconds
                 }
             };
 
         } catch (error) {
+            const endTime = Date.now();
+            const processingTimeSeconds = (endTime - startTime) / 1000;
+            
             console.error('❌ OpenAI processing error:', error.message);
             return {
                 success: false,
                 error: error.message,
-                method: 'openai'
+                method: 'openai',
+                ai_processing_time_seconds: processingTimeSeconds,
+                metadata: {
+                    processing_time_seconds: processingTimeSeconds,
+                    ai_processing_time_seconds: processingTimeSeconds
+                }
             };
         }
     }
