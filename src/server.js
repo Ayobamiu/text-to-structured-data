@@ -655,7 +655,7 @@ app.put("/jobs/:id/config", authenticateToken, async (req, res) => {
             }
 
             // Validate extraction method if provided
-            if (processing_config.extraction?.method && 
+            if (processing_config.extraction?.method &&
                 !['mineru', 'documentai', 'extendai', 'paddleocr'].includes(processing_config.extraction.method)) {
                 return res.status(400).json({
                     status: "error",
@@ -664,7 +664,7 @@ app.put("/jobs/:id/config", authenticateToken, async (req, res) => {
             }
 
             // Validate processing method if provided
-            if (processing_config.processing?.method && 
+            if (processing_config.processing?.method &&
                 processing_config.processing.method !== 'openai') {
                 return res.status(400).json({
                     status: "error",
@@ -673,7 +673,7 @@ app.put("/jobs/:id/config", authenticateToken, async (req, res) => {
             }
 
             // Validate model if provided
-            if (processing_config.processing?.model && 
+            if (processing_config.processing?.model &&
                 !['gpt-4o', 'gpt-4', 'gpt-3.5-turbo'].includes(processing_config.processing.model)) {
                 return res.status(400).json({
                     status: "error",
