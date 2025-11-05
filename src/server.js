@@ -627,7 +627,22 @@ app.put("/jobs/:id/schema", authenticateToken, async (req, res) => {
 app.put("/jobs/:id/config", authenticateToken, async (req, res) => {
     try {
         const { id } = req.params;
-        const { name, extraction_mode, processing_config } = req.body;
+        let { name, extraction_mode, processing_config } = req.body;
+
+        // Parse processing_config if it's a string
+        if (processing_config !== undefined && typeof processing_config === 'string') {
+            try {
+                processing_config = JSON.parse(processing_config);
+            } catch (parseError) {
+                return res.status(400).json({
+                    status: "error",
+                    message: "Invalid processing_config JSON string",
+                    error: parseError.message
+                });
+            }
+        }
+
+        console.log({ name, extraction_mode, processing_config });
 
         // Validate input - at least one field must be provided
         if (name === undefined && extraction_mode === undefined && processing_config === undefined) {
@@ -647,7 +662,7 @@ app.put("/jobs/:id/config", authenticateToken, async (req, res) => {
 
         // Validate processing_config structure if provided
         if (processing_config !== undefined) {
-            if (typeof processing_config !== 'object' || processing_config === null) {
+            if (typeof processing_config !== 'object' || processing_config === null || Array.isArray(processing_config)) {
                 return res.status(400).json({
                     status: "error",
                     message: "processing_config must be an object"
@@ -722,7 +737,7 @@ app.put("/jobs/:id/config", authenticateToken, async (req, res) => {
                 }
             };
         }
-
+        console.log("updates", updates);
         // Update job configuration
         const updatedJob = await updateJobConfig(id, updates);
 
@@ -750,6 +765,19 @@ app.get("/files/:id/result", authenticateToken, async (req, res) => {
     try {
         const { id } = req.params;
         const file = await getFileResult(id);
+
+        // Extract pages from raw_data if available
+        let pages = null;
+        if (file?.raw_data && typeof file.raw_data === 'object' && file.raw_data.pages) {
+            pages = file.raw_data.pages;
+        } else if (file?.raw_data && typeof file.raw_data === 'string') {
+            try {
+                const parsed = JSON.parse(file.raw_data);
+                pages = parsed.pages || null;
+            } catch (e) {
+                // Ignore parsing errors
+            }
+        }
 
         if (!file) {
             return res.status(404).json({
@@ -779,7 +807,10 @@ app.get("/files/:id/result", authenticateToken, async (req, res) => {
 
         res.json({
             status: "success",
-            file
+            file: {
+                ...file,
+                pages: pages || file.pages || null
+            }
         });
     } catch (error) {
         res.status(500).json({

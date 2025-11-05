@@ -232,14 +232,32 @@ export async function getJobStatus(jobId) {
                    processing_metadata, extraction_error, processing_error, created_at, processed_at,
                    upload_status, upload_error, storage_type, retry_count, last_retry_at,
                    extraction_time_seconds, ai_processing_time_seconds, admin_verified, customer_verified,
-                   pages, openai_feed_blocked, openai_feed_unblocked, extraction_metadata, source_locations
+                   pages, openai_feed_blocked, openai_feed_unblocked, extraction_metadata, source_locations,
+                   raw_data
             FROM job_files WHERE job_id = $1
             ORDER BY created_at
         `;
         const filesResult = await client.query(filesQuery, [jobId]);
 
         const job = jobResult.rows[0];
-        const files = filesResult.rows;
+        // Extract pages from raw_data for each file
+        const files = filesResult.rows.map(file => {
+            let pages = null;
+            if (file.raw_data && typeof file.raw_data === 'object' && file.raw_data.pages) {
+                pages = file.raw_data.pages;
+            } else if (file.raw_data && typeof file.raw_data === 'string') {
+                try {
+                    const parsed = JSON.parse(file.raw_data);
+                    pages = parsed.pages || null;
+                } catch (e) {
+                    // Ignore parsing errors
+                }
+            }
+            return {
+                ...file,
+                pages: pages || file.pages || null
+            };
+        });
 
         // Calculate summary
         const summary = {
@@ -657,7 +675,7 @@ export async function getFileResult(fileId) {
                    jf.job_id, j.name as job_name, j.schema_data, j.schema_data_array, jf.upload_status, jf.upload_error, 
                    jf.storage_type, jf.retry_count, jf.last_retry_at, jf.extraction_time_seconds, jf.ai_processing_time_seconds,
                    jf.admin_verified, jf.customer_verified, jf.openai_feed_blocked, jf.openai_feed_unblocked, jf.extraction_metadata,
-                   jf.source_locations
+                   jf.source_locations, jf.raw_data
             FROM job_files jf
             JOIN jobs j ON jf.job_id = j.id
             WHERE jf.id = $1
