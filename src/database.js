@@ -240,6 +240,18 @@ export async function getJobStatus(jobId) {
         const filesResult = await client.query(filesQuery, [jobId]);
 
         const job = jobResult.rows[0];
+
+        // Parse processing_config if it's a string (JSONB columns can return as strings)
+        let processingConfig = job.processing_config;
+        if (processingConfig && typeof processingConfig === 'string') {
+            try {
+                processingConfig = JSON.parse(processingConfig);
+            } catch (parseError) {
+                console.warn('⚠️ Failed to parse processing_config, using default:', parseError.message);
+                processingConfig = null;
+            }
+        }
+
         // Extract pages from raw_data for each file
         const files = filesResult.rows.map(file => {
             let pages = null;
@@ -274,6 +286,7 @@ export async function getJobStatus(jobId) {
 
         return {
             ...job,
+            processing_config: processingConfig,
             files,
             summary
         };
@@ -548,8 +561,19 @@ export async function updateJobConfig(jobId, updates) {
             throw new Error('Job not found');
         }
 
+        const updatedJob = result.rows[0];
+
+        // Parse processing_config if it's a string (JSONB columns can return as strings)
+        if (updatedJob.processing_config && typeof updatedJob.processing_config === 'string') {
+            try {
+                updatedJob.processing_config = JSON.parse(updatedJob.processing_config);
+            } catch (parseError) {
+                console.warn('⚠️ Failed to parse processing_config in update result:', parseError.message);
+            }
+        }
+
         console.log(`✅ Job configuration updated: ${jobId}`);
-        return result.rows[0];
+        return updatedJob;
     } catch (error) {
         console.error('❌ Error updating job configuration:', error.message);
         throw error;

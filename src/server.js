@@ -734,8 +734,23 @@ app.put("/jobs/:id/config", authenticateToken, async (req, res) => {
         if (name !== undefined) updates.name = name;
         if (extraction_mode !== undefined) updates.extraction_mode = extraction_mode;
         if (processing_config !== undefined) {
-            // Merge with existing processing_config if it exists
-            const existingConfig = job.processing_config || {};
+            // Parse existing processing_config if it's a string (JSONB can return as string)
+            let existingConfig = job.processing_config || {};
+            if (typeof existingConfig === 'string') {
+                try {
+                    existingConfig = JSON.parse(existingConfig);
+                } catch (parseError) {
+                    console.warn('⚠️ Failed to parse existing processing_config, using empty object:', parseError.message);
+                    existingConfig = {};
+                }
+            }
+
+            // Ensure existingConfig is an object
+            if (typeof existingConfig !== 'object' || existingConfig === null || Array.isArray(existingConfig)) {
+                existingConfig = {};
+            }
+
+            // Merge with existing processing_config
             updates.processing_config = {
                 ...existingConfig,
                 ...processing_config,
