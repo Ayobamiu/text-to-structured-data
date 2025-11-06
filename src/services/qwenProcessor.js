@@ -111,9 +111,16 @@ class QwenProcessor {
 
             // Extract response content
             const extractedContent = completion.choices[0].message.content;
+            const finishReason = completion.choices[0].finish_reason;
 
             if (!extractedContent) {
                 throw new Error('No content in Qwen API response');
+            }
+
+            // Check if response was truncated due to max_tokens limit
+            const wasTruncated = finishReason === 'length' || finishReason === 'stop';
+            if (wasTruncated && finishReason === 'length') {
+                console.warn(`⚠️ Qwen response was truncated (finish_reason: ${finishReason}). Consider increasing max_tokens.`);
             }
 
             // Parse JSON from response
@@ -121,7 +128,24 @@ class QwenProcessor {
             try {
                 extractedData = JSON.parse(extractedContent);
             } catch (parseError) {
-                throw new Error(`Failed to parse JSON from Qwen response: ${parseError.message}. Response: ${extractedContent.substring(0, 200)}`);
+                // Check if the error is due to truncated response (incomplete JSON)
+                const isTruncated = finishReason === 'length' ||
+                                   extractedContent.trim().endsWith('"') || 
+                                   extractedContent.trim().endsWith(',') ||
+                                   extractedContent.trim().endsWith('[') ||
+                                   extractedContent.trim().endsWith('{') ||
+                                   (parseError.message.includes('position') && 
+                                    !extractedContent.trim().endsWith('}'));
+                
+                if (isTruncated) {
+                    const errorMsg = `Qwen response was truncated (likely exceeded max_tokens limit of ${defaultOptions.max_tokens}). The JSON response was cut off mid-output. ` +
+                                   `Used ${completion.usage?.total_tokens || 'unknown'} tokens. ` +
+                                   `Consider increasing max_tokens in processing options or simplifying the schema. ` +
+                                   `Parse error: ${parseError.message}. Response preview: ${extractedContent.substring(0, 500)}...`;
+                    throw new Error(errorMsg);
+                }
+                
+                throw new Error(`Failed to parse JSON from Qwen response: ${parseError.message}. Response preview: ${extractedContent.substring(0, 500)}...`);
             }
 
             const endTime = Date.now();

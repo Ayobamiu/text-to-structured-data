@@ -78,45 +78,45 @@ export const OPENAI_DEFAULT_OPTIONS = {
 
 // Default options for Qwen models
 export const QWEN_DEFAULT_OPTIONS = {
-    // Qwen-Max series (best quality)
+    // Qwen-Max series (best quality) - increased max_tokens for complex schemas
     [QWEN_MODELS.QWEN3_MAX]: {
         temperature: 0.1,
         top_p: 0.8,
-        max_tokens: 2000
+        max_tokens: 8000 // Increased from 2000 to handle large/complex schemas
     },
     [QWEN_MODELS.QWEN_MAX]: {
         temperature: 0.1,
         top_p: 0.8,
-        max_tokens: 2000
+        max_tokens: 8000 // Increased from 2000
     },
     // Qwen-Plus series
     [QWEN_MODELS.QWEN_PLUS]: {
         temperature: 0.1,
         top_p: 0.8,
-        max_tokens: 2000
+        max_tokens: 6000 // Increased from 2000
     },
     // Qwen-Flash series (faster)
     [QWEN_MODELS.QWEN_FLASH]: {
         temperature: 0.2,
         top_p: 0.8,
-        max_tokens: 1500
+        max_tokens: 4000 // Increased from 1500
     },
     // Qwen-Turbo series (fastest)
     [QWEN_MODELS.QWEN_TURBO]: {
         temperature: 0.2,
         top_p: 0.8,
-        max_tokens: 1500
+        max_tokens: 4000 // Increased from 1500
     },
     // Qwen-Coder series
     [QWEN_MODELS.QWEN3_CODER_PLUS]: {
         temperature: 0.1,
         top_p: 0.8,
-        max_tokens: 2000
+        max_tokens: 6000 // Increased from 2000
     },
     [QWEN_MODELS.QWEN3_CODER_FLASH]: {
         temperature: 0.2,
         top_p: 0.8,
-        max_tokens: 1500
+        max_tokens: 4000 // Increased from 1500
     }
 };
 
