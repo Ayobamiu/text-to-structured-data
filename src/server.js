@@ -43,6 +43,7 @@ import { rateLimitConfig } from "./auth.js";
 import logger from "./utils/logger.js";
 import { processWithOpenAI } from "./utils/openaiProcessor.js";
 import ExtractionService from "./services/extractionService.js";
+import groqService from "./services/groqService.js";
 import {
     PROCESSING_METHODS,
     DEFAULT_MODELS,
@@ -1759,6 +1760,36 @@ app.post("/extract", authenticateToken, upload.array("files", 20), async (req, r
             return; // Error response already sent by helper
         }
 
+        // Generate job name with Groq if not provided
+        // Check for undefined, null, empty string, or whitespace-only string
+        let finalJobName = jobName;
+        if (!finalJobName || (typeof finalJobName === 'string' && finalJobName.trim() === '')) {
+            console.log("No job name provided, generating with Groq...");
+            try {
+                // Parse schema if it's a string
+                let parsedSchema = schema;
+                if (typeof schema === 'string') {
+                    try {
+                        parsedSchema = JSON.parse(schema);
+                    } catch (parseError) {
+                        console.warn("Could not parse schema as JSON, using as-is");
+                        parsedSchema = schema;
+                    }
+                }
+
+                const generatedName = await groqService.generateJobName(parsedSchema, schemaName);
+                if (generatedName) {
+                    finalJobName = generatedName;
+                    console.log(`✅ Using generated job name: "${finalJobName}"`);
+                } else {
+                    console.log("⚠️ Groq name generation failed or unavailable, using default");
+                }
+            } catch (error) {
+                console.error("❌ Error generating job name with Groq:", error.message);
+                // Continue with default naming if Groq fails
+            }
+        }
+
         // Set default processing config if not provided
         const defaultProcessingConfig = {
             extraction: { method: 'paddleocr', options: {} },
@@ -1772,7 +1803,7 @@ app.post("/extract", authenticateToken, upload.array("files", 20), async (req, r
             finalProcessingConfig.processing.model = getDefaultModel(finalProcessingConfig.processing.method);
         }
 
-        job = await createJob(jobName, schema, schemaName, req.user.id, organizationId, extractionMode, finalProcessingConfig);
+        job = await createJob(finalJobName, schema, schemaName, req.user.id, organizationId, extractionMode, finalProcessingConfig);
         console.log(`✅ Job created: ${job.id}`);
 
         // Step 1: Create file records immediately for better UX
