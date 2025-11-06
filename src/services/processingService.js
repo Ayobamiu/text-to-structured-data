@@ -1,17 +1,26 @@
 import OpenAI from 'openai';
+import QwenProcessor from './qwenProcessor.js';
+import {
+    PROCESSING_METHODS,
+    OPENAI_MODELS_LIST,
+    QWEN_MODELS_LIST,
+    getDefaultModel as getConfigDefaultModel,
+    getDefaultOptions as getConfigDefaultOptions
+} from '../config/processingConfig.js';
 
 class ProcessingService {
     constructor() {
         this.openai = new OpenAI({
             apiKey: process.env.OPENAI_API_KEY,
         });
+        this.qwenProcessor = new QwenProcessor();
     }
 
     /**
      * Process extracted text using the specified method
      * @param {string} text - Extracted text/markdown to process
      * @param {Object} schemaData - Schema configuration
-     * @param {string} method - Processing method ('openai')
+     * @param {string} method - Processing method ('openai' | 'qwen')
      * @param {Object} options - Method-specific options
      * @returns {Promise<Object>} Processing result
      */
@@ -19,8 +28,10 @@ class ProcessingService {
         try {
             console.log(`🤖 Processing text using ${method} method`);
 
-            if (method === 'openai') {
+            if (method === PROCESSING_METHODS.OPENAI) {
                 return await this.processWithOpenAI(text, schemaData, options);
+            } else if (method === PROCESSING_METHODS.QWEN) {
+                return await this.processWithQwen(text, schemaData, options);
             } else {
                 throw new Error(`Unsupported processing method: ${method}`);
             }
@@ -43,13 +54,14 @@ class ProcessingService {
      */
     async processWithOpenAI(text, schemaData, options = {}) {
         const startTime = Date.now();
-        
+
         try {
             // Merge default options with provided options
+            const model = options.model || getConfigDefaultModel(PROCESSING_METHODS.OPENAI);
+            const modelDefaults = getConfigDefaultOptions(PROCESSING_METHODS.OPENAI, model);
             const defaultOptions = {
-                model: 'gpt-4o-2024-08-06',
-                temperature: 0.1,
-                max_tokens: 4000,
+                model: model,
+                ...modelDefaults,
                 ...options
             };
 
@@ -124,7 +136,7 @@ class ProcessingService {
         } catch (error) {
             const endTime = Date.now();
             const processingTimeSeconds = (endTime - startTime) / 1000;
-            
+
             console.error('❌ OpenAI processing error:', error.message);
             return {
                 success: false,
@@ -140,19 +152,56 @@ class ProcessingService {
     }
 
     /**
+     * Process text using Qwen
+     * @param {string} text - Text to process
+     * @param {Object} schemaData - Schema configuration
+     * @param {Object} options - Qwen options
+     * @returns {Promise<Object>} Processing result
+     */
+    async processWithQwen(text, schemaData, options = {}) {
+        return await this.qwenProcessor.processWithQwen(text, schemaData, options);
+    }
+
+    /**
      * Get available processing methods
      * @returns {Array<string>} List of available methods
      */
     getAvailableMethods() {
-        return ['openai'];
+        return Object.values(PROCESSING_METHODS);
     }
 
     /**
      * Get available OpenAI models
      * @returns {Array<string>} List of available models
      */
-    getAvailableModels() {
-        return ['gpt-4o', 'gpt-4', 'gpt-3.5-turbo'];
+    getAvailableOpenAIModels() {
+        return OPENAI_MODELS_LIST;
+    }
+
+    /**
+     * Get available Qwen models
+     * @returns {Array<string>} List of available models
+     */
+    getAvailableQwenModels() {
+        return QWEN_MODELS_LIST;
+    }
+
+    /**
+     * Get available models for a specific method
+     * @param {string} method - Processing method
+     * @returns {Array<string>|Object} List of available models or object with all methods
+     */
+    getAvailableModels(method = null) {
+        if (method === PROCESSING_METHODS.OPENAI) {
+            return this.getAvailableOpenAIModels();
+        } else if (method === PROCESSING_METHODS.QWEN) {
+            return this.getAvailableQwenModels();
+        }
+        // Return all models if no method specified
+        return {
+            [PROCESSING_METHODS.OPENAI]: this.getAvailableOpenAIModels(),
+            [PROCESSING_METHODS.QWEN]: this.getAvailableQwenModels()
+        };
     }
 
     /**
@@ -160,23 +209,17 @@ class ProcessingService {
      * @param {string} model - OpenAI model
      * @returns {Object} Default options for the model
      */
-    getDefaultOptions(model = 'gpt-4o') {
-        const defaultOptions = {
-            'gpt-4o': {
-                temperature: 0.1,
-                max_tokens: 4000
-            },
-            'gpt-4': {
-                temperature: 0.1,
-                max_tokens: 4000
-            },
-            'gpt-3.5-turbo': {
-                temperature: 0.2,
-                max_tokens: 3000
-            }
-        };
+    getDefaultOptions(model = getConfigDefaultModel(PROCESSING_METHODS.OPENAI)) {
+        return getConfigDefaultOptions(PROCESSING_METHODS.OPENAI, model);
+    }
 
-        return defaultOptions[model] || defaultOptions['gpt-4o'];
+    /**
+     * Get default options for Qwen processing
+     * @param {string} model - Qwen model
+     * @returns {Object} Default options for the model
+     */
+    getDefaultQwenOptions(model = getConfigDefaultModel(PROCESSING_METHODS.QWEN)) {
+        return getConfigDefaultOptions(PROCESSING_METHODS.QWEN, model);
     }
 }
 

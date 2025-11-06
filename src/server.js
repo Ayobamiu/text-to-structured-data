@@ -43,6 +43,14 @@ import { rateLimitConfig } from "./auth.js";
 import logger from "./utils/logger.js";
 import { processWithOpenAI } from "./utils/openaiProcessor.js";
 import ExtractionService from "./services/extractionService.js";
+import {
+    PROCESSING_METHODS,
+    DEFAULT_MODELS,
+    ALL_PROCESSING_METHODS,
+    isValidModel,
+    getModelsForMethod,
+    getDefaultModel
+} from "./config/processingConfig.js";
 
 dotenv.config();
 
@@ -679,21 +687,25 @@ app.put("/jobs/:id/config", authenticateToken, async (req, res) => {
             }
 
             // Validate processing method if provided
-            if (processing_config.processing?.method &&
-                processing_config.processing.method !== 'openai') {
-                return res.status(400).json({
-                    status: "error",
-                    message: "Invalid processing.method. Currently only 'openai' is supported"
-                });
-            }
+            if (processing_config.processing?.method) {
+                if (!ALL_PROCESSING_METHODS.includes(processing_config.processing.method)) {
+                    return res.status(400).json({
+                        status: "error",
+                        message: `Invalid processing.method. Must be one of: ${ALL_PROCESSING_METHODS.join(', ')}`
+                    });
+                }
 
-            // Validate model if provided
-            if (processing_config.processing?.model &&
-                !['gpt-4o', 'gpt-4', 'gpt-3.5-turbo'].includes(processing_config.processing.model)) {
-                return res.status(400).json({
-                    status: "error",
-                    message: "Invalid processing.model. Must be one of: gpt-4o, gpt-4, gpt-3.5-turbo"
-                });
+                // Validate model if provided
+                if (processing_config.processing?.model) {
+                    const method = processing_config.processing.method;
+                    if (!isValidModel(method, processing_config.processing.model)) {
+                        const validModels = getModelsForMethod(method);
+                        return res.status(400).json({
+                            status: "error",
+                            message: `Invalid processing.model for ${method}. Must be one of: ${validModels.join(', ')}`
+                        });
+                    }
+                }
             }
         }
 
@@ -1668,8 +1680,8 @@ async function processFilesAsync(job, files, schema, schemaName, processingConfi
  *                                        options: Object  // Method-specific options
  *                                      },
  *                                      processing: {
- *                                        method: string,  // 'openai'
- *                                        model: string,   // 'gpt-4o' | 'gpt-4o-2024-08-06' | etc.
+ *                                        method: string,  // 'openai' | 'qwen'
+ *                                        model: string,   // OpenAI: 'gpt-4o' | 'gpt-4o-2024-08-06' | etc. | Qwen: 'qwen-max' | 'qwen-plus' | etc.
  *                                        options: Object  // Processing options
  *                                      }
  *                                    }
@@ -1698,6 +1710,8 @@ async function processFilesAsync(job, files, schema, schemaName, processingConfi
  * formData.append('processingConfig', JSON.stringify({
  *   extraction: { method: 'paddleocr', options: {} },
  *   processing: { method: 'openai', model: 'gpt-4o', options: {} }
+ *   // Or for Qwen:
+ *   processing: { method: 'qwen', model: 'qwen-max', options: {} }
  * }));
  * 
  * @response 200 - Job created successfully, processing started
@@ -1748,10 +1762,15 @@ app.post("/extract", authenticateToken, upload.array("files", 20), async (req, r
         // Set default processing config if not provided
         const defaultProcessingConfig = {
             extraction: { method: 'paddleocr', options: {} },
-            processing: { method: 'openai', model: 'gpt-4o', options: {} }
+            processing: { method: PROCESSING_METHODS.OPENAI, model: DEFAULT_MODELS[PROCESSING_METHODS.OPENAI], options: {} }
         };
 
         const finalProcessingConfig = processingConfig || defaultProcessingConfig;
+
+        // Set default model if method is specified but model is not
+        if (finalProcessingConfig?.processing?.method && !finalProcessingConfig?.processing?.model) {
+            finalProcessingConfig.processing.model = getDefaultModel(finalProcessingConfig.processing.method);
+        }
 
         job = await createJob(jobName, schema, schemaName, req.user.id, organizationId, extractionMode, finalProcessingConfig);
         console.log(`✅ Job created: ${job.id}`);
