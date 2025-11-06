@@ -130,21 +130,21 @@ class QwenProcessor {
             } catch (parseError) {
                 // Check if the error is due to truncated response (incomplete JSON)
                 const isTruncated = finishReason === 'length' ||
-                                   extractedContent.trim().endsWith('"') || 
-                                   extractedContent.trim().endsWith(',') ||
-                                   extractedContent.trim().endsWith('[') ||
-                                   extractedContent.trim().endsWith('{') ||
-                                   (parseError.message.includes('position') && 
-                                    !extractedContent.trim().endsWith('}'));
-                
+                    extractedContent.trim().endsWith('"') ||
+                    extractedContent.trim().endsWith(',') ||
+                    extractedContent.trim().endsWith('[') ||
+                    extractedContent.trim().endsWith('{') ||
+                    (parseError.message.includes('position') &&
+                        !extractedContent.trim().endsWith('}'));
+
                 if (isTruncated) {
                     const errorMsg = `Qwen response was truncated (likely exceeded max_tokens limit of ${defaultOptions.max_tokens}). The JSON response was cut off mid-output. ` +
-                                   `Used ${completion.usage?.total_tokens || 'unknown'} tokens. ` +
-                                   `Consider increasing max_tokens in processing options or simplifying the schema. ` +
-                                   `Parse error: ${parseError.message}. Response preview: ${extractedContent.substring(0, 500)}...`;
+                        `Used ${completion.usage?.total_tokens || 'unknown'} tokens. ` +
+                        `Consider increasing max_tokens in processing options or simplifying the schema. ` +
+                        `Parse error: ${parseError.message}. Response preview: ${extractedContent.substring(0, 500)}...`;
                     throw new Error(errorMsg);
                 }
-                
+
                 throw new Error(`Failed to parse JSON from Qwen response: ${parseError.message}. Response preview: ${extractedContent.substring(0, 500)}...`);
             }
 

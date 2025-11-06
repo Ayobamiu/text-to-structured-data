@@ -163,13 +163,13 @@ class FileProcessorWorker {
         try {
             // Mark file as processing
             await queueService.markFileAsProcessing(fileId);
-            
+
             // Get file details directly (lightweight - no large columns needed for processing)
             const file = await getFileById(fileId, false);
             if (!file) {
                 throw new Error(`File ${fileId} not found`);
             }
-            
+
             // Get job details separately (lightweight - no files needed)
             const jobQuery = `
                 SELECT id, name, status, schema_data, schema_data_array, processing_config, extraction_mode
@@ -184,7 +184,7 @@ class FileProcessorWorker {
                     throw new Error(`Job ${jobId} not found for file ${fileId}`);
                 }
                 job = jobResult.rows[0];
-                
+
                 // Parse processing_config if it's a string
                 if (job.processing_config && typeof job.processing_config === 'string') {
                     try {
@@ -550,12 +550,10 @@ class FileProcessorWorker {
                 console.log(`📝 Text-only mode: Skipping AI processing for ${file.filename}`);
 
                 // Mark processing as completed without AI processing
+                // Only store minimal metadata indicating text_only mode
+                // Extraction data (text, tables, markdown, pages) is already stored via updateFileExtractionStatus
                 await updateFileProcessingStatus(file.id, 'completed', null, null, {
-                    mode: 'text_only',
-                    extracted_text: extractionResult.text,
-                    extracted_tables: extractionResult.tables,
-                    markdown: extractionResult.markdown,
-                    pages: extractionResult.pages
+                    mode: 'text_only'
                 });
 
                 // Emit WebSocket event for completion
@@ -637,16 +635,16 @@ class FileProcessorWorker {
 
             if (processingResult.success) {
                 // Extract ai_processing_time_seconds from metadata
-                const aiProcessingTimeSeconds = processingResult.metadata?.processing_time_seconds || 
-                                                processingResult.metadata?.ai_processing_time_seconds ||
-                                                processingResult.ai_processing_time_seconds ||
-                                                null;
-                
+                const aiProcessingTimeSeconds = processingResult.metadata?.processing_time_seconds ||
+                    processingResult.metadata?.ai_processing_time_seconds ||
+                    processingResult.ai_processing_time_seconds ||
+                    null;
+
                 await updateFileProcessingStatus(
-                    file.id, 
-                    'completed', 
-                    processingResult.data, 
-                    null, 
+                    file.id,
+                    'completed',
+                    processingResult.data,
+                    null,
                     processingResult.metadata,
                     aiProcessingTimeSeconds
                 );
