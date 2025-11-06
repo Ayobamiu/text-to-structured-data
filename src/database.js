@@ -35,6 +35,8 @@ const pool = new Pool({
     max: 20, // Maximum number of clients in the pool
     idleTimeoutMillis: 30000, // Close idle clients after 30 seconds
     connectionTimeoutMillis: 10000, // Return an error after 10 seconds if connection could not be established
+    // Note: statement_timeout and query_timeout are not valid Pool options
+    // These need to be set per-connection or via SQL SET command
 });
 
 // Test database connection
@@ -210,13 +212,16 @@ export async function updateFileS3Info(fileId, s3Key, fileHash) {
     }
 }
 
-// Get job status with files
-export async function getJobStatus(jobId) {
+// Get job status with files (lightweight - excludes large columns by default)
+export async function getJobStatus(jobId, includeLargeColumns = false) {
     const client = await pool.connect();
     try {
+        // Set statement timeout for this connection (30 seconds)
+        await client.query('SET statement_timeout = 30000');
+
         // Get job details
         const jobQuery = `
-            SELECT id, name, status, schema_data, schema_data_array, summary, user_id, created_at, updated_at, extraction_mode, processing_config
+            SELECT id, name, status, schema_data, schema_data_array, summary, user_id, organization_id, created_at, updated_at, extraction_mode, processing_config
             FROM jobs WHERE id = $1
         `;
         const jobResult = await client.query(jobQuery, [jobId]);
@@ -225,15 +230,19 @@ export async function getJobStatus(jobId) {
             return null;
         }
 
-        // Get job files
+        // Get job files - exclude large columns unless explicitly requested
+        // Large columns: extracted_text, markdown, result, actual_result, raw_data
+        const largeColumns = includeLargeColumns
+            ? 'extracted_text, extracted_tables, markdown, result, actual_result, raw_data,'
+            : '';
+
         const filesQuery = `
             SELECT id, filename, size, s3_key, file_hash, extraction_status, 
-                   processing_status, extracted_text, extracted_tables, markdown, result, actual_result,
+                   processing_status, ${largeColumns}
                    processing_metadata, extraction_error, processing_error, created_at, processed_at,
                    upload_status, upload_error, storage_type, retry_count, last_retry_at,
                    extraction_time_seconds, ai_processing_time_seconds, admin_verified, customer_verified,
-                   pages, openai_feed_blocked, openai_feed_unblocked, extraction_metadata, source_locations,
-                   raw_data
+                   pages, openai_feed_blocked, openai_feed_unblocked, extraction_metadata, source_locations
             FROM job_files WHERE job_id = $1
             ORDER BY created_at
         `;
@@ -252,23 +261,28 @@ export async function getJobStatus(jobId) {
             }
         }
 
-        // Extract pages from raw_data for each file
+        // Extract pages from raw_data for each file (only if raw_data was fetched)
         const files = filesResult.rows.map(file => {
-            let pages = null;
-            if (file.raw_data && typeof file.raw_data === 'object' && file.raw_data.pages) {
-                pages = file.raw_data.pages;
-            } else if (file.raw_data && typeof file.raw_data === 'string') {
-                try {
-                    const parsed = JSON.parse(file.raw_data);
-                    pages = parsed.pages || null;
-                } catch (e) {
-                    // Ignore parsing errors
+            // Only parse raw_data if it was included in the query
+            if (includeLargeColumns && file.raw_data) {
+                let pages = null;
+                if (typeof file.raw_data === 'object' && file.raw_data.pages) {
+                    pages = file.raw_data.pages;
+                } else if (typeof file.raw_data === 'string') {
+                    try {
+                        const parsed = JSON.parse(file.raw_data);
+                        pages = parsed.pages || null;
+                    } catch (e) {
+                        // Ignore parsing errors
+                    }
                 }
+                return {
+                    ...file,
+                    pages: pages || file.pages || null
+                };
             }
-            return {
-                ...file,
-                pages: pages || file.pages || null
-            };
+            // If raw_data not fetched, just return file with existing pages if any
+            return file;
         });
 
         // Calculate summary
@@ -689,7 +703,91 @@ export async function listJobs(limit = 10, offset = 0, userId = null, organizati
     }
 }
 
-// Get file result
+// Get job organization ID (ultra-lightweight - for access checks)
+export async function getJobOrganizationId(jobId) {
+    const client = await pool.connect();
+    try {
+        await client.query('SET statement_timeout = 30000');
+        const query = `SELECT organization_id FROM jobs WHERE id = $1`;
+        const result = await client.query(query, [jobId]);
+        return result.rows.length > 0 ? result.rows[0].organization_id : null;
+    } catch (error) {
+        console.error('❌ Error getting job organization ID:', error.message);
+        throw error;
+    } finally {
+        client.release();
+    }
+}
+
+// Get file by ID (lightweight - for worker use)
+export async function getFileById(fileId, includeLargeColumns = false) {
+    const client = await pool.connect();
+    try {
+        // Set statement timeout for this connection (30 seconds)
+        await client.query('SET statement_timeout = 30000');
+        const largeColumns = includeLargeColumns
+            ? 'extracted_text, extracted_tables, markdown, result, actual_result, raw_data,'
+            : '';
+
+        const query = `
+            SELECT jf.id, jf.filename, jf.size, jf.s3_key, jf.file_hash, jf.extraction_status, 
+                   jf.processing_status, ${largeColumns}
+                   jf.processing_metadata, jf.extraction_error, jf.processing_error, 
+                   jf.created_at, jf.processed_at, jf.upload_status, jf.upload_error, 
+                   jf.storage_type, jf.retry_count, jf.last_retry_at,
+                   jf.extraction_time_seconds, jf.ai_processing_time_seconds, 
+                   jf.admin_verified, jf.customer_verified, jf.pages,
+                   jf.openai_feed_blocked, jf.openai_feed_unblocked, jf.extraction_metadata, 
+                   jf.source_locations, jf.job_id,
+                   j.id as job_id, j.name as job_name, j.schema_data, j.schema_data_array, j.processing_config
+            FROM job_files jf
+            JOIN jobs j ON jf.job_id = j.id
+            WHERE jf.id = $1
+        `;
+
+        const result = await client.query(query, [fileId]);
+
+        if (result.rows.length === 0) {
+            return null;
+        }
+
+        const file = result.rows[0];
+
+        // Parse processing_config if it's a string
+        if (file.processing_config && typeof file.processing_config === 'string') {
+            try {
+                file.processing_config = JSON.parse(file.processing_config);
+            } catch (parseError) {
+                console.warn('⚠️ Failed to parse processing_config in getFileById:', parseError.message);
+            }
+        }
+
+        // Extract pages from raw_data if included
+        if (includeLargeColumns && file.raw_data) {
+            let pages = null;
+            if (typeof file.raw_data === 'object' && file.raw_data.pages) {
+                pages = file.raw_data.pages;
+            } else if (typeof file.raw_data === 'string') {
+                try {
+                    const parsed = JSON.parse(file.raw_data);
+                    pages = parsed.pages || null;
+                } catch (e) {
+                    // Ignore parsing errors
+                }
+            }
+            file.pages = pages || file.pages || null;
+        }
+
+        return file;
+    } catch (error) {
+        console.error('❌ Error getting file by ID:', error.message);
+        throw error;
+    } finally {
+        client.release();
+    }
+}
+
+// Get file result (includes all large columns)
 export async function getFileResult(fileId) {
     const client = await pool.connect();
     try {

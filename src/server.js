@@ -14,6 +14,7 @@ import pool, {
     createJob,
     addFileToJob,
     getJobStatus,
+    getJobOrganizationId,
     updateFileExtractionStatus,
     updateFileProcessingStatus,
     updateJobStatus,
@@ -814,9 +815,9 @@ app.get("/files/:id/result", authenticateToken, async (req, res) => {
             });
         }
 
-        // Check if user has access to this file's job organization
-        const job = await getJobStatus(file.job_id);
-        if (!job) {
+        // Check if user has access to this file's job organization (lightweight)
+        const jobOrganizationId = await getJobOrganizationId(file.job_id);
+        if (jobOrganizationId === null) {
             return res.status(404).json({
                 status: "error",
                 message: "Job not found"
@@ -826,7 +827,7 @@ app.get("/files/:id/result", authenticateToken, async (req, res) => {
         // Check if user has access to this file's job organization (with JWT optimization)
         const userOrganizationIds = await getUserOrganizationIds(req.user);
 
-        if (job.organization_id && !userOrganizationIds.includes(job.organization_id)) {
+        if (jobOrganizationId && !userOrganizationIds.includes(jobOrganizationId)) {
             return res.status(403).json({
                 status: "error",
                 message: "Access denied to this file"
@@ -960,9 +961,9 @@ app.put("/files/:id/results", authenticateToken, async (req, res) => {
             });
         }
 
-        // Check if user has access to this file's job organization
-        const job = await getJobStatus(file.job_id);
-        if (!job) {
+        // Check if user has access to this file's job organization (lightweight)
+        const jobOrganizationId = await getJobOrganizationId(file.job_id);
+        if (jobOrganizationId === null) {
             return res.status(404).json({
                 status: "error",
                 message: "Job not found"
@@ -972,7 +973,7 @@ app.put("/files/:id/results", authenticateToken, async (req, res) => {
         // Check if user has access to this file's job organization (with JWT optimization)
         const userOrganizationIds = await getUserOrganizationIds(req.user);
 
-        if (job.organization_id && !userOrganizationIds.includes(job.organization_id)) {
+        if (jobOrganizationId && !userOrganizationIds.includes(jobOrganizationId)) {
             return res.status(403).json({
                 status: "error",
                 message: "Access denied to this file"
@@ -1366,8 +1367,8 @@ async function processFilesAsync(job, files, schema, schemaName, processingConfi
             message: `Processing ${files.length} files...`
         });
 
-        // Get existing file records for this job
-        const jobDetails = await getJobStatus(job.id);
+        // Get existing file records for this job (lightweight - no large columns needed)
+        const jobDetails = await getJobStatus(job.id, false);
         const fileRecords = jobDetails.files;
 
         // Process each file
@@ -1933,9 +1934,9 @@ app.delete("/files/:fileId", authenticateToken, async (req, res) => {
             });
         }
 
-        // Check if user has access to this file's job organization
-        const job = await getJobStatus(file.job_id);
-        if (!job) {
+        // Check if user has access to this file's job organization (lightweight)
+        const jobOrganizationId = await getJobOrganizationId(file.job_id);
+        if (jobOrganizationId === null) {
             return res.status(404).json({
                 status: "error",
                 message: "Job not found"
@@ -1945,7 +1946,7 @@ app.delete("/files/:fileId", authenticateToken, async (req, res) => {
         // Check if user has access to this file's job organization (with JWT optimization)
         const userOrganizationIds = await getUserOrganizationIds(req.user);
 
-        if (job.organization_id && !userOrganizationIds.includes(job.organization_id)) {
+        if (jobOrganizationId && !userOrganizationIds.includes(jobOrganizationId)) {
             return res.status(403).json({
                 status: "error",
                 message: "Access denied to this file"
@@ -2033,14 +2034,14 @@ app.delete("/files", authenticateToken, async (req, res) => {
                         continue;
                     }
 
-                    // Check if user has access to this file's job organization
-                    const job = await getJobStatus(file.job_id);
-                    if (!job) {
+                    // Check if user has access to this file's job organization (lightweight)
+                    const jobOrganizationId = await getJobOrganizationId(file.job_id);
+                    if (jobOrganizationId === null) {
                         errors.push({ fileId, error: "Job not found" });
                         continue;
                     }
 
-                    if (job.organization_id && !userOrganizationIds.includes(job.organization_id)) {
+                    if (jobOrganizationId && !userOrganizationIds.includes(jobOrganizationId)) {
                         errors.push({ fileId, error: "Access denied" });
                         continue;
                     }
@@ -2179,9 +2180,9 @@ app.post("/files/reprocess", authenticateToken, async (req, res) => {
                     continue;
                 }
 
-                // Check if user has access to this file's job organization
-                const job = await getJobStatus(file.job_id);
-                if (!job) {
+                // Check if user has access to this file's job organization (lightweight)
+                const jobOrganizationId = await getJobOrganizationId(file.job_id);
+                if (jobOrganizationId === null) {
                     skippedFiles.push({
                         fileId,
                         reason: "Job not found"
@@ -2189,7 +2190,7 @@ app.post("/files/reprocess", authenticateToken, async (req, res) => {
                     continue;
                 }
 
-                if (job.organization_id && !userOrganizationIds.includes(job.organization_id)) {
+                if (jobOrganizationId && !userOrganizationIds.includes(jobOrganizationId)) {
                     skippedFiles.push({
                         fileId,
                         reason: "Access denied"

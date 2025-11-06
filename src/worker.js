@@ -4,6 +4,7 @@ import { io } from 'socket.io-client';
 import queueService from './queue.js';
 import {
     getJobStatus,
+    getFileById,
     updateFileExtractionStatus,
     updateFileProcessingStatus,
     updateJobStatus
@@ -162,15 +163,38 @@ class FileProcessorWorker {
         try {
             // Mark file as processing
             await queueService.markFileAsProcessing(fileId);
-            // Get job and file details
-            const job = await getJobStatus(jobId);
-            if (!job) {
-                throw new Error(`Job ${jobId} not found for file ${fileId}`);
-            }
-
-            const file = job.files.find(f => f.id === fileId);
+            
+            // Get file details directly (lightweight - no large columns needed for processing)
+            const file = await getFileById(fileId, false);
             if (!file) {
-                throw new Error(`File ${fileId} not found in job ${jobId}`);
+                throw new Error(`File ${fileId} not found`);
+            }
+            
+            // Get job details separately (lightweight - no files needed)
+            const jobQuery = `
+                SELECT id, name, status, schema_data, schema_data_array, processing_config, extraction_mode
+                FROM jobs WHERE id = $1
+            `;
+            const { default: pool } = await import('./database.js');
+            const client = await pool.connect();
+            let job;
+            try {
+                const jobResult = await client.query(jobQuery, [jobId]);
+                if (jobResult.rows.length === 0) {
+                    throw new Error(`Job ${jobId} not found for file ${fileId}`);
+                }
+                job = jobResult.rows[0];
+                
+                // Parse processing_config if it's a string
+                if (job.processing_config && typeof job.processing_config === 'string') {
+                    try {
+                        job.processing_config = JSON.parse(job.processing_config);
+                    } catch (parseError) {
+                        console.warn('⚠️ Failed to parse processing_config in worker:', parseError.message);
+                    }
+                }
+            } finally {
+                client.release();
             }
 
             let extractionResult;
