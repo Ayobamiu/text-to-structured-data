@@ -237,7 +237,10 @@ export async function getJobDetailsWithSummary(jobId) {
                     COUNT(*) FILTER (WHERE processing_status = 'pending') as processing_pending,
                     COUNT(*) FILTER (WHERE processing_status = 'processing') as processing_processing,
                     COUNT(*) FILTER (WHERE processing_status = 'completed') as processing_completed,
-                    COUNT(*) FILTER (WHERE processing_status = 'failed') as processing_failed
+                    COUNT(*) FILTER (WHERE processing_status = 'failed') as processing_failed,
+                    -- Combined counts for summary display
+                    COUNT(*) FILTER (WHERE extraction_status = 'processing' OR processing_status = 'processing') as processing,
+                    COUNT(*) FILTER (WHERE extraction_status = 'pending' AND processing_status = 'pending') as pending
                 FROM job_files
                 WHERE job_id = $1
             `, [jobId])
@@ -277,7 +280,9 @@ export async function getJobDetailsWithSummary(jobId) {
                 processing_pending: 0,
                 processing_processing: 0,
                 processing_completed: 0,
-                processing_failed: 0
+                processing_failed: 0,
+                processing: 0,
+                pending: 0
             };
         } else {
             const row = summaryResult.rows[0];
@@ -290,7 +295,10 @@ export async function getJobDetailsWithSummary(jobId) {
                 processing_pending: parseInt(row.processing_pending, 10),
                 processing_processing: parseInt(row.processing_processing, 10),
                 processing_completed: parseInt(row.processing_completed, 10),
-                processing_failed: parseInt(row.processing_failed, 10)
+                processing_failed: parseInt(row.processing_failed, 10),
+                // Combined counts for summary display
+                processing: parseInt(row.processing || 0, 10),
+                pending: parseInt(row.pending || 0, 10)
             };
         }
 
