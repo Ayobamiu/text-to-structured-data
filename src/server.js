@@ -14,6 +14,7 @@ import pool, {
     createJob,
     addFileToJob,
     getJobStatus,
+    getJobDetailsWithSummary,
     getJobOrganizationId,
     updateFileExtractionStatus,
     updateFileProcessingStatus,
@@ -495,11 +496,50 @@ app.get("/jobs", authenticateToken, async (req, res) => {
     }
 });
 
-// Get job status
+// Get job details with summary (ultra-lightweight - no files, combined response)
+app.get("/jobs/:id/details", authenticateToken, async (req, res) => {
+    try {
+        const { id } = req.params;
+
+        // Check if user has access to this job's organization
+        const jobOrgId = await getJobOrganizationId(id);
+        if (jobOrgId) {
+            const userOrganizationIds = await getUserOrganizationIds(req.user);
+            if (!userOrganizationIds.includes(jobOrgId)) {
+                return res.status(403).json({
+                    status: "error",
+                    message: "Access denied to this job"
+                });
+            }
+        }
+
+        // Fetch both job details and summary in a single database connection
+        const result = await getJobDetailsWithSummary(id);
+
+        if (!result.job) {
+            return res.status(404).json({
+                status: "error",
+                message: "Job not found"
+            });
+        }
+
+        res.json({
+            status: "success",
+            job: result.job,
+            summary: result.summary
+        });
+    } catch (error) {
+        res.status(500).json({
+            status: "error",
+            message: error.message
+        });
+    }
+});
+
 app.get("/jobs/:id", authenticateToken, async (req, res) => {
     try {
         const { id } = req.params;
-        const job = await getJobStatus(id);
+        const job = await getJobStatus(id, false); // Use lightweight by default
 
         if (!job) {
             return res.status(404).json({

@@ -212,6 +212,99 @@ export async function updateFileS3Info(fileId, s3Key, fileHash) {
     }
 }
 
+// Get job details with summary (combined - single connection, parallel queries)
+export async function getJobDetailsWithSummary(jobId) {
+    const client = await pool.connect();
+    try {
+        // Set statement timeout for this connection (30 seconds)
+        await client.query('SET statement_timeout = 30000');
+
+        // Run both queries in parallel on the same connection
+        const [jobResult, summaryResult] = await Promise.all([
+            client.query(`
+                SELECT id, name, status, schema_data, schema_data_array, user_id, organization_id, 
+                       created_at, updated_at, extraction_mode, processing_config
+                FROM jobs WHERE id = $1
+            `, [jobId]),
+            client.query(`
+                SELECT 
+                    COUNT(*) as total,
+                    COUNT(*) FILTER (WHERE extraction_status = 'pending') as extraction_pending,
+                    COUNT(*) FILTER (WHERE extraction_status = 'processing') as extraction_processing,
+                    COUNT(*) FILTER (WHERE extraction_status = 'completed') as extraction_completed,
+                    COUNT(*) FILTER (WHERE extraction_status = 'failed') as extraction_failed,
+                    COUNT(*) FILTER (WHERE processing_status = 'pending') as processing_pending,
+                    COUNT(*) FILTER (WHERE processing_status = 'processing') as processing_processing,
+                    COUNT(*) FILTER (WHERE processing_status = 'completed') as processing_completed,
+                    COUNT(*) FILTER (WHERE processing_status = 'failed') as processing_failed
+                FROM job_files
+                WHERE job_id = $1
+            `, [jobId])
+        ]);
+
+        if (jobResult.rows.length === 0) {
+            return { job: null, summary: null };
+        }
+
+        const job = jobResult.rows[0];
+
+        // Parse processing_config if it's a string (JSONB columns can return as strings)
+        let processingConfig = job.processing_config;
+        if (processingConfig && typeof processingConfig === 'string') {
+            try {
+                processingConfig = JSON.parse(processingConfig);
+            } catch (parseError) {
+                console.warn('⚠️ Failed to parse processing_config, using default:', parseError.message);
+                processingConfig = null;
+            }
+        }
+
+        const parsedJob = {
+            ...job,
+            processing_config: processingConfig
+        };
+
+        // Parse summary
+        let summary;
+        if (summaryResult.rows.length === 0) {
+            summary = {
+                total: 0,
+                extraction_pending: 0,
+                extraction_processing: 0,
+                extraction_completed: 0,
+                extraction_failed: 0,
+                processing_pending: 0,
+                processing_processing: 0,
+                processing_completed: 0,
+                processing_failed: 0
+            };
+        } else {
+            const row = summaryResult.rows[0];
+            summary = {
+                total: parseInt(row.total, 10),
+                extraction_pending: parseInt(row.extraction_pending, 10),
+                extraction_processing: parseInt(row.extraction_processing, 10),
+                extraction_completed: parseInt(row.extraction_completed, 10),
+                extraction_failed: parseInt(row.extraction_failed, 10),
+                processing_pending: parseInt(row.processing_pending, 10),
+                processing_processing: parseInt(row.processing_processing, 10),
+                processing_completed: parseInt(row.processing_completed, 10),
+                processing_failed: parseInt(row.processing_failed, 10)
+            };
+        }
+
+        return {
+            job: parsedJob,
+            summary
+        };
+    } catch (error) {
+        console.error('❌ Error getting job details with summary:', error.message);
+        throw error;
+    } finally {
+        client.release();
+    }
+}
+
 // Get job status with files (lightweight - excludes large columns by default)
 export async function getJobStatus(jobId, includeLargeColumns = false) {
     const client = await pool.connect();
