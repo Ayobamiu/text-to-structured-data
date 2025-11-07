@@ -675,7 +675,7 @@ class FileProcessorWorker {
             // Handle retries
             if (retries < MAX_RETRIES) {
                 console.log(`🔄 Retrying file ${fileId}. Attempt ${retries + 1} of ${MAX_RETRIES}`);
-                const retrySuccess = await queueService.retryFile(fileId, jobId);
+                const retrySuccess = await queueService.retryFile(fileId, jobId, 0, mode);
 
                 if (retrySuccess) {
                     // Update status to reflect retry

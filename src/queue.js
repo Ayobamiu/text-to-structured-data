@@ -166,7 +166,7 @@ class QueueService {
     }
 
     // Retry failed file
-    async retryFile(fileId, jobId, priority = 0) {
+    async retryFile(fileId, jobId, priority = 0, mode = 'normal') {
         try {
             const client = await this.connect();
 
@@ -192,7 +192,8 @@ class QueueService {
                 priority,
                 timestamp: Date.now() + delay,
                 retries: retries + 1,
-                status: 'retry'
+                status: 'retry',
+                mode: mode
             };
 
             await client.zAdd(this.queueKey, {
