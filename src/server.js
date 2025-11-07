@@ -46,6 +46,7 @@ import logger from "./utils/logger.js";
 import { processWithOpenAI } from "./utils/openaiProcessor.js";
 import ExtractionService from "./services/extractionService.js";
 import groqService from "./services/groqService.js";
+import { getPdfPageCount } from "./utils/pdfUtils.js";
 import {
     PROCESSING_METHODS,
     DEFAULT_MODELS,
@@ -1181,6 +1182,9 @@ app.post("/jobs/:id/files", authenticateToken, upload.array("files", 20), async 
             let uploadError = null;
             let storageType = 's3';
 
+            let pageCount = null;
+            const isPdf = file.mimetype === 'application/pdf' || file.originalname?.toLowerCase().endsWith('.pdf');
+
             if (s3Service.isCloudStorageEnabled()) {
                 try {
                     s3FileInfo = await s3Service.uploadFile(file, jobId);
@@ -1194,6 +1198,10 @@ app.post("/jobs/:id/files", authenticateToken, upload.array("files", 20), async 
                 storageType = 'local';
             }
 
+            if (isPdf) {
+                pageCount = await getPdfPageCount(file.path);
+            }
+
             // Add file record to database
             const fileRecord = await addFileToJob(
                 jobId,
@@ -1203,7 +1211,8 @@ app.post("/jobs/:id/files", authenticateToken, upload.array("files", 20), async 
                 s3FileInfo?.fileHash || null,
                 uploadStatus,
                 uploadError,
-                storageType
+                storageType,
+                pageCount
             );
 
             // Add file to processing queue
@@ -1215,7 +1224,8 @@ app.post("/jobs/:id/files", authenticateToken, upload.array("files", 20), async 
                 filename: fileRecord.filename,
                 size: fileRecord.size,
                 s3Key: fileRecord.s3_key,
-                fileHash: fileRecord.file_hash
+                fileHash: fileRecord.file_hash,
+                page_count: fileRecord.page_count
             });
 
             // Clean up uploaded file
@@ -1876,6 +1886,9 @@ app.post("/extract", authenticateToken, upload.array("files", 20), async (req, r
             let uploadError = null;
             let storageType = 's3';
 
+            let pageCount = null;
+            const isPdf = file.mimetype === 'application/pdf' || file.originalname?.toLowerCase().endsWith('.pdf');
+
             if (s3Service.isCloudStorageEnabled()) {
                 try {
                     s3FileInfo = await s3Service.uploadFile(file, job.id);
@@ -1890,6 +1903,10 @@ app.post("/extract", authenticateToken, upload.array("files", 20), async (req, r
                 storageType = 'local';
             }
 
+            if (isPdf) {
+                pageCount = await getPdfPageCount(file.path);
+            }
+
             // Create file record
             const fileRecord = await addFileToJob(
                 job.id,
@@ -1899,7 +1916,8 @@ app.post("/extract", authenticateToken, upload.array("files", 20), async (req, r
                 s3FileInfo?.fileHash || null,
                 uploadStatus,
                 uploadError,
-                storageType
+                storageType,
+                pageCount
             );
             console.log(`✅ File record created: ${fileRecord.id}`);
 
@@ -1912,6 +1930,7 @@ app.post("/extract", authenticateToken, upload.array("files", 20), async (req, r
                 size: file.size,
                 extraction_status: 'pending',
                 processing_status: 'pending',
+                page_count: fileRecord.page_count,
                 s3Storage: s3FileInfo ? {
                     s3Key: s3FileInfo.s3Key,
                     fileUrl: s3FileInfo.fileUrl,

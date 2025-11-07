@@ -100,15 +100,15 @@ export async function createJob(name, schema, schemaName, userId = null, organiz
 }
 
 // Add file to job
-export async function addFileToJob(jobId, filename, size, s3Key, fileHash, uploadStatus = 'pending', uploadError = null, storageType = 's3') {
+export async function addFileToJob(jobId, filename, size, s3Key, fileHash, uploadStatus = 'pending', uploadError = null, storageType = 's3', pageCount = null) {
     const client = await pool.connect();
     try {
         const fileId = uuidv4();
         const query = `
-            INSERT INTO job_files (id, job_id, filename, size, s3_key, file_hash, 
+            INSERT INTO job_files (id, job_id, filename, size, page_count, s3_key, file_hash, 
                                  extraction_status, processing_status, upload_status, upload_error, storage_type, retry_count, last_retry_at, created_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, NOW())
-            RETURNING id, filename, size, s3_key, file_hash, upload_status, upload_error, storage_type, retry_count, last_retry_at
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, NOW())
+            RETURNING id, filename, size, page_count, s3_key, file_hash, upload_status, upload_error, storage_type, retry_count, last_retry_at
         `;
 
         const values = [
@@ -116,6 +116,7 @@ export async function addFileToJob(jobId, filename, size, s3Key, fileHash, uploa
             jobId,
             filename,
             size,
+            pageCount,
             s3Key,
             fileHash,
             'pending',
@@ -335,7 +336,7 @@ export async function getJobStatus(jobId, includeLargeColumns = false) {
                    processing_metadata, extraction_error, processing_error, created_at, processed_at,
                    upload_status, upload_error, storage_type, retry_count, last_retry_at,
                    extraction_time_seconds, ai_processing_time_seconds, admin_verified, customer_verified,
-                   pages, openai_feed_blocked, openai_feed_unblocked, extraction_metadata, source_locations
+                   pages, page_count, openai_feed_blocked, openai_feed_unblocked, extraction_metadata, source_locations
             FROM job_files WHERE job_id = $1
             ORDER BY created_at
         `;
@@ -356,7 +357,6 @@ export async function getJobStatus(jobId, includeLargeColumns = false) {
 
         // Extract pages from raw_data for each file (only if raw_data was fetched)
         const files = filesResult.rows.map(file => {
-            // Only parse raw_data if it was included in the query
             if (includeLargeColumns && file.raw_data) {
                 let pages = null;
                 if (typeof file.raw_data === 'object' && file.raw_data.pages) {
@@ -374,7 +374,7 @@ export async function getJobStatus(jobId, includeLargeColumns = false) {
                     pages: pages || file.pages || null
                 };
             }
-            // If raw_data not fetched, just return file with existing pages if any
+            // If raw_data not fetched, just return file
             return file;
         });
 
@@ -829,7 +829,7 @@ export async function getFileById(fileId, includeLargeColumns = false) {
                    jf.created_at, jf.processed_at, jf.upload_status, jf.upload_error, 
                    jf.storage_type, jf.retry_count, jf.last_retry_at,
                    jf.extraction_time_seconds, jf.ai_processing_time_seconds, 
-                   jf.admin_verified, jf.customer_verified, jf.pages,
+                   jf.admin_verified, jf.customer_verified, jf.pages, jf.page_count,
                    jf.openai_feed_blocked, jf.openai_feed_unblocked, jf.extraction_metadata, 
                    jf.source_locations, jf.job_id,
                    j.id as job_id, j.name as job_name, j.schema_data, j.schema_data_array, j.processing_config
@@ -885,7 +885,7 @@ export async function getFileResult(fileId) {
     const client = await pool.connect();
     try {
         const query = `
-            SELECT jf.id, jf.filename, jf.result, jf.actual_result, jf.extracted_text, jf.extracted_tables, jf.pages, jf.markdown,
+            SELECT jf.id, jf.filename, jf.result, jf.actual_result, jf.extracted_text, jf.extracted_tables, jf.pages, jf.page_count, jf.markdown,
                    jf.extraction_status, jf.processing_status, jf.extraction_error, jf.processing_error, jf.processed_at,
                    jf.job_id, j.name as job_name, j.schema_data, j.schema_data_array, jf.upload_status, jf.upload_error, 
                    jf.storage_type, jf.retry_count, jf.last_retry_at, jf.extraction_time_seconds, jf.ai_processing_time_seconds,
@@ -1061,6 +1061,7 @@ export async function getAllFiles(limit = 50, offset = 0, status = null, jobId =
                 jf.extracted_text, 
                 jf.extracted_tables, 
                 jf.pages, 
+                jf.page_count,
                 jf.markdown,
                 jf.admin_verified,
                 jf.customer_verified,
@@ -1088,7 +1089,9 @@ export async function getAllFiles(limit = 50, offset = 0, status = null, jobId =
             ${whereConditions}
             GROUP BY jf.id, jf.filename, jf.size, jf.extraction_status, jf.processing_status,
                      jf.extraction_time_seconds, jf.ai_processing_time_seconds, jf.created_at,
-                     jf.processed_at, jf.job_id, j.name, jf.result, jf.actual_result, jf.extraction_error, jf.processing_error, jf.markdown, jf.admin_verified, jf.customer_verified
+                     jf.processed_at, jf.job_id, j.name, jf.result, jf.actual_result,
+                     jf.extraction_error, jf.processing_error, jf.markdown, jf.admin_verified,
+                     jf.customer_verified, jf.page_count
             ORDER BY jf.created_at DESC 
             LIMIT $${++paramCount} OFFSET $${++paramCount}
         `;
