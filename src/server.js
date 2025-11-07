@@ -1550,7 +1550,9 @@ async function processFilesAsync(job, files, schema, schemaName, processingConfi
                     extractionTimeSeconds,
                     openaiFeedBlocked,
                     openaiFeedUnblocked,
-                    extractionMetadata
+                    extractionMetadata,
+                    null, // rawData
+                    pageCount // Preserve or update page_count from extraction result
                 );
 
                 console.log(`✅ File extraction status updated for ${file.originalname}`);

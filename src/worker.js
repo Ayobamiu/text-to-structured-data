@@ -274,14 +274,15 @@ class FileProcessorWorker {
                 const tables = extractionResult.tables || [];
 
                 // Extract page count - pages could be array, number, or object
-                let pageCount = null;
+                // Preserve existing page_count if available, otherwise calculate from extraction result
+                let pageCount = file.page_count || null;
                 let pagesToStore = null;
                 if (Array.isArray(pages) && pages.length > 0) {
-                    pageCount = pages.length;
+                    pageCount = pages.length; // Use extracted page count
                     // Store the array if it has content
                     pagesToStore = pages;
                 } else if (typeof pages === 'number') {
-                    pageCount = pages;
+                    pageCount = pages; // Use extracted page count
                     pagesToStore = pages;
                 }
 
@@ -335,7 +336,8 @@ class FileProcessorWorker {
                     openaiFeedBlocked,
                     openaiFeedUnblocked,
                     extractionMetadata,
-                    extractionResult.raw_data || null
+                    extractionResult.raw_data || null,
+                    pageCount // Preserve or update page_count from extraction result
                 );
 
                 console.log(`✅ File extraction status updated for ${file.filename}`);
@@ -464,14 +466,15 @@ class FileProcessorWorker {
                 const tables = extractionResult.tables || [];
 
                 // Extract page count - pages could be array, number, or object
-                let pageCount = null;
+                // Preserve existing page_count if available, otherwise calculate from extraction result
+                let pageCount = file.page_count || null;
                 let pagesToStore = null;
                 if (Array.isArray(pages) && pages.length > 0) {
-                    pageCount = pages.length;
+                    pageCount = pages.length; // Use extracted page count
                     // Store the array if it has content
                     pagesToStore = pages;
                 } else if (typeof pages === 'number') {
-                    pageCount = pages;
+                    pageCount = pages; // Use extracted page count
                     pagesToStore = pages;
                 }
 
@@ -525,7 +528,8 @@ class FileProcessorWorker {
                     openaiFeedBlocked,
                     openaiFeedUnblocked,
                     extractionMetadata,
-                    extractionResult.raw_data || null
+                    extractionResult.raw_data || null,
+                    pageCount // Preserve or update page_count from extraction result
                 );
                 console.log(`✅ File ${file.filename} extraction completed and updated in database`);
 

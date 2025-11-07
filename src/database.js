@@ -426,16 +426,34 @@ export async function updateFileExtractionStatus(
     openaiFeedBlocked = null,
     openaiFeedUnblocked = null,
     extractionMetadata = null,
-    rawData = null
+    rawData = null,
+    pageCount = null // Optional: preserve or update page_count
 ) {
     const client = await pool.connect();
     try {
+        // Build query conditionally - only update page_count if provided
+        let updatePageCount = pageCount !== null && pageCount !== undefined;
+
+        // Ensure pageCount is an integer if provided
+        let pageCountValue = null;
+        if (updatePageCount) {
+            pageCountValue = typeof pageCount === 'number' ? Math.floor(pageCount) : parseInt(pageCount, 10);
+            if (isNaN(pageCountValue) || pageCountValue < 0) {
+                console.warn(`⚠️ Invalid pageCount value: ${pageCount}, skipping page_count update`);
+                // Fall back to not updating page_count
+                updatePageCount = false;
+                pageCountValue = null;
+            }
+        }
+
+        // When updatePageCount is true: $1-$11 are regular params, $12 is fileId, $13 is pageCount
+        // When updatePageCount is false: $1-$11 are regular params, $12 is fileId
         const query = `
             UPDATE job_files 
             SET extraction_status = $1, extracted_text = $2, extracted_tables = $3, 
                 markdown = $4, pages = $5, extraction_error = $6, extraction_time_seconds = $7,
                 openai_feed_blocked = $8, openai_feed_unblocked = $9, extraction_metadata = $10,
-                raw_data = $11, updated_at = NOW()
+                raw_data = $11${updatePageCount ? ', page_count = $13' : ''}, updated_at = NOW()
             WHERE id = $12
             RETURNING id, job_id, filename
         `;
@@ -444,26 +462,45 @@ export async function updateFileExtractionStatus(
         const openaiFeedBlockedValue = (openaiFeedBlocked && openaiFeedBlocked.trim().length > 0) ? openaiFeedBlocked : null;
         const openaiFeedUnblockedValue = (openaiFeedUnblocked && openaiFeedUnblocked.trim().length > 0) ? openaiFeedUnblocked : null;
 
-        const values = [
-            status,
-            extractedText,
-            extractedTables ? JSON.stringify(extractedTables) : null,
-            markdown,
-            pages ? JSON.stringify(pages) : null,
-            error,
-            extractionTimeSeconds,
-            openaiFeedBlockedValue,
-            openaiFeedUnblockedValue,
-            extractionMetadata ? JSON.stringify(extractionMetadata) : null,
-            rawData ? JSON.stringify(rawData) : null,
-            fileId
-        ];
+        const values = updatePageCount
+            ? [
+                status,
+                extractedText,
+                extractedTables ? JSON.stringify(extractedTables) : null,
+                markdown,
+                pages ? JSON.stringify(pages) : null,
+                error,
+                extractionTimeSeconds,
+                openaiFeedBlockedValue,
+                openaiFeedUnblockedValue,
+                extractionMetadata ? JSON.stringify(extractionMetadata) : null,
+                rawData ? JSON.stringify(rawData) : null,
+                fileId,
+                pageCountValue
+            ]
+            : [
+                status,
+                extractedText,
+                extractedTables ? JSON.stringify(extractedTables) : null,
+                markdown,
+                pages ? JSON.stringify(pages) : null,
+                error,
+                extractionTimeSeconds,
+                openaiFeedBlockedValue,
+                openaiFeedUnblockedValue,
+                extractionMetadata ? JSON.stringify(extractionMetadata) : null,
+                rawData ? JSON.stringify(rawData) : null,
+                fileId
+            ];
 
         // Debug logging
         console.log('🔍 updateFileExtractionStatus debug:', {
             fileId,
             status,
             extractionTimeSeconds,
+            updatePageCount,
+            pageCount,
+            pageCountType: typeof pageCount,
             openaiFeedBlocked: openaiFeedBlockedValue ? `${openaiFeedBlockedValue.length} chars` : 'null',
             openaiFeedUnblocked: openaiFeedUnblockedValue ? `${openaiFeedUnblockedValue.length} chars` : 'null',
             hasExtractionMetadata: !!extractionMetadata,
@@ -471,6 +508,9 @@ export async function updateFileExtractionStatus(
             hasRawData: !!rawData,
             rawDataType: rawData ? typeof rawData : 'null',
             rawDataKeys: rawData && typeof rawData === 'object' ? Object.keys(rawData).slice(0, 5) : null,
+            valuesLength: values.length,
+            lastValue: values[values.length - 1],
+            lastValueType: typeof values[values.length - 1],
         });
 
         const result = await client.query(query, values);
