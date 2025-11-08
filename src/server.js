@@ -1129,11 +1129,33 @@ app.put("/files/:id/verify", authenticateToken, requireRole('admin'), async (req
             });
         }
 
+        // Get file info before update to get job_id
+        const file = await getFileResult(id);
+        if (!file) {
+            return res.status(404).json({
+                status: "error",
+                message: "File not found"
+            });
+        }
+
         const result = await updateFileVerification(
             id,
             updateData.adminVerified !== undefined ? updateData.adminVerified : null,
             updateData.customerVerified !== undefined ? updateData.customerVerified : null
         );
+
+        // Emit file update event via WebSocket
+        const updateEvent = {
+            jobId: file.job_id,
+            fileId: result.id,
+            filename: result.filename,
+            admin_verified: result.admin_verified,
+            customer_verified: result.customer_verified,
+            message: `File verification updated for ${result.filename}`,
+            timestamp: new Date().toISOString()
+        };
+        console.log(`📡 Emitting file-status-update for verification:`, updateEvent);
+        io.to(`job-${file.job_id}`).emit('file-status-update', updateEvent);
 
         res.json({
             status: "success",
