@@ -766,6 +766,7 @@ export async function updateJobStatus(jobId, status, summary = null) {
 }
 
 // List jobs with pagination
+// Returns jobs from organizations the user is a member of (any role: owner, admin, member, viewer)
 export async function listJobsByOrganizations(limit = 10, offset = 0, organizationIds = []) {
     const client = await pool.connect();
     try {
@@ -1040,6 +1041,7 @@ export async function closePool() {
 }
 
 // Get all files across all jobs with pagination
+// Returns files from jobs in organizations the user is a member of (any role)
 export async function getAllFiles(limit = 50, offset = 0, status = null, jobId = null, organizationIds = null) {
     const client = await pool.connect();
     try {
@@ -1060,10 +1062,24 @@ export async function getAllFiles(limit = 50, offset = 0, status = null, jobId =
             params.push(jobId);
         }
 
+        // Filter by organization membership (any role: owner, admin, member, viewer)
         if (organizationIds && Array.isArray(organizationIds) && organizationIds.length > 0) {
             const placeholders = organizationIds.map(() => `$${++paramCount}`).join(',');
             whereConditions += ` AND j.organization_id IN (${placeholders})`;
             params.push(...organizationIds);
+        } else {
+            // User with no organizations - return empty
+            return {
+                files: [],
+                total: 0,
+                stats: {
+                    total: 0,
+                    completed: 0,
+                    processing: 0,
+                    failed: 0,
+                    pending: 0
+                }
+            };
         }
 
         // Get total count and file statistics
@@ -1274,6 +1290,31 @@ export async function getJobFilesByStatus(jobId, status, limit = 50, offset = 0)
         };
     } catch (error) {
         console.error('Error getting job files by status:', error.message);
+        throw error;
+    } finally {
+        client.release();
+    }
+}
+
+// Check if user has access to a job
+// Returns true if user is a member of the job's organization (any role: owner, admin, member, viewer)
+export async function userHasJobAccess(jobId, userEmail, userRole, userOrganizationIds = []) {
+    const client = await pool.connect();
+    try {
+        // Get job's organization_id
+        const jobQuery = `SELECT organization_id FROM jobs WHERE id = $1`;
+        const jobResult = await client.query(jobQuery, [jobId]);
+
+        if (jobResult.rows.length === 0) {
+            return false; // Job doesn't exist
+        }
+
+        const jobOrgId = jobResult.rows[0].organization_id;
+
+        // User has access if they're a member of the job's organization (any role)
+        return jobOrgId && userOrganizationIds.includes(jobOrgId);
+    } catch (error) {
+        console.error('❌ Error checking job access:', error.message);
         throw error;
     } finally {
         client.release();

@@ -8,6 +8,7 @@ import helmet from "helmet";
 import rateLimit from "express-rate-limit";
 import { createServer } from "http";
 import { Server } from "socket.io";
+import { v4 as uuidv4 } from "uuid";
 import S3Service from "./s3Service.js";
 import pool, {
     testConnection,
@@ -29,11 +30,13 @@ import pool, {
     updateFileUploadStatus,
     updateFileS3Info,
     getAllFiles,
-    updateFileVerification
+    updateFileVerification,
+    userHasJobAccess
 } from "./database.js";
 import { getUserById } from "./database/users.js";
 import { getUserOrganizations } from "./database/userOrganizationMemberships.js";
 import { getUserOrganizationIds, getUserFirstOrganizationId, requireUserFirstOrganizationId } from "./utils/organizationHelpers.js";
+import { checkJobAccess, checkFileAccess } from "./utils/accessControl.js";
 import { initializeDatabase } from "./database/init.js";
 import queueService from "./queue.js";
 import authRoutes from "./routes/auth.js";
@@ -475,7 +478,7 @@ app.get("/jobs", authenticateToken, async (req, res) => {
 
         // Get user's organization IDs (with JWT optimization)
         const organizationIds = await getUserOrganizationIds(req.user);
-
+        console.log({ organizationIds });
         if (organizationIds.length === 0) {
             return res.json({
                 status: "success",
@@ -483,8 +486,12 @@ app.get("/jobs", authenticateToken, async (req, res) => {
             });
         }
 
-        // Get jobs for all organizations the user belongs to
-        const jobs = await listJobsByOrganizations(parseInt(limit), parseInt(offset), organizationIds);
+        // Get jobs for all organizations the user belongs to (any role: owner, admin, member, viewer)
+        const jobs = await listJobsByOrganizations(
+            parseInt(limit),
+            parseInt(offset),
+            organizationIds
+        );
         res.json({
             status: "success",
             jobs
@@ -502,16 +509,10 @@ app.get("/jobs/:id/details", authenticateToken, async (req, res) => {
     try {
         const { id } = req.params;
 
-        // Check if user has access to this job's organization
-        const jobOrgId = await getJobOrganizationId(id);
-        if (jobOrgId) {
-            const userOrganizationIds = await getUserOrganizationIds(req.user);
-            if (!userOrganizationIds.includes(jobOrgId)) {
-                return res.status(403).json({
-                    status: "error",
-                    message: "Access denied to this job"
-                });
-            }
+        // Check if user has access to this job
+        const hasAccess = await checkJobAccess(id, req.user, res);
+        if (!hasAccess) {
+            return; // Error response already sent by checkJobAccess
         }
 
         // Fetch both job details and summary in a single database connection
@@ -540,22 +541,19 @@ app.get("/jobs/:id/details", authenticateToken, async (req, res) => {
 app.get("/jobs/:id", authenticateToken, async (req, res) => {
     try {
         const { id } = req.params;
+
+        // Check if user has access to this job
+        const hasAccess = await checkJobAccess(id, req.user, res);
+        if (!hasAccess) {
+            return; // Error response already sent by checkJobAccess
+        }
+
         const job = await getJobStatus(id, false); // Use lightweight by default
 
         if (!job) {
             return res.status(404).json({
                 status: "error",
                 message: "Job not found"
-            });
-        }
-
-        // Check if user has access to this job's organization (with JWT optimization)
-        const userOrganizationIds = await getUserOrganizationIds(req.user);
-
-        if (job.organization_id && !userOrganizationIds.includes(job.organization_id)) {
-            return res.status(403).json({
-                status: "error",
-                message: "Access denied to this job"
             });
         }
 
@@ -585,22 +583,18 @@ app.put("/jobs/:id/schema", authenticateToken, async (req, res) => {
             });
         }
 
-        // Check if user has access to this job's organization
+        // Check if user has access to this job
+        const hasAccess = await checkJobAccess(id, req.user, res);
+        if (!hasAccess) {
+            return; // Error response already sent by checkJobAccess
+        }
+
+        // Get job to ensure it exists
         const job = await getJobStatus(id);
         if (!job) {
             return res.status(404).json({
                 status: "error",
                 message: "Job not found"
-            });
-        }
-
-        // Check if user has access to this job's organization (with JWT optimization)
-        const userOrganizationIds = await getUserOrganizationIds(req.user);
-
-        if (job.organization_id && !userOrganizationIds.includes(job.organization_id)) {
-            return res.status(403).json({
-                status: "error",
-                message: "Access denied to this job"
             });
         }
 
@@ -752,22 +746,18 @@ app.put("/jobs/:id/config", authenticateToken, async (req, res) => {
             }
         }
 
-        // Check if user has access to this job's organization
+        // Check if user has access to this job
+        const hasAccess = await checkJobAccess(id, req.user, res);
+        if (!hasAccess) {
+            return; // Error response already sent by checkJobAccess
+        }
+
+        // Get job to ensure it exists
         const job = await getJobStatus(id);
         if (!job) {
             return res.status(404).json({
                 status: "error",
                 message: "Job not found"
-            });
-        }
-
-        // Check if user has access to this job's organization
-        const userOrganizationIds = await getUserOrganizationIds(req.user);
-
-        if (job.organization_id && !userOrganizationIds.includes(job.organization_id)) {
-            return res.status(403).json({
-                status: "error",
-                message: "Access denied to this job"
             });
         }
 
@@ -849,29 +839,16 @@ app.get("/files/:id/result", authenticateToken, async (req, res) => {
             }
         }
 
+        // Check if user has access to this file
+        const hasAccess = await checkFileAccess(id, req.user, res);
+        if (!hasAccess) {
+            return; // Error response already sent by checkFileAccess
+        }
+
         if (!file) {
             return res.status(404).json({
                 status: "error",
                 message: "File not found"
-            });
-        }
-
-        // Check if user has access to this file's job organization (lightweight)
-        const jobOrganizationId = await getJobOrganizationId(file.job_id);
-        if (jobOrganizationId === null) {
-            return res.status(404).json({
-                status: "error",
-                message: "Job not found"
-            });
-        }
-
-        // Check if user has access to this file's job organization (with JWT optimization)
-        const userOrganizationIds = await getUserOrganizationIds(req.user);
-
-        if (jobOrganizationId && !userOrganizationIds.includes(jobOrganizationId)) {
-            return res.status(403).json({
-                status: "error",
-                message: "Access denied to this file"
             });
         }
 
@@ -915,23 +892,10 @@ app.get("/files/:id/download", authenticateToken, async (req, res) => {
 
             const file = result.rows[0];
 
-            // Check if user has access to this file's job organization
-            const job = await getJobStatus(file.job_id);
-            if (!job) {
-                return res.status(404).json({
-                    status: "error",
-                    message: "Job not found"
-                });
-            }
-
-            // Check if user has access to this file's job organization (with JWT optimization)
-            const userOrganizationIds = await getUserOrganizationIds(req.user);
-
-            if (job.organization_id && !userOrganizationIds.includes(job.organization_id)) {
-                return res.status(403).json({
-                    status: "error",
-                    message: "Access denied to this file"
-                });
+            // Check if user has access to this file
+            const hasAccess = await checkFileAccess(id, req.user, res);
+            if (!hasAccess) {
+                return; // Error response already sent by checkFileAccess
             }
 
             // If file is stored in S3, generate signed URL
@@ -995,29 +959,16 @@ app.put("/files/:id/results", authenticateToken, async (req, res) => {
 
         // Get file details first
         const file = await getFileResult(id);
+        // Check if user has access to this file
+        const hasAccess = await checkFileAccess(id, req.user, res);
+        if (!hasAccess) {
+            return; // Error response already sent by checkFileAccess
+        }
+
         if (!file) {
             return res.status(404).json({
                 status: "error",
                 message: "File not found"
-            });
-        }
-
-        // Check if user has access to this file's job organization (lightweight)
-        const jobOrganizationId = await getJobOrganizationId(file.job_id);
-        if (jobOrganizationId === null) {
-            return res.status(404).json({
-                status: "error",
-                message: "Job not found"
-            });
-        }
-
-        // Check if user has access to this file's job organization (with JWT optimization)
-        const userOrganizationIds = await getUserOrganizationIds(req.user);
-
-        if (jobOrganizationId && !userOrganizationIds.includes(jobOrganizationId)) {
-            return res.status(403).json({
-                status: "error",
-                message: "Access denied to this file"
             });
         }
 
@@ -1101,6 +1052,170 @@ app.put("/files/:id/results", authenticateToken, async (req, res) => {
         res.status(500).json({
             status: "error",
             message: "Failed to update file results",
+            error: error.message
+        });
+    }
+});
+
+// Get file comments
+app.get("/files/:id/comments", authenticateToken, async (req, res) => {
+    try {
+        const { id: fileId } = req.params;
+
+        // Check if user has access to this file
+        const hasAccess = await checkFileAccess(fileId, req.user, res);
+        if (!hasAccess) {
+            return; // Error response already sent by checkFileAccess
+        }
+
+        // Get file details
+        const file = await getFileResult(fileId);
+        if (!file) {
+            return res.status(404).json({
+                status: "error",
+                message: "File not found"
+            });
+        }
+
+        // Get comments from database
+        const client = await pool.connect();
+        try {
+            const query = `
+                SELECT comments
+                FROM job_files
+                WHERE id = $1
+            `;
+            const result = await client.query(query, [fileId]);
+
+            if (result.rows.length === 0) {
+                return res.status(404).json({
+                    status: "error",
+                    message: "File not found"
+                });
+            }
+
+            const comments = result.rows[0].comments || [];
+
+            res.json({
+                status: "success",
+                data: {
+                    comments: Array.isArray(comments) ? comments : []
+                }
+            });
+
+        } finally {
+            client.release();
+        }
+
+    } catch (error) {
+        console.error('Error fetching file comments:', error);
+        res.status(500).json({
+            status: "error",
+            message: "Failed to fetch comments",
+            error: error.message
+        });
+    }
+});
+
+// Add comment to file
+app.post("/files/:id/comments", authenticateToken, async (req, res) => {
+    try {
+        const { id: fileId } = req.params;
+        const { text } = req.body;
+
+        // Validate input
+        if (!text || typeof text !== 'string' || text.trim().length === 0) {
+            return res.status(400).json({
+                status: "error",
+                message: "Comment text is required and must be a non-empty string"
+            });
+        }
+
+        // Check if user has access to this file
+        const hasAccess = await checkFileAccess(fileId, req.user, res);
+        if (!hasAccess) {
+            return; // Error response already sent by checkFileAccess
+        }
+
+        // Get file details
+        const file = await getFileResult(fileId);
+        if (!file) {
+            return res.status(404).json({
+                status: "error",
+                message: "File not found"
+            });
+        }
+
+        // Get user details
+        const user = await getUserById(req.user.id);
+        if (!user) {
+            return res.status(404).json({
+                status: "error",
+                message: "User not found"
+            });
+        }
+
+        // Create new comment
+        const newComment = {
+            id: uuidv4(),
+            userId: req.user.id,
+            userEmail: req.user.email || user.email,
+            text: text.trim(),
+            createdAt: new Date().toISOString()
+        };
+
+        // Update comments in database
+        const client = await pool.connect();
+        try {
+            // Get existing comments
+            const getQuery = `
+                SELECT comments
+                FROM job_files
+                WHERE id = $1
+            `;
+            const getResult = await client.query(getQuery, [fileId]);
+
+            if (getResult.rows.length === 0) {
+                return res.status(404).json({
+                    status: "error",
+                    message: "File not found"
+                });
+            }
+
+            const existingComments = getResult.rows[0].comments || [];
+            const updatedComments = Array.isArray(existingComments)
+                ? [...existingComments, newComment]
+                : [newComment];
+
+            // Update comments
+            const updateQuery = `
+                UPDATE job_files
+                SET comments = $1, updated_at = NOW()
+                WHERE id = $2
+                RETURNING id, filename
+            `;
+            const updateResult = await client.query(updateQuery, [
+                JSON.stringify(updatedComments),
+                fileId
+            ]);
+
+            res.json({
+                status: "success",
+                message: "Comment added successfully",
+                data: {
+                    comment: newComment
+                }
+            });
+
+        } finally {
+            client.release();
+        }
+
+    } catch (error) {
+        console.error('Error adding file comment:', error);
+        res.status(500).json({
+            status: "error",
+            message: "Failed to add comment",
             error: error.message
         });
     }
@@ -1281,6 +1396,13 @@ app.post("/jobs/:id/files", authenticateToken, upload.array("files", 20), async 
 app.get("/jobs/:id/files", authenticateToken, async (req, res) => {
     try {
         const { id: jobId } = req.params;
+
+        // Check if user has access to this job
+        const hasAccess = await checkJobAccess(jobId, req.user, res);
+        if (!hasAccess) {
+            return; // Error response already sent by checkJobAccess
+        }
+
         const job = await getJobStatus(jobId);
 
         if (!job) {
@@ -1310,13 +1432,10 @@ app.get("/jobs/:id/files/stats", authenticateToken, async (req, res) => {
     try {
         const { id: jobId } = req.params;
 
-        // Verify job exists
-        const job = await getJobStatus(jobId);
-        if (!job) {
-            return res.status(404).json({
-                status: "error",
-                message: "Job not found"
-            });
+        // Check if user has access to this job
+        const hasAccess = await checkJobAccess(jobId, req.user, res);
+        if (!hasAccess) {
+            return; // Error response already sent by checkJobAccess
         }
 
         const stats = await getJobFileStats(jobId);
@@ -1342,13 +1461,10 @@ app.get("/jobs/:id/files/:status", authenticateToken, async (req, res) => {
         const { id: jobId, status } = req.params;
         const { limit = 50, offset = 0 } = req.query;
 
-        // Verify job exists
-        const job = await getJobStatus(jobId);
-        if (!job) {
-            return res.status(404).json({
-                status: "error",
-                message: "Job not found"
-            });
+        // Check if user has access to this job
+        const hasAccess = await checkJobAccess(jobId, req.user, res);
+        if (!hasAccess) {
+            return; // Error response already sent by checkJobAccess
         }
 
         // Validate status
@@ -2016,31 +2132,18 @@ app.delete("/files/:fileId", authenticateToken, async (req, res) => {
     try {
         const { fileId } = req.params;
 
-        // Get file details first
+        // Check if user has access to this file
+        const hasAccess = await checkFileAccess(fileId, req.user, res);
+        if (!hasAccess) {
+            return; // Error response already sent by checkFileAccess
+        }
+
+        // Get file details
         const file = await getFileResult(fileId);
         if (!file) {
             return res.status(404).json({
                 status: "error",
                 message: "File not found"
-            });
-        }
-
-        // Check if user has access to this file's job organization (lightweight)
-        const jobOrganizationId = await getJobOrganizationId(file.job_id);
-        if (jobOrganizationId === null) {
-            return res.status(404).json({
-                status: "error",
-                message: "Job not found"
-            });
-        }
-
-        // Check if user has access to this file's job organization (with JWT optimization)
-        const userOrganizationIds = await getUserOrganizationIds(req.user);
-
-        if (jobOrganizationId && !userOrganizationIds.includes(jobOrganizationId)) {
-            return res.status(403).json({
-                status: "error",
-                message: "Access denied to this file"
             });
         }
 
@@ -2125,14 +2228,15 @@ app.delete("/files", authenticateToken, async (req, res) => {
                         continue;
                     }
 
-                    // Check if user has access to this file's job organization (lightweight)
-                    const jobOrganizationId = await getJobOrganizationId(file.job_id);
-                    if (jobOrganizationId === null) {
-                        errors.push({ fileId, error: "Job not found" });
-                        continue;
-                    }
+                    // Check if user has access to this file's job
+                    const hasAccess = await userHasJobAccess(
+                        file.job_id,
+                        req.user.email,
+                        req.user.role,
+                        userOrganizationIds
+                    );
 
-                    if (jobOrganizationId && !userOrganizationIds.includes(jobOrganizationId)) {
+                    if (!hasAccess) {
                         errors.push({ fileId, error: "Access denied" });
                         continue;
                     }
@@ -2246,13 +2350,6 @@ app.post("/files/reprocess", authenticateToken, async (req, res) => {
         // Get user's organization IDs for access control (with JWT optimization)
         const userOrganizationIds = await getUserOrganizationIds(req.user);
 
-        if (userOrganizationIds.length === 0) {
-            return res.status(403).json({
-                status: "error",
-                message: "User must be part of an organization to reprocess files"
-            });
-        }
-
         const queuedFiles = [];
         const skippedFiles = [];
         const errors = [];
@@ -2271,17 +2368,15 @@ app.post("/files/reprocess", authenticateToken, async (req, res) => {
                     continue;
                 }
 
-                // Check if user has access to this file's job organization (lightweight)
-                const jobOrganizationId = await getJobOrganizationId(file.job_id);
-                if (jobOrganizationId === null) {
-                    skippedFiles.push({
-                        fileId,
-                        reason: "Job not found"
-                    });
-                    continue;
-                }
+                // Check if user has access to this file's job
+                const hasAccess = await userHasJobAccess(
+                    file.job_id,
+                    req.user.email,
+                    req.user.role,
+                    userOrganizationIds
+                );
 
-                if (jobOrganizationId && !userOrganizationIds.includes(jobOrganizationId)) {
+                if (!hasAccess) {
                     skippedFiles.push({
                         fileId,
                         reason: "Access denied"
