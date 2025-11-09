@@ -344,7 +344,8 @@ export async function getJobStatus(jobId, includeLargeColumns = false) {
                    processing_metadata, extraction_error, processing_error, created_at, processed_at,
                    upload_status, upload_error, storage_type, retry_count, last_retry_at,
                    extraction_time_seconds, ai_processing_time_seconds, admin_verified, customer_verified,
-                   pages, page_count, openai_feed_blocked, openai_feed_unblocked, extraction_metadata, source_locations
+                   pages, page_count, openai_feed_blocked, openai_feed_unblocked, extraction_metadata, source_locations,
+                   review_status, reviewed_by, reviewed_at, review_notes
             FROM job_files WHERE job_id = $1
             ORDER BY created_at
         `;
@@ -881,6 +882,7 @@ export async function getFileById(fileId, includeLargeColumns = false) {
                    jf.admin_verified, jf.customer_verified, jf.pages, jf.page_count,
                    jf.openai_feed_blocked, jf.openai_feed_unblocked, jf.extraction_metadata, 
                    jf.source_locations, jf.job_id,
+                   jf.review_status, jf.reviewed_by, jf.reviewed_at, jf.review_notes,
                    j.id as job_id, j.name as job_name, j.schema_data, j.schema_data_array, j.processing_config
             FROM job_files jf
             JOIN jobs j ON jf.job_id = j.id
@@ -939,7 +941,8 @@ export async function getFileResult(fileId) {
                    jf.job_id, j.name as job_name, j.schema_data, j.schema_data_array, jf.upload_status, jf.upload_error, 
                    jf.storage_type, jf.retry_count, jf.last_retry_at, jf.extraction_time_seconds, jf.ai_processing_time_seconds,
                    jf.admin_verified, jf.customer_verified, jf.openai_feed_blocked, jf.openai_feed_unblocked, jf.extraction_metadata,
-                   jf.source_locations, jf.raw_data
+                   jf.source_locations, jf.raw_data,
+                   jf.review_status, jf.reviewed_by, jf.reviewed_at, jf.review_notes
             FROM job_files jf
             JOIN jobs j ON jf.job_id = j.id
             WHERE jf.id = $1
@@ -1004,6 +1007,186 @@ export async function updateFileVerification(fileId, adminVerified = null, custo
         return result.rows[0];
     } catch (error) {
         console.error('❌ Error updating file verification:', error.message);
+        throw error;
+    } finally {
+        client.release();
+    }
+}
+
+// Bulk update file review status
+export async function bulkUpdateFileReviewStatus(fileIds, reviewStatus, reviewedBy = null, reviewNotes = null) {
+    const client = await pool.connect();
+    try {
+        // Validate review status
+        const validStatuses = ['pending', 'in_review', 'reviewed', 'approved', 'rejected'];
+        if (!validStatuses.includes(reviewStatus)) {
+            throw new Error(`Invalid review status. Must be one of: ${validStatuses.join(', ')}`);
+        }
+
+        if (!fileIds || !Array.isArray(fileIds) || fileIds.length === 0) {
+            throw new Error('File IDs array is required');
+        }
+
+        const updates = [];
+        const values = [];
+        let paramCount = 0;
+
+        paramCount++;
+        updates.push(`review_status = $${paramCount}`);
+        values.push(reviewStatus);
+
+        if (reviewedBy !== null) {
+            paramCount++;
+            updates.push(`reviewed_by = $${paramCount}`);
+            values.push(reviewedBy);
+        }
+
+        // Set reviewed_at when status changes to reviewed, approved, or rejected
+        if (['reviewed', 'approved', 'rejected'].includes(reviewStatus)) {
+            updates.push(`reviewed_at = NOW()`);
+        } else if (reviewStatus === 'pending') {
+            updates.push(`reviewed_at = NULL`);
+        }
+
+        if (reviewNotes !== null && reviewNotes !== undefined) {
+            paramCount++;
+            updates.push(`review_notes = $${paramCount}`);
+            values.push(reviewNotes);
+        }
+
+        // Create placeholders for file IDs
+        const fileIdPlaceholders = fileIds.map((_, index) => `$${++paramCount}`).join(',');
+        values.push(...fileIds);
+
+        const query = `
+            UPDATE job_files 
+            SET ${updates.join(', ')}, updated_at = NOW()
+            WHERE id IN (${fileIdPlaceholders})
+            RETURNING id, filename, review_status, reviewed_by, reviewed_at, review_notes, job_id
+        `;
+
+        const result = await client.query(query, values);
+
+        console.log(`✅ Bulk review status updated: ${result.rows.length} files -> ${reviewStatus}${reviewedBy ? ` by ${reviewedBy}` : ''}`);
+        return result.rows;
+    } catch (error) {
+        console.error('❌ Error bulk updating file review status:', error.message);
+        throw error;
+    } finally {
+        client.release();
+    }
+}
+
+// Bulk update file verification status
+export async function bulkUpdateFileVerification(fileIds, adminVerified = null, customerVerified = null) {
+    const client = await pool.connect();
+    try {
+        if (!fileIds || !Array.isArray(fileIds) || fileIds.length === 0) {
+            throw new Error('File IDs array is required');
+        }
+
+        const updates = [];
+        const values = [];
+        let paramCount = 0;
+
+        if (adminVerified !== null) {
+            paramCount++;
+            updates.push(`admin_verified = $${paramCount}`);
+            values.push(adminVerified);
+        }
+
+        if (customerVerified !== null) {
+            paramCount++;
+            updates.push(`customer_verified = $${paramCount}`);
+            values.push(customerVerified);
+        }
+
+        if (updates.length === 0) {
+            throw new Error('At least one verification field must be provided');
+        }
+
+        // Create placeholders for file IDs
+        const fileIdPlaceholders = fileIds.map((_, index) => `$${++paramCount}`).join(',');
+        values.push(...fileIds);
+
+        const query = `
+            UPDATE job_files 
+            SET ${updates.join(', ')}, updated_at = NOW()
+            WHERE id IN (${fileIdPlaceholders})
+            RETURNING id, filename, admin_verified, customer_verified, job_id
+        `;
+
+        const result = await client.query(query, values);
+
+        console.log(`✅ Bulk verification updated: ${result.rows.length} files - admin: ${adminVerified}, customer: ${customerVerified}`);
+        return result.rows;
+    } catch (error) {
+        console.error('❌ Error bulk updating file verification:', error.message);
+        throw error;
+    } finally {
+        client.release();
+    }
+}
+
+// Update file review status
+export async function updateFileReviewStatus(fileId, reviewStatus, reviewedBy = null, reviewNotes = null) {
+    const client = await pool.connect();
+    try {
+        // Validate review status
+        const validStatuses = ['pending', 'in_review', 'reviewed', 'approved', 'rejected'];
+        if (!validStatuses.includes(reviewStatus)) {
+            throw new Error(`Invalid review status. Must be one of: ${validStatuses.join(', ')}`);
+        }
+
+        const updates = [];
+        const values = [];
+        let paramCount = 0;
+
+        paramCount++;
+        updates.push(`review_status = $${paramCount}`);
+        values.push(reviewStatus);
+
+        if (reviewedBy !== null) {
+            paramCount++;
+            updates.push(`reviewed_by = $${paramCount}`);
+            values.push(reviewedBy);
+        }
+
+        // Set reviewed_at when status changes to reviewed, approved, or rejected
+        // Note: Don't increment paramCount for SQL literals (NOW(), NULL)
+        if (['reviewed', 'approved', 'rejected'].includes(reviewStatus)) {
+            updates.push(`reviewed_at = NOW()`);
+        } else if (reviewStatus === 'pending') {
+            // Reset reviewed_at when going back to pending
+            updates.push(`reviewed_at = NULL`);
+        }
+
+        if (reviewNotes !== null && reviewNotes !== undefined) {
+            paramCount++;
+            updates.push(`review_notes = $${paramCount}`);
+            values.push(reviewNotes);
+        }
+
+        paramCount++;
+        values.push(fileId);
+
+        const query = `
+            UPDATE job_files 
+            SET ${updates.join(', ')}, updated_at = NOW()
+            WHERE id = $${paramCount}
+            RETURNING id, filename, review_status, reviewed_by, reviewed_at, review_notes
+        `;
+
+        const result = await client.query(query, values);
+
+        if (result.rows.length === 0) {
+            throw new Error('File not found');
+        }
+
+        console.log(`✅ File review status updated: ${fileId} -> ${reviewStatus}${reviewedBy ? ` by ${reviewedBy}` : ''}`);
+        return result.rows[0];
+    } catch (error) {
+        console.error('❌ Error updating file review status:', error.message);
         throw error;
     } finally {
         client.release();
@@ -1133,6 +1316,10 @@ export async function getAllFiles(limit = 50, offset = 0, status = null, jobId =
                 jf.openai_feed_unblocked,
                 jf.extraction_metadata,
                 jf.source_locations,
+                jf.review_status,
+                jf.reviewed_by,
+                jf.reviewed_at,
+                jf.review_notes,
                 COALESCE(
                     JSON_AGG(
                         CASE 
