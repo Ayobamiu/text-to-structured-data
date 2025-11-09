@@ -1224,75 +1224,7 @@ app.post("/files/:id/comments", authenticateToken, async (req, res) => {
     }
 });
 
-// Update file review status
-app.put("/files/:id/review", authenticateToken, async (req, res) => {
-    try {
-        const { id: fileId } = req.params;
-        const { reviewStatus, reviewNotes } = req.body;
-
-        // Validate input
-        const validStatuses = ['pending', 'in_review', 'reviewed', 'approved', 'rejected'];
-        if (!reviewStatus || !validStatuses.includes(reviewStatus)) {
-            return res.status(400).json({
-                status: "error",
-                message: `Invalid review status. Must be one of: ${validStatuses.join(', ')}`
-            });
-        }
-
-        // Check if user has access to this file
-        const hasAccess = await checkFileAccess(fileId, req.user, res);
-        if (!hasAccess) {
-            return; // Error response already sent by checkFileAccess
-        }
-
-        // Get file details
-        const file = await getFileResult(fileId);
-        if (!file) {
-            return res.status(404).json({
-                status: "error",
-                message: "File not found"
-            });
-        }
-
-        // Update review status
-        const result = await updateFileReviewStatus(
-            fileId,
-            reviewStatus,
-            req.user.id, // reviewed_by
-            reviewNotes || null
-        );
-
-        // Emit file update event via WebSocket
-        const updateEvent = {
-            jobId: file.job_id,
-            fileId: result.id,
-            filename: result.filename,
-            review_status: result.review_status,
-            reviewed_by: result.reviewed_by,
-            reviewed_at: result.reviewed_at,
-            message: `File review status updated to ${reviewStatus} for ${result.filename}`,
-            timestamp: new Date().toISOString()
-        };
-        console.log(`📡 Emitting file-status-update for review:`, updateEvent);
-        io.to(`job-${file.job_id}`).emit('file-status-update', updateEvent);
-
-        res.json({
-            status: "success",
-            message: "File review status updated successfully",
-            data: result
-        });
-
-    } catch (error) {
-        console.error('Error updating file review status:', error);
-        res.status(500).json({
-            status: "error",
-            message: "Failed to update file review status",
-            error: error.message
-        });
-    }
-});
-
-// Bulk update file review status
+// Bulk update file review status (MUST be before /files/:id/review to avoid route conflict)
 app.put("/files/bulk/review", authenticateToken, async (req, res) => {
     try {
         const { fileIds, reviewStatus, reviewNotes } = req.body;
@@ -1397,7 +1329,7 @@ app.put("/files/bulk/review", authenticateToken, async (req, res) => {
     }
 });
 
-// Bulk update file verification status
+// Bulk update file verification status (MUST be before /files/:id/verify to avoid route conflict)
 app.put("/files/bulk/verify", authenticateToken, requireRole('admin'), async (req, res) => {
     try {
         const { fileIds, adminVerified, customerVerified } = req.body;
@@ -1501,6 +1433,74 @@ app.put("/files/bulk/verify", authenticateToken, requireRole('admin'), async (re
         res.status(500).json({
             status: "error",
             message: "Failed to bulk update file verification",
+            error: error.message
+        });
+    }
+});
+
+// Update file review status
+app.put("/files/:id/review", authenticateToken, async (req, res) => {
+    try {
+        const { id: fileId } = req.params;
+        const { reviewStatus, reviewNotes } = req.body;
+
+        // Validate input
+        const validStatuses = ['pending', 'in_review', 'reviewed', 'approved', 'rejected'];
+        if (!reviewStatus || !validStatuses.includes(reviewStatus)) {
+            return res.status(400).json({
+                status: "error",
+                message: `Invalid review status. Must be one of: ${validStatuses.join(', ')}`
+            });
+        }
+
+        // Check if user has access to this file
+        const hasAccess = await checkFileAccess(fileId, req.user, res);
+        if (!hasAccess) {
+            return; // Error response already sent by checkFileAccess
+        }
+
+        // Get file details
+        const file = await getFileResult(fileId);
+        if (!file) {
+            return res.status(404).json({
+                status: "error",
+                message: "File not found"
+            });
+        }
+
+        // Update review status
+        const result = await updateFileReviewStatus(
+            fileId,
+            reviewStatus,
+            req.user.id, // reviewed_by
+            reviewNotes || null
+        );
+
+        // Emit file update event via WebSocket
+        const updateEvent = {
+            jobId: file.job_id,
+            fileId: result.id,
+            filename: result.filename,
+            review_status: result.review_status,
+            reviewed_by: result.reviewed_by,
+            reviewed_at: result.reviewed_at,
+            message: `File review status updated to ${reviewStatus} for ${result.filename}`,
+            timestamp: new Date().toISOString()
+        };
+        console.log(`📡 Emitting file-status-update for review:`, updateEvent);
+        io.to(`job-${file.job_id}`).emit('file-status-update', updateEvent);
+
+        res.json({
+            status: "success",
+            message: "File review status updated successfully",
+            data: result
+        });
+
+    } catch (error) {
+        console.error('Error updating file review status:', error);
+        res.status(500).json({
+            status: "error",
+            message: "Failed to update file review status",
             error: error.message
         });
     }
