@@ -41,9 +41,12 @@ class ExtractionService {
 
             const FormData = (await import('form-data')).default;
             const formData = new FormData();
+            // Determine content type based on file extension
+            const isImage = /\.(png|jpg|jpeg|gif|bmp|tiff|tif|webp)$/i.test(filename);
+            const contentType = isImage ? "image/*" : "application/pdf";
             formData.append("file", fs.createReadStream(filePath), {
                 filename: filename,
-                contentType: "application/pdf",
+                contentType: contentType,
             });
 
             // Add extraction method parameter

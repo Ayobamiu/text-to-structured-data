@@ -1206,6 +1206,7 @@ app.post("/jobs/:id/files", authenticateToken, upload.array("files", 20), async 
 
             let pageCount = null;
             const isPdf = file.mimetype === 'application/pdf' || file.originalname?.toLowerCase().endsWith('.pdf');
+            const isImage = file.mimetype?.startsWith('image/') || /\.(png|jpg|jpeg|gif|bmp|tiff|tif|webp)$/i.test(file.originalname || '');
 
             if (s3Service.isCloudStorageEnabled()) {
                 try {
@@ -1222,6 +1223,9 @@ app.post("/jobs/:id/files", authenticateToken, upload.array("files", 20), async 
 
             if (isPdf) {
                 pageCount = await getPdfPageCount(file.path);
+            } else if (isImage) {
+                // Images are treated as single-page documents
+                pageCount = 1;
             }
 
             // Add file record to database
@@ -1912,6 +1916,7 @@ app.post("/extract", authenticateToken, upload.array("files", 20), async (req, r
 
             let pageCount = null;
             const isPdf = file.mimetype === 'application/pdf' || file.originalname?.toLowerCase().endsWith('.pdf');
+            const isImage = file.mimetype?.startsWith('image/') || /\.(png|jpg|jpeg|gif|bmp|tiff|tif|webp)$/i.test(file.originalname || '');
 
             if (s3Service.isCloudStorageEnabled()) {
                 try {
@@ -1929,6 +1934,9 @@ app.post("/extract", authenticateToken, upload.array("files", 20), async (req, r
 
             if (isPdf) {
                 pageCount = await getPdfPageCount(file.path);
+            } else if (isImage) {
+                // Images are treated as single-page documents
+                pageCount = 1;
             }
 
             // Create file record

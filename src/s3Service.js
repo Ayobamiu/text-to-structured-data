@@ -101,10 +101,14 @@ class S3Service {
     getContentType(filename) {
         const ext = path.extname(filename).toLowerCase();
         const contentTypes = {
+            '.pdf': 'application/pdf',
             '.png': 'image/png',
             '.jpg': 'image/jpeg',
             '.jpeg': 'image/jpeg',
             '.gif': 'image/gif',
+            '.bmp': 'image/bmp',
+            '.tiff': 'image/tiff',
+            '.tif': 'image/tiff',
             '.svg': 'image/svg+xml',
             '.webp': 'image/webp'
         };
@@ -319,13 +323,26 @@ class S3Service {
             'application/pdf',
             'text/plain',
             'application/msword',
-            'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+            'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+            // Image types
+            'image/png',
+            'image/jpeg',
+            'image/jpg',
+            'image/gif',
+            'image/bmp',
+            'image/tiff',
+            'image/tif',
+            'image/webp'
         ];
 
         const maxSize = 50 * 1024 * 1024; // 50MB
 
-        if (!allowedTypes.includes(file.mimetype)) {
-            throw new Error(`File type ${file.mimetype} not allowed`);
+        // Also check file extension as fallback (some uploads may have incorrect MIME types)
+        const ext = path.extname(file.originalname || '').toLowerCase();
+        const allowedExtensions = ['.pdf', '.txt', '.doc', '.docx', '.png', '.jpg', '.jpeg', '.gif', '.bmp', '.tiff', '.tif', '.webp'];
+        
+        if (!allowedTypes.includes(file.mimetype) && !allowedExtensions.includes(ext)) {
+            throw new Error(`File type ${file.mimetype} (${ext}) not allowed. Allowed types: PDF, DOC, DOCX, TXT, PNG, JPG, JPEG, GIF, BMP, TIFF, TIF, WEBP`);
         }
 
         if (file.size > maxSize) {
