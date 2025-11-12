@@ -393,16 +393,63 @@ class FileProcessorWorker {
 
                 console.log(`✅ Extraction completed for ${file.filename}. Proceeding to AI processing.`);
 
-                // Update extraction status for both modes
+                // Prepare data for database update
+                const pages = extractionResult.pages || [];
+                const tables = extractionResult.tables || [];
+
+                // Extract page count - pages could be array, number, or object
+                // Preserve existing page_count if available, otherwise calculate from extraction result
+                let pageCount = file.page_count || null;
+                let pagesToStore = null;
+                if (Array.isArray(pages) && pages.length > 0) {
+                    pageCount = pages.length; // Use extracted page count
+                    // Store the array if it has content
+                    pagesToStore = pages;
+                } else if (typeof pages === 'number') {
+                    pageCount = pages; // Use extracted page count
+                    pagesToStore = pages;
+                }
+
+                // Extract OpenAI feed data (if available, e.g., from PaddleOCR)
+                const openaiFeedBlocked = extractionResult.openai_feed?.blocked || null;
+                const openaiFeedUnblocked = extractionResult.openai_feed?.unblocked || null;
+
+                // Extract extraction metadata
+                const extractionMetadata = extractionResult.metadata ? {
+                    ...extractionResult.metadata,
+                    extraction_time_seconds: extractionResult.metadata.extraction_time_seconds || extractionResult.extraction_time_seconds || extractionResult.extractionTimeSeconds || null,
+                } : {
+                    extraction_method: extractionResult.method || null,
+                    extraction_time_seconds: extractionResult.extraction_time_seconds || extractionResult.extractionTimeSeconds || null,
+                    total_pages: pageCount || null,
+                    total_tables: (extractionResult.tables || [])?.length || null,
+                    text_length: (extractionResult.text || '')?.length || null,
+                    markdown_length: (extractionResult.markdown || '')?.length || null,
+                };
+
+                // Add OpenAI feed lengths if available
+                if (openaiFeedBlocked) {
+                    extractionMetadata.openai_feed_blocked_length = openaiFeedBlocked.length;
+                }
+                if (openaiFeedUnblocked) {
+                    extractionMetadata.openai_feed_unblocked_length = openaiFeedUnblocked.length;
+                }
+
+                // Update extraction status for both modes with all fields
                 await updateFileExtractionStatus(
                     file.id,
                     'completed',
-                    extractionResult.text,
-                    extractionResult.tables,
-                    extractionResult.markdown,
-                    extractionResult.pages,
-                    null,
-                    extractionResult.extractionTimeSeconds
+                    extractionResult.text || null,
+                    Array.isArray(tables) && tables.length > 0 ? tables : null,
+                    extractionResult.markdown || null,
+                    pagesToStore,
+                    null, // error
+                    extractionResult.extraction_time_seconds || extractionResult.extractionTimeSeconds || null,
+                    openaiFeedBlocked,
+                    openaiFeedUnblocked,
+                    extractionMetadata,
+                    extractionResult.raw_data || null,
+                    pageCount // Preserve or update page_count from extraction result
                 );
 
                 console.log(`✅ File ${file.filename} extraction completed`);
@@ -612,7 +659,7 @@ class FileProcessorWorker {
                 }
             }
 
-            console.log('🔍 Processed schemaData:', schemaData);
+            // console.log('🔍 Processed schemaData:', schemaData);
 
             // Validate schema structure
             if (!schemaData || !schemaData.schema) {

@@ -1978,7 +1978,7 @@ async function processFilesAsync(job, files, schema, schemaName, processingConfi
                     openaiFeedBlocked,
                     openaiFeedUnblocked,
                     extractionMetadata,
-                    null, // rawData
+                    extractionResult.raw_data || null, // rawData from extraction result
                     pageCount // Preserve or update page_count from extraction result
                 );
 
