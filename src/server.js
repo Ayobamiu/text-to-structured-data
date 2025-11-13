@@ -1034,7 +1034,7 @@ app.put("/files/:id/results", authenticateToken, async (req, res) => {
             });
 
             // Create log entry for the update
-            await createLogAndEmit(file.job_id, updatedFile.id, 'info', `File results updated for ${updatedFile.filename}`, updatedFile.filename);
+            // await createLogAndEmit(file.job_id, updatedFile.id, 'info', `File results updated for ${updatedFile.filename}`, updatedFile.filename);
 
             res.json({
                 status: "success",
@@ -1659,6 +1659,20 @@ app.post("/jobs/:id/files", authenticateToken, upload.array("files", 20), async 
             fs.unlink(file.path, (err) => {
                 if (err) console.error('Error deleting file:', err);
             });
+        }
+
+        // Emit socket events for each newly added file to notify frontend immediately
+        for (const fileRecord of addedFiles) {
+            io.to(`job-${jobId}`).emit('file-status-update', {
+                jobId,
+                fileId: fileRecord.id,
+                filename: fileRecord.filename,
+                extraction_status: 'pending',
+                processing_status: 'pending',
+                message: `File ${fileRecord.filename} added to job`,
+                timestamp: new Date().toISOString()
+            });
+            console.log(`📡 Emitted file-status-update for newly added file: ${fileRecord.id} - ${fileRecord.filename}`);
         }
 
         res.json({
@@ -2372,6 +2386,18 @@ app.post("/extract", authenticateToken, upload.array("files", 20), async (req, r
                     expiresAt: s3FileInfo.expiresAt
                 } : null
             });
+
+            // Emit socket event for each newly created file to notify frontend immediately
+            io.to(`job-${job.id}`).emit('file-status-update', {
+                jobId: job.id,
+                fileId: fileRecord.id,
+                filename: file.originalname,
+                extraction_status: 'pending',
+                processing_status: 'pending',
+                message: `File ${file.originalname} added to job`,
+                timestamp: new Date().toISOString()
+            });
+            console.log(`📡 Emitted file-status-update for newly created file: ${fileRecord.id} - ${file.originalname}`);
         }
 
         // Return jobId and file information immediately for better UX
