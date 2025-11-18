@@ -1438,6 +1438,136 @@ app.put("/files/bulk/verify", authenticateToken, requireRole('admin'), async (re
     }
 });
 
+// Bulk update file review and verification status (MUST be before /files/:id/review to avoid route conflict)
+app.put("/files/bulk/review-and-verify", authenticateToken, requireRole('admin'), async (req, res) => {
+    try {
+        const { fileIds, reviewStatus, adminVerified, reviewNotes } = req.body;
+
+        // Validate input
+        if (!fileIds || !Array.isArray(fileIds) || fileIds.length === 0) {
+            return res.status(400).json({
+                status: "error",
+                message: "File IDs array is required"
+            });
+        }
+
+        const validStatuses = ['pending', 'in_review', 'reviewed', 'approved', 'rejected'];
+        if (!reviewStatus || !validStatuses.includes(reviewStatus)) {
+            return res.status(400).json({
+                status: "error",
+                message: `Invalid review status. Must be one of: ${validStatuses.join(', ')}`
+            });
+        }
+
+        if (adminVerified === undefined) {
+            return res.status(400).json({
+                status: "error",
+                message: "adminVerified is required"
+            });
+        }
+
+        // Get user's organization IDs for access control
+        const userOrganizationIds = await getUserOrganizationIds(req.user);
+
+        // Check access for all files
+        const accessibleFileIds = [];
+        const deniedFileIds = [];
+
+        for (const fileId of fileIds) {
+            try {
+                const file = await getFileResult(fileId);
+                if (!file) {
+                    deniedFileIds.push({ fileId, error: "File not found" });
+                    continue;
+                }
+
+                const hasAccess = await userHasJobAccess(
+                    file.job_id,
+                    req.user.email,
+                    req.user.role,
+                    userOrganizationIds
+                );
+
+                if (hasAccess) {
+                    accessibleFileIds.push(fileId);
+                } else {
+                    deniedFileIds.push({ fileId, error: "Access denied" });
+                }
+            } catch (error) {
+                deniedFileIds.push({ fileId, error: error.message });
+            }
+        }
+
+        if (accessibleFileIds.length === 0) {
+            return res.status(403).json({
+                status: "error",
+                message: "No accessible files found",
+                data: { denied: deniedFileIds }
+            });
+        }
+
+        // Bulk update both review status and verification
+        const [reviewedFiles, verifiedFiles] = await Promise.all([
+            bulkUpdateFileReviewStatus(
+                accessibleFileIds,
+                reviewStatus,
+                req.user.id, // reviewed_by
+                reviewNotes || null
+            ),
+            bulkUpdateFileVerification(
+                accessibleFileIds,
+                adminVerified,
+                null // customerVerified - not updating this
+            )
+        ]);
+
+        // Combine results - both operations should return the same files
+        const updatedFiles = reviewedFiles.map(reviewedFile => {
+            const verifiedFile = verifiedFiles.find(vf => vf.id === reviewedFile.id);
+            return {
+                ...reviewedFile,
+                admin_verified: verifiedFile ? verifiedFile.admin_verified : null,
+                customer_verified: verifiedFile ? verifiedFile.customer_verified : null
+            };
+        });
+
+        // Emit WebSocket events for each updated file
+        for (const file of updatedFiles) {
+            const updateEvent = {
+                jobId: file.job_id,
+                fileId: file.id,
+                filename: file.filename,
+                review_status: file.review_status,
+                reviewed_by: file.reviewed_by,
+                reviewed_at: file.reviewed_at,
+                admin_verified: file.admin_verified,
+                customer_verified: file.customer_verified,
+                message: `File review and verification updated for ${file.filename}`,
+                timestamp: new Date().toISOString()
+            };
+            console.log(`📡 Emitting file-status-update for review-and-verify:`, updateEvent);
+            io.to(`job-${file.job_id}`).emit('file-status-update', updateEvent);
+        }
+
+        res.json({
+            status: "success",
+            message: `Review and verification updated for ${updatedFiles.length} file(s)`,
+            data: {
+                updated: updatedFiles,
+                denied: deniedFileIds.length > 0 ? deniedFileIds : undefined
+            }
+        });
+
+    } catch (error) {
+        console.error('Error bulk updating file review and verification:', error);
+        res.status(500).json({
+            status: "error",
+            message: "Failed to bulk update file review and verification",
+            error: error.message
+        });
+    }
+});
+
 // Update file review status
 app.put("/files/:id/review", authenticateToken, async (req, res) => {
     try {
