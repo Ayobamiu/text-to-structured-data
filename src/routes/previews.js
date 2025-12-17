@@ -16,9 +16,11 @@ import {
     addItemsToPreview,
     removeItemsFromPreview,
     getJobFilesForPreview,
+    getJobFilesForPreviewPaginated,
     getAvailableJobFiles,
     getPreviewsForFile,
-    isFileInPreview
+    isFileInPreview,
+    getPreviewStatistics
 } from '../database/previewDataTable.js';
 import mgsDataService from '../services/mgsDataService.js';
 
@@ -102,10 +104,10 @@ router.get('/:id', async (req, res) => {
 });
 
 /**
- * GET /previews/:id/data
- * Get preview data with job files results
+ * GET /previews/:id/statistics
+ * Get summary statistics for all items in a preview (not paginated)
  */
-router.get('/:id/data', async (req, res) => {
+router.get('/:id/statistics', async (req, res) => {
     try {
         const { id } = req.params;
         const preview = await getPreviewDataTableById(id);
@@ -117,14 +119,79 @@ router.get('/:id/data', async (req, res) => {
             });
         }
 
-        // Get job files data
-        const jobFiles = await getJobFilesForPreview(preview.items_ids);
+        // Get statistics for all items
+        const statistics = await getPreviewStatistics(preview.items_ids || []);
+
+        res.json({
+            success: true,
+            data: statistics
+        });
+    } catch (error) {
+        console.error('Error fetching preview statistics:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Failed to fetch preview statistics',
+            error: error.message
+        });
+    }
+});
+
+/**
+ * GET /previews/:id/data
+ * Get preview data with job files results (paginated)
+ * Query params: page (default: 1), pageSize (default: 20), search (optional)
+ */
+router.get('/:id/data', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { page = '1', pageSize = '20', search = null } = req.query;
+        
+        const preview = await getPreviewDataTableById(id);
+
+        if (!preview) {
+            return res.status(404).json({
+                success: false,
+                message: 'Preview not found'
+            });
+        }
+
+        // Parse pagination params
+        const pageNum = parseInt(page, 10) || 1;
+        const pageSizeNum = parseInt(pageSize, 10) || 20;
+        
+        // Validate pagination params
+        if (pageNum < 1) {
+            return res.status(400).json({
+                success: false,
+                message: 'Page must be greater than 0'
+            });
+        }
+        if (pageSizeNum < 1 || pageSizeNum > 100) {
+            return res.status(400).json({
+                success: false,
+                message: 'Page size must be between 1 and 100'
+            });
+        }
+
+        // Get paginated job files data
+        const result = await getJobFilesForPreviewPaginated(
+            preview.items_ids || [],
+            pageNum,
+            pageSizeNum,
+            search || null
+        );
 
         res.json({
             success: true,
             data: {
                 preview,
-                jobFiles
+                jobFiles: result.files,
+                pagination: {
+                    total: result.total,
+                    page: result.page,
+                    pageSize: result.pageSize,
+                    totalPages: Math.ceil(result.total / result.pageSize)
+                }
             }
         });
     } catch (error) {
