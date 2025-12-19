@@ -829,19 +829,6 @@ app.get("/files/:id/result", authenticateToken, async (req, res) => {
         const { id } = req.params;
         const file = await getFileResult(id);
 
-        // Extract pages from raw_data if available
-        let pages = null;
-        if (file?.raw_data && typeof file.raw_data === 'object' && file.raw_data.pages) {
-            pages = file.raw_data.pages;
-        } else if (file?.raw_data && typeof file.raw_data === 'string') {
-            try {
-                const parsed = JSON.parse(file.raw_data);
-                pages = parsed.pages || null;
-            } catch (e) {
-                // Ignore parsing errors
-            }
-        }
-
         // Check if user has access to this file
         const hasAccess = await checkFileAccess(id, req.user, res);
         if (!hasAccess) {
@@ -857,10 +844,7 @@ app.get("/files/:id/result", authenticateToken, async (req, res) => {
 
         res.json({
             status: "success",
-            file: {
-                ...file,
-                pages: pages || file.pages || null
-            }
+            file: file
         });
     } catch (error) {
         res.status(500).json({

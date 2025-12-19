@@ -223,7 +223,7 @@ export async function getJobDetailsWithSummary(jobId) {
         // Run both queries in parallel on the same connection
         const [jobResult, summaryResult] = await Promise.all([
             client.query(`
-                SELECT id, name, status, schema_data, schema_data_array, user_id, organization_id, 
+                SELECT id, name, status, schema_data, user_id, organization_id, 
                        created_at, updated_at, extraction_mode, processing_config
                 FROM jobs WHERE id = $1
             `, [jobId]),
@@ -323,7 +323,7 @@ export async function getJobStatus(jobId, includeLargeColumns = false) {
 
         // Get job details
         const jobQuery = `
-            SELECT id, name, status, schema_data, schema_data_array, summary, user_id, organization_id, created_at, updated_at, extraction_mode, processing_config
+            SELECT id, name, status, schema_data, summary, user_id, organization_id, created_at, updated_at, extraction_mode, processing_config
             FROM jobs WHERE id = $1
         `;
         const jobResult = await client.query(jobQuery, [jobId]);
@@ -333,9 +333,9 @@ export async function getJobStatus(jobId, includeLargeColumns = false) {
         }
 
         // Get job files - exclude large columns unless explicitly requested
-        // Large columns: extracted_text, markdown, result, actual_result, raw_data
+        // Large columns: actual_result, extracted_text, extracted_tables, pages, openai_feed_blocked, openai_feed_unblocked, source_locations, raw_data
         const largeColumns = includeLargeColumns
-            ? 'extracted_text, extracted_tables, markdown, result, actual_result, raw_data,'
+            ? 'actual_result, extracted_text, extracted_tables, pages, openai_feed_blocked, openai_feed_unblocked, source_locations, raw_data,'
             : '';
 
         const filesQuery = `
@@ -344,7 +344,7 @@ export async function getJobStatus(jobId, includeLargeColumns = false) {
                    processing_metadata, extraction_error, processing_error, created_at, processed_at,
                    upload_status, upload_error, storage_type, retry_count, last_retry_at,
                    extraction_time_seconds, ai_processing_time_seconds, admin_verified, customer_verified,
-                   pages, page_count, openai_feed_blocked, openai_feed_unblocked, extraction_metadata, source_locations,
+                   page_count, extraction_metadata,
                    review_status, reviewed_by, reviewed_at, review_notes
             FROM job_files WHERE job_id = $1
             ORDER BY created_at
@@ -868,8 +868,9 @@ export async function getFileById(fileId, includeLargeColumns = false) {
     try {
         // Set statement timeout for this connection (30 seconds)
         await client.query('SET statement_timeout = 30000');
+        // Large columns: actual_result, extracted_text, extracted_tables, pages, openai_feed_blocked, openai_feed_unblocked, source_locations, raw_data
         const largeColumns = includeLargeColumns
-            ? 'extracted_text, extracted_tables, markdown, result, actual_result, raw_data,'
+            ? 'jf.actual_result, jf.extracted_text, jf.extracted_tables, jf.pages, jf.openai_feed_blocked, jf.openai_feed_unblocked, jf.source_locations, jf.raw_data,'
             : '';
 
         const query = `
@@ -879,11 +880,10 @@ export async function getFileById(fileId, includeLargeColumns = false) {
                    jf.created_at, jf.processed_at, jf.upload_status, jf.upload_error, 
                    jf.storage_type, jf.retry_count, jf.last_retry_at,
                    jf.extraction_time_seconds, jf.ai_processing_time_seconds, 
-                   jf.admin_verified, jf.customer_verified, jf.pages, jf.page_count,
-                   jf.openai_feed_blocked, jf.openai_feed_unblocked, jf.extraction_metadata, 
-                   jf.source_locations, jf.job_id,
+                   jf.admin_verified, jf.customer_verified, jf.page_count,
+                   jf.extraction_metadata, jf.job_id,
                    jf.review_status, jf.reviewed_by, jf.reviewed_at, jf.review_notes,
-                   j.id as job_id, j.name as job_name, j.schema_data, j.schema_data_array, j.processing_config
+                   j.id as job_id, j.name as job_name, j.schema_data, j.processing_config
             FROM job_files jf
             JOIN jobs j ON jf.job_id = j.id
             WHERE jf.id = $1
@@ -931,17 +931,16 @@ export async function getFileById(fileId, includeLargeColumns = false) {
     }
 }
 
-// Get file result (includes all large columns)
+// Get file result (optimized - excludes large columns: actual_result, extracted_text, extracted_tables, pages, raw_data, source_locations)
 export async function getFileResult(fileId) {
     const client = await pool.connect();
     try {
         const query = `
-            SELECT jf.id, jf.filename, jf.result, jf.actual_result, jf.extracted_text, jf.extracted_tables, jf.pages, jf.page_count, jf.markdown,
+            SELECT jf.id, jf.filename, jf.result, jf.page_count, jf.markdown,
                    jf.extraction_status, jf.processing_status, jf.extraction_error, jf.processing_error, jf.processed_at,
-                   jf.job_id, j.name as job_name, j.schema_data, j.schema_data_array, jf.upload_status, jf.upload_error, 
+                   jf.job_id, j.name as job_name, j.schema_data, jf.upload_status, jf.upload_error, 
                    jf.storage_type, jf.retry_count, jf.last_retry_at, jf.extraction_time_seconds, jf.ai_processing_time_seconds,
-                   jf.admin_verified, jf.customer_verified, jf.openai_feed_blocked, jf.openai_feed_unblocked, jf.extraction_metadata,
-                   jf.source_locations, jf.raw_data,
+                   jf.admin_verified, jf.customer_verified, jf.extraction_metadata,
                    jf.review_status, jf.reviewed_by, jf.reviewed_at, jf.review_notes
             FROM job_files jf
             JOIN jobs j ON jf.job_id = j.id
@@ -1225,7 +1224,8 @@ export async function closePool() {
 
 // Get all files across all jobs with pagination
 // Returns files from jobs in organizations the user is a member of (any role)
-export async function getAllFiles(limit = 50, offset = 0, status = null, jobId = null, organizationIds = null) {
+// OPTIMIZED: Excludes large columns (extracted_text, markdown, result, etc.) by default to reduce egress
+export async function getAllFiles(limit = 50, offset = 0, status = null, jobId = null, organizationIds = null, includeLargeColumns = false) {
     const client = await pool.connect();
     try {
         // Build base query conditions
@@ -1287,7 +1287,16 @@ export async function getAllFiles(limit = 50, offset = 0, status = null, jobId =
             pending: parseInt(countResult.rows[0].pending)
         };
 
+        // Large columns that should only be fetched when explicitly needed
+        // These columns can be very large (extracted_text can be MBs per file)
+        // Large columns: actual_result, extracted_text, extracted_tables, pages, openai_feed_blocked, openai_feed_unblocked, source_locations, raw_data
+        // Note: result and markdown are always included
+        const largeColumns = includeLargeColumns
+            ? 'jf.actual_result, jf.extracted_text, jf.extracted_tables, jf.pages, jf.openai_feed_blocked, jf.openai_feed_unblocked, jf.source_locations, jf.raw_data,'
+            : '';
+
         // Get paginated files with preview data
+        // Always include result and markdown
         const filesQuery = `
             SELECT 
                 jf.id,
@@ -1301,21 +1310,16 @@ export async function getAllFiles(limit = 50, offset = 0, status = null, jobId =
                 jf.processed_at,
                 jf.job_id,
                 j.name as job_name,
+                j.extraction_mode as job_extraction_mode,
                 jf.result,
-                jf.actual_result,
+                jf.markdown,
+                ${largeColumns}
                 jf.extraction_error,
                 jf.processing_error,
-                jf.extracted_text, 
-                jf.extracted_tables, 
-                jf.pages, 
                 jf.page_count,
-                jf.markdown,
                 jf.admin_verified,
                 jf.customer_verified,
-                jf.openai_feed_blocked,
-                jf.openai_feed_unblocked,
                 jf.extraction_metadata,
-                jf.source_locations,
                 jf.review_status,
                 jf.reviewed_by,
                 jf.reviewed_at,
@@ -1340,8 +1344,8 @@ export async function getAllFiles(limit = 50, offset = 0, status = null, jobId =
             ${whereConditions}
             GROUP BY jf.id, jf.filename, jf.size, jf.extraction_status, jf.processing_status,
                      jf.extraction_time_seconds, jf.ai_processing_time_seconds, jf.created_at,
-                     jf.processed_at, jf.job_id, j.name, jf.result, jf.actual_result,
-                     jf.extraction_error, jf.processing_error, jf.markdown, jf.admin_verified,
+                     jf.processed_at, jf.job_id, j.name, j.extraction_mode, jf.result, jf.markdown${includeLargeColumns ? ', jf.actual_result, jf.extracted_text, jf.extracted_tables, jf.pages, jf.openai_feed_blocked, jf.openai_feed_unblocked, jf.source_locations, jf.raw_data' : ''},
+                     jf.extraction_error, jf.processing_error, jf.admin_verified,
                      jf.customer_verified, jf.page_count
             ORDER BY jf.created_at DESC 
             LIMIT $${++paramCount} OFFSET $${++paramCount}
