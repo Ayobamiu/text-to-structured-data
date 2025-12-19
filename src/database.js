@@ -8,9 +8,9 @@ import { addItemsToPreview } from './database/previewDataTable.js';
 function autoFixPermitNumber(result, filename) {
     if (!result || !filename) return result;
 
-    const { permitNumber, correct } = mgsDataService.getPermitNumberFromData(result, filename);
-
-    if (!correct) {
+    // Always extract permit number from filename and replace it in the result
+    const permitNumber = mgsDataService.extractPermitFromFilename(filename);
+    if (permitNumber) {
         return {
             ...result,
             permit_number: permitNumber
