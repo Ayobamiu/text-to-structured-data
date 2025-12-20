@@ -189,13 +189,13 @@ class MGSDataService {
 
 
     /**
- * Extract permit number from filename
- * Supports various patterns like:
- * - PERMIT12345.pdf
- * - permit_12345.pdf
- * - 12345_permit.pdf
- * - permit-12345.pdf
- */
+     * Extract permit number from filename
+     * Supports various patterns like:
+     * - PERMIT12345.pdf
+     * - permit_12345.pdf
+     * - 12345_permit.pdf
+     * - permit-12345.pdf
+     */
     extractPermitFromFilename(filename) {
         if (!filename || typeof filename !== 'string') return null;
 
@@ -215,6 +215,28 @@ class MGSDataService {
         }
 
         return null;
+    }
+
+    /**
+     * Auto-fix missing permit numbers by extracting from filename
+     * Always replaces permit_number in result with the one from filename
+     * @param {Object} result - Extracted data result
+     * @param {string} filename - Original filename
+     * @returns {Object} - Result with fixed permit number
+     */
+    autoFixPermitNumber(result, filename) {
+        if (!result || !filename) return result;
+
+        // Always extract permit number from filename and replace it in the result
+        const permitNumber = this.extractPermitFromFilename(filename);
+        if (permitNumber) {
+            return {
+                ...result,
+                permit_number: permitNumber
+            };
+        }
+
+        return result;
     }
 }
 

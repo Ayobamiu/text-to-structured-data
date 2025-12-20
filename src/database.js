@@ -1,24 +1,7 @@
 import pg from 'pg';
 import { v4 as uuidv4 } from 'uuid';
 import dotenv from 'dotenv';
-import mgsDataService from './services/mgsDataService.js';
-import { addItemsToPreview } from './database/previewDataTable.js';
-
-// Auto-fix missing permit numbers by extracting from filename
-function autoFixPermitNumber(result, filename) {
-    if (!result || !filename) return result;
-
-    // Always extract permit number from filename and replace it in the result
-    const permitNumber = mgsDataService.extractPermitFromFilename(filename);
-    if (permitNumber) {
-        return {
-            ...result,
-            permit_number: permitNumber
-        };
-    }
-
-    return result;
-}
+import { FileProcessingPipeline } from './pipeline/FileProcessingPipeline.js';
 
 // Only load .env file in development
 if (process.env.NODE_ENV !== 'production') {
@@ -560,51 +543,69 @@ export async function updateFileProcessingStatus(fileId, status, result = null, 
             }
         }
 
-        // Auto-fix permit number if result is being saved and status is completed
+        // Run post-processing pipeline (MGS permit fix, formation page detection, etc.)
         let finalResult = resultWithoutSourceLocations;
+        let finalMetadata = metadata;
+
         if (status === 'completed' && result) {
-            // Get filename and job_id for permit extraction
-            const fileQuery = `SELECT filename, job_id FROM job_files WHERE id = $1`;
-            const fileResult = await client.query(fileQuery, [fileId]);
+            try {
+                // Get file info for pipeline context
+                const fileInfoQuery = `SELECT id, filename, job_id, s3_key, storage_type, pages FROM job_files WHERE id = $1`;
+                const fileInfoResult = await client.query(fileInfoQuery, [fileId]);
 
-            if (fileResult.rows.length > 0) {
-                const { filename, job_id } = fileResult.rows[0];
-                console.log({ filename, job_id });
+                if (fileInfoResult.rows.length > 0) {
+                    const fileInfo = fileInfoResult.rows[0];
 
-                // Only run auto-fix for MGS job
-                if (job_id === '5667fe82-63e1-47fa-a640-b182b5c5d034') {
-                    console.log(`🔧 Starting MGS processing for file ${fileId}`);
-
-                    // Step 1: Fix permit number
-                    finalResult = autoFixPermitNumber(result, filename);
-                    console.log(`✅ Step 1: Permit number fixed for ${filename}`);
-
-                    const permitNumber = mgsDataService.extractPermitFromData(finalResult);
-                    if (permitNumber) {
-                        console.log(`🔍 Step 2: Looking up MGS data for permit ${permitNumber}`);
-                        try {
-                            const mgsData = await mgsDataService.getMGSDataByPermitNumber(permitNumber);
-                            if (mgsData) {
-                                // Step 2: Populate MGS data
-                                finalResult = mgsDataService.mergeMGSData(finalResult, mgsData);
-                                console.log(`✅ Step 2: MGS data populated for permit ${permitNumber}`);
-
-                                // Step 3: Add to preview (only if MGS data was found)
-                                console.log(`📋 Step 3: Adding file ${fileId} to preview`);
-                                await addItemsToPreview('550bff46-db7d-4691-8503-e819273977ee', [fileId]);
-                                console.log(`✅ Step 3: File ${fileId} added to preview successfully`);
-                            } else {
-                                console.log(`⚠️ Step 2: No MGS data found for permit ${permitNumber}`);
+                    // Parse pages if needed
+                    let pages = null;
+                    if (fileInfo.pages) {
+                        if (typeof fileInfo.pages === 'string') {
+                            try {
+                                pages = JSON.parse(fileInfo.pages);
+                            } catch (parseError) {
+                                console.warn(`⚠️ Failed to parse pages JSON: ${parseError.message}`);
                             }
-                        } catch (error) {
-                            console.error(`❌ Step 2: Error looking up MGS data for permit ${permitNumber}:`, error.message);
+                        } else if (Array.isArray(fileInfo.pages)) {
+                            pages = fileInfo.pages;
                         }
-                    } else {
-                        console.log(`⚠️ Step 2: No permit number found in result, skipping MGS data lookup`);
                     }
 
-                    console.log(`🎉 MGS processing completed for file ${fileId}`);
+                    // Create pipeline context
+                    const pipelineContext = {
+                        fileId: fileId,
+                        jobId: fileInfo.job_id,
+                        filename: fileInfo.filename,
+                        result: resultWithoutSourceLocations,
+                        status: status,
+                        fileInfo: fileInfo,
+                        pages: pages,
+                        metadata: metadata ? (typeof metadata === 'string' ? JSON.parse(metadata) : metadata) : {}
+                    };
+
+                    // Execute pipeline
+                    const pipeline = new FileProcessingPipeline({
+                        stopOnError: false, // Don't fail entire update if pipeline stage fails
+                        logProgress: true
+                    });
+
+                    const pipelineResult = await pipeline.execute(pipelineContext);
+
+                    // Update final result and metadata from pipeline
+                    finalResult = pipelineResult.result || finalResult;
+                    finalMetadata = pipelineResult.metadata || finalMetadata;
+
+                    // Log pipeline summary
+                    const summary = pipeline.getSummary();
+                    if (summary.failed > 0) {
+                        console.warn(`⚠️ Pipeline completed with ${summary.failed} failed stage(s) for file ${fileId}`);
+                    } else {
+                        console.log(`✅ Pipeline completed successfully for file ${fileId}`);
+                    }
                 }
+            } catch (pipelineError) {
+                // Don't fail the entire update if pipeline fails
+                console.error(`❌ Pipeline execution failed for file ${fileId}:`, pipelineError.message);
+                // Continue with original result and metadata
             }
         }
 
@@ -629,7 +630,7 @@ export async function updateFileProcessingStatus(fileId, status, result = null, 
                 JSON.stringify(actualResultToSave),
                 error,
                 processedAt,
-                metadata ? JSON.stringify(metadata) : null,
+                finalMetadata ? JSON.stringify(finalMetadata) : null,
                 aiProcessingTimeSeconds,
                 sourceLocations ? JSON.stringify(sourceLocations) : null,
                 fileId
@@ -650,7 +651,7 @@ export async function updateFileProcessingStatus(fileId, status, result = null, 
                 finalResult ? JSON.stringify(finalResult) : null,
                 error,
                 processedAt,
-                metadata ? JSON.stringify(metadata) : null,
+                finalMetadata ? JSON.stringify(finalMetadata) : null,
                 aiProcessingTimeSeconds,
                 sourceLocations ? JSON.stringify(sourceLocations) : null,
                 fileId
