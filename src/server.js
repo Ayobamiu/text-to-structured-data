@@ -2112,6 +2112,47 @@ async function processFilesAsync(job, files, schema, schemaName, processingConfi
 
                 console.log(`✅ File extraction status updated for ${file.originalname}`);
 
+                // Pre-processing pipeline: Run formation page detection before AI processing
+                let confidentHits = [];
+                let preProcessingMetadata = {};
+                try {
+                    const { PreProcessingPipeline } = await import('./pipeline/PreProcessingPipeline.js');
+                    const prePipeline = new PreProcessingPipeline({
+                        stopOnError: false,
+                        logProgress: true
+                    });
+
+                    const prePipelineContext = {
+                        fileId: fileRecord.id,
+                        jobId: job.id,
+                        filename: file.originalname,
+                        extractionStatus: 'completed',
+                        fileInfo: {
+                            id: fileRecord.id,
+                            filename: file.originalname,
+                            job_id: job.id,
+                            s3_key: fileRecord.s3_key,
+                            storage_type: fileRecord.storage_type || 's3',
+                            pages: pagesToStore
+                        },
+                        pages: Array.isArray(pages) ? pages : null,
+                        metadata: extractionMetadata ? (typeof extractionMetadata === 'string' ? JSON.parse(extractionMetadata) : extractionMetadata) : {}
+                    };
+
+                    const prePipelineResult = await prePipeline.execute(prePipelineContext);
+                    confidentHits = prePipelineResult.confidentHits || [];
+                    preProcessingMetadata = prePipelineResult.metadata || {};
+
+                    if (confidentHits.length > 0) {
+                        console.log(`✅ Pre-processing: Found ${confidentHits.length} confident formation pages for ${file.originalname}`);
+                    } else {
+                        console.log(`ℹ️ Pre-processing: No confident formation pages found, will use full content for ${file.originalname}`);
+                    }
+                } catch (prePipelineError) {
+                    console.error(`⚠️ Pre-processing pipeline failed (non-fatal) for ${file.originalname}:`, prePipelineError.message);
+                    // Continue with full content if pre-processing fails
+                }
+
                 // Check if this is a text-only extraction job
                 if (job.extraction_mode === 'text_only') {
                     console.log(`📝 Text-only mode: Skipping AI processing for ${file.originalname}`);
@@ -2156,9 +2197,28 @@ async function processFilesAsync(job, files, schema, schemaName, processingConfi
                     // Step 5: Process with OpenAI using markdown content
                     console.log(`Step 5: Processing ${file.originalname} with OpenAI using markdown content...`);
 
-                    // Use markdown content for better AI processing
-                    const contentForAI = markdown || rawText;
-                    console.log(`Using ${markdown ? 'markdown' : 'extracted text'} for OpenAI processing (${contentForAI.length} characters)`);
+                    // Use filtered markdown from confidentHits if available, otherwise use full content
+                    let contentForAI = markdown || rawText;
+                    if (confidentHits.length > 0 && Array.isArray(pages) && markdown) {
+                        // Filter pages to only confidentHits and concatenate their markdown
+                        const filteredPages = pages.filter(page =>
+                            confidentHits.includes(page.page_number)
+                        );
+                        const filteredMarkdown = filteredPages
+                            .map(page => page.text || '')
+                            .join('\n\n');
+
+                        if (filteredMarkdown.trim().length > 0) {
+                            contentForAI = filteredMarkdown;
+                            console.log('--------------------------------------- IMPORTANT ---------------------------------------');
+                            console.log(`Using filtered markdown from ${confidentHits.length} confident formation pages (${contentForAI.length} characters, reduced from ${markdown.length})`);
+                            console.log('--------------------------------------- IMPORTANT ---------------------------------------');
+                        } else {
+                            console.log(`Filtered markdown is empty, falling back to full markdown`);
+                        }
+                    } else {
+                        console.log(`Using ${markdown ? 'markdown' : 'extracted text'} for OpenAI processing (${contentForAI.length} characters)`);
+                    }
 
                     // Step 5: Process with OpenAI using shared function
                     console.log(`Step 5: Processing ${file.originalname} with OpenAI using shared processor...`);

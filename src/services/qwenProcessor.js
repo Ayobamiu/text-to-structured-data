@@ -165,6 +165,8 @@ class QwenProcessor {
                     top_p: defaultOptions.top_p,
                     max_tokens: defaultOptions.max_tokens,
                     tokens_used: completion.usage?.total_tokens || 0,
+                    prompt_tokens: completion.usage?.input_tokens || completion.usage?.prompt_tokens || 0,  // Input tokens
+                    completion_tokens: completion.usage?.output_tokens || completion.usage?.completion_tokens || 0,  // Output tokens
                     processing_time: new Date().toISOString(),
                     processing_time_seconds: processingTimeSeconds,
                     ai_processing_time_seconds: processingTimeSeconds

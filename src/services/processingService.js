@@ -127,6 +127,8 @@ class ProcessingService {
                     temperature: defaultOptions.temperature,
                     max_tokens: defaultOptions.max_tokens,
                     tokens_used: response.usage?.total_tokens || 0,
+                    prompt_tokens: response.usage?.prompt_tokens || 0,  // Input tokens
+                    completion_tokens: response.usage?.completion_tokens || 0,  // Output tokens
                     processing_time: new Date().toISOString(),
                     processing_time_seconds: processingTimeSeconds,
                     ai_processing_time_seconds: processingTimeSeconds

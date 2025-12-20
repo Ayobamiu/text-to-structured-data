@@ -67,6 +67,8 @@ export async function processWithOpenAI(text, schemaData) {
                 processing_time: new Date().toISOString(),
                 model: 'gpt-4o-2024-08-06',
                 tokens_used: response.usage?.total_tokens || 0,
+                prompt_tokens: response.usage?.prompt_tokens || 0,  // Input tokens
+                completion_tokens: response.usage?.completion_tokens || 0,  // Output tokens
                 processing_time_seconds: processingTimeSeconds
             }
         };

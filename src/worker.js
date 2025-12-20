@@ -160,6 +160,9 @@ class FileProcessorWorker {
         const { fileId, jobId, retries, mode = 'normal' } = queueItem;
         console.log(`🔄 Processing file: ${fileId} (attempt ${retries + 1}, mode: ${mode})`);
 
+        // Declare confidentHits at function scope so it's accessible in all code paths
+        let confidentHits = [];
+
         try {
             // Mark file as processing
             await queueService.markFileAsProcessing(fileId);
@@ -580,6 +583,53 @@ class FileProcessorWorker {
                 );
                 console.log(`✅ File ${file.filename} extraction completed and updated in database`);
 
+                // Pre-processing pipeline: Run formation page detection before AI processing
+                try {
+                    const { PreProcessingPipeline } = await import('./pipeline/PreProcessingPipeline.js');
+                    const prePipeline = new PreProcessingPipeline({
+                        stopOnError: false,
+                        logProgress: true
+                    });
+
+                    // Parse pages if needed
+                    let pagesArray = null;
+                    if (Array.isArray(pagesToStore)) {
+                        pagesArray = pagesToStore;
+                    } else if (extractionResult.pages && Array.isArray(extractionResult.pages)) {
+                        pagesArray = extractionResult.pages;
+                    }
+
+                    const prePipelineContext = {
+                        fileId: file.id,
+                        jobId: jobId,
+                        filename: file.filename,
+                        extractionStatus: 'completed',
+                        fileInfo: {
+                            id: file.id,
+                            filename: file.filename,
+                            job_id: jobId,
+                            s3_key: file.s3_key,
+                            storage_type: file.storage_type || 's3',
+                            pages: pagesToStore
+                        },
+                        pages: pagesArray,
+                        metadata: extractionMetadata ? (typeof extractionMetadata === 'string' ? JSON.parse(extractionMetadata) : extractionMetadata) : {}
+                    };
+
+                    const prePipelineResult = await prePipeline.execute(prePipelineContext);
+                    confidentHits = prePipelineResult.confidentHits || [];
+                    preProcessingMetadata = prePipelineResult.metadata || {};
+
+                    if (confidentHits.length > 0) {
+                        console.log(`✅ Pre-processing: Found ${confidentHits.length} confident formation pages for ${file.filename}`);
+                    } else {
+                        console.log(`ℹ️ Pre-processing: No confident formation pages found, will use full content for ${file.filename}`);
+                    }
+                } catch (prePipelineError) {
+                    console.error(`⚠️ Pre-processing pipeline failed (non-fatal) for ${file.filename}:`, prePipelineError.message);
+                    // Continue with full content if pre-processing fails
+                }
+
                 // Emit WebSocket event for Stage 1 completion
                 this.emitFileStatusUpdate(
                     jobId,
@@ -677,8 +727,31 @@ class FileProcessorWorker {
                 ...processingOptions
             };
 
+            // Use filtered markdown from confidentHits if available, otherwise use full content
+            let contentForAI = extractionResult.markdown;
+            if (confidentHits && confidentHits.length > 0 && extractionResult.pages && Array.isArray(extractionResult.pages)) {
+                // Filter pages to only confidentHits and concatenate their markdown
+                const filteredPages = extractionResult.pages.filter(page =>
+                    confidentHits.includes(page.page_number)
+                );
+                const filteredMarkdown = filteredPages
+                    .map(page => page.text || '')
+                    .join('\n\n');
+
+                if (filteredMarkdown.trim().length > 0) {
+                    contentForAI = filteredMarkdown;
+                    console.log('--------------------------------------- IMPORTANT ---------------------------------------');
+                    console.log(`Using filtered markdown from ${confidentHits.length} confident formation pages (${contentForAI.length} characters, reduced from ${extractionResult.markdown?.length || 0})`);
+                    console.log('--------------------------------------- IMPORTANT ---------------------------------------');
+                } else {
+                    console.log(`Filtered markdown is empty, falling back to full markdown`);
+                }
+            } else {
+                console.log(`Using full markdown for AI processing (${contentForAI?.length || 0} characters)`);
+            }
+
             const processingResult = await this.processingService.processText(
-                extractionResult.markdown,
+                contentForAI,
                 schemaData,
                 processingMethod,
                 finalProcessingOptions

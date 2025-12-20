@@ -191,7 +191,7 @@ class ExtractionService {
                     if (tableContent.trim()) {
                         // Replace escaped double quotes with single quotes in table content
                         tableContent = tableContent.replace(/\\"/g, "'");
-                        
+
                         tables.push({
                             table_id: tables.length + 1,
                             page: pageIndex + 1, // 1-indexed

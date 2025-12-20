@@ -228,14 +228,14 @@ export function heuristicScoreFromMarkdown(text) {
         }
     }
 
-    // if (t.includes('DEPTH')) {
-    //     score += 2;
-    // } else {
-    //     const norm = getNormalized();
-    //     if (norm.includes('DEPTH')) {
-    //         score += 2;
-    //     }
-    // }
+    if (t.includes('DEPTH')) {
+        score += 2;
+    } else {
+        const norm = getNormalized();
+        if (norm.includes('DEPTH')) {
+            score += 2;
+        }
+    }
 
     // Geology vocabulary - use exact match first, fuzzy only if needed
     const formations = [

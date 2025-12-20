@@ -1321,6 +1321,7 @@ export async function getAllFiles(limit = 50, offset = 0, status = null, jobId =
                 jf.admin_verified,
                 jf.customer_verified,
                 jf.extraction_metadata,
+                jf.processing_metadata,
                 jf.review_status,
                 jf.reviewed_by,
                 jf.reviewed_at,
@@ -1347,7 +1348,7 @@ export async function getAllFiles(limit = 50, offset = 0, status = null, jobId =
                      jf.extraction_time_seconds, jf.ai_processing_time_seconds, jf.created_at,
                      jf.processed_at, jf.job_id, j.name, j.extraction_mode, jf.result, jf.markdown${includeLargeColumns ? ', jf.actual_result, jf.extracted_text, jf.extracted_tables, jf.pages, jf.openai_feed_blocked, jf.openai_feed_unblocked, jf.source_locations, jf.raw_data' : ''},
                      jf.extraction_error, jf.processing_error, jf.admin_verified,
-                     jf.customer_verified, jf.page_count
+                     jf.customer_verified, jf.page_count, jf.extraction_metadata, jf.processing_metadata
             ORDER BY jf.created_at DESC 
             LIMIT $${++paramCount} OFFSET $${++paramCount}
         `;
