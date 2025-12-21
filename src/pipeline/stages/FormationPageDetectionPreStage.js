@@ -1,12 +1,16 @@
 import { PipelineStage } from '../PipelineStage.js';
-import { scorePages } from '../../services/formationPageDetectionService.js';
+import { scoreDataExtractionPages } from '../../services/dataExtractionPageDetectionService.js';
 
 /**
- * Pre-processing stage for formation page detection
+ * Pre-processing stage for comprehensive data extraction page detection
  * 
- * This stage runs BEFORE AI processing to identify pages with formation data.
+ * This stage runs BEFORE AI processing to identify pages with all relevant data:
+ * - Formation pages
+ * - LOG OF OIL, GAS OR TEST WELL pages
+ * - Well Plugging Record pages
+ * 
  * It only scores pages and returns confidentHits - no PDF extraction.
- * The confidentHits are used to filter markdown content for AI processing.
+ * The confidentHits (overall, from all three types) are used to filter markdown content for AI processing.
  */
 export class FormationPageDetectionPreStage extends PipelineStage {
     constructor(options = {}) {
@@ -100,31 +104,64 @@ export class FormationPageDetectionPreStage extends PipelineStage {
                     message: 'No pages data available',
                     skipped: true,
                     confidentHits: []
-                }
+                },
+                confidentHits: [] // Ensure confidentHits is always set
             };
         }
 
-        console.log(`🔍 [Pre-processing] Starting formation page detection for file ${fileId}`);
+        console.log(`🔍 [Pre-processing] Starting comprehensive data extraction page detection for file ${fileId}`);
 
-        // Score pages and get confidentHits
-        const scoringResult = scorePages(pages);
+        // Score pages for all data extraction types (Formation + LOG + Plugging Record)
+        const scoringResult = scoreDataExtractionPages(pages);
 
+        // Get overall confidentHits (includes Formation, LOG, and Plugging Record pages)
         const confidentHits = scoringResult.confidentHits || [];
 
-        console.log(`✅ [Pre-processing] Formation page detection completed: ${confidentHits.length} confident hits out of ${pages.length} pages`);
+        // Calculate breakdown by type for logging
+        const formationCount = scoringResult.scoredPages?.filter(p => 
+            p.detectedTypes?.includes('FORMATION')
+        ).length || 0;
+        const logCount = scoringResult.scoredPages?.filter(p => 
+            p.detectedTypes?.includes('LOG_OF_OIL_GAS')
+        ).length || 0;
+        const pluggingCount = scoringResult.scoredPages?.filter(p => 
+            p.detectedTypes?.includes('PLUGGING_RECORD')
+        ).length || 0;
+
+        console.log(`✅ [Pre-processing] Comprehensive page detection completed: ${confidentHits.length} total confident hits (Formation: ${formationCount}, LOG: ${logCount}, Plugging: ${pluggingCount}) out of ${pages.length} pages`);
 
         // Update context with results
         return {
             ...context,
             formationPageDetectionPre: {
                 success: true,
-                confidentHits: confidentHits,
+                confidentHits: confidentHits, // Overall confidentHits from all types
                 scoring: scoringResult,
-                summary: scoringResult.summary
+                summary: scoringResult.summary,
+                // Breakdown by type for reference
+                detectionBreakdown: {
+                    formation: formationCount,
+                    log: logCount,
+                    plugging: pluggingCount,
+                    total: confidentHits.length
+                }
             },
             // Store confidentHits in metadata for later use in AI processing
             metadata: {
                 ...context.metadata,
+                data_extraction_page_detection_pre: {
+                    success: true,
+                    confidentHits: confidentHits, // Overall confidentHits (all types combined)
+                    scoring: scoringResult,
+                    summary: scoringResult.summary,
+                    detectionBreakdown: {
+                        formation: formationCount,
+                        log: logCount,
+                        plugging: pluggingCount,
+                        total: confidentHits.length
+                    }
+                },
+                // Keep old key for backward compatibility
                 formation_page_detection_pre: {
                     success: true,
                     confidentHits: confidentHits,
@@ -132,7 +169,7 @@ export class FormationPageDetectionPreStage extends PipelineStage {
                     summary: scoringResult.summary
                 }
             },
-            // Also store directly in context for easy access
+            // Also store directly in context for easy access (overall confidentHits)
             confidentHits: confidentHits
         };
     }
@@ -142,7 +179,7 @@ export class FormationPageDetectionPreStage extends PipelineStage {
      */
     handleError(error, context) {
         // Don't fail the pipeline if this stage fails (it's optional)
-        console.error(`⚠️ Formation page detection (pre-processing) failed (non-fatal): ${error.message}`);
+        console.error(`⚠️ Comprehensive data extraction page detection (pre-processing) failed (non-fatal): ${error.message}`);
 
         return {
             ...context,

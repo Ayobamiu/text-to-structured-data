@@ -160,8 +160,9 @@ class FileProcessorWorker {
         const { fileId, jobId, retries, mode = 'normal' } = queueItem;
         console.log(`🔄 Processing file: ${fileId} (attempt ${retries + 1}, mode: ${mode})`);
 
-        // Declare confidentHits at function scope so it's accessible in all code paths
+        // Declare confidentHits and preProcessingMetadata at function scope so they're accessible in all code paths
         let confidentHits = [];
+        let preProcessingMetadata = {};
 
         try {
             // Mark file as processing
@@ -621,9 +622,13 @@ class FileProcessorWorker {
                     preProcessingMetadata = prePipelineResult.metadata || {};
 
                     if (confidentHits.length > 0) {
-                        console.log(`✅ Pre-processing: Found ${confidentHits.length} confident formation pages for ${file.filename}`);
+                        const breakdown = preProcessingMetadata?.data_extraction_page_detection_pre?.detectionBreakdown || {};
+                        const breakdownStr = breakdown.total ?
+                            `(Formation: ${breakdown.formation || 0}, LOG: ${breakdown.log || 0}, Plugging: ${breakdown.plugging || 0})` :
+                            '';
+                        console.log(`✅ Pre-processing: Found ${confidentHits.length} confident data extraction pages ${breakdownStr} for ${file.filename}`);
                     } else {
-                        console.log(`ℹ️ Pre-processing: No confident formation pages found, will use full content for ${file.filename}`);
+                        console.log(`ℹ️ Pre-processing: No confident data extraction pages found, will use full content for ${file.filename}`);
                     }
                 } catch (prePipelineError) {
                     console.error(`⚠️ Pre-processing pipeline failed (non-fatal) for ${file.filename}:`, prePipelineError.message);
@@ -740,8 +745,12 @@ class FileProcessorWorker {
 
                 if (filteredMarkdown.trim().length > 0) {
                     contentForAI = filteredMarkdown;
+                    const breakdown = preProcessingMetadata?.data_extraction_page_detection_pre?.detectionBreakdown || {};
+                    const breakdownStr = breakdown.total ?
+                        `(Formation: ${breakdown.formation || 0}, LOG: ${breakdown.log || 0}, Plugging: ${breakdown.plugging || 0})` :
+                        '';
                     console.log('--------------------------------------- IMPORTANT ---------------------------------------');
-                    console.log(`Using filtered markdown from ${confidentHits.length} confident formation pages (${contentForAI.length} characters, reduced from ${extractionResult.markdown?.length || 0})`);
+                    console.log(`Using filtered markdown from ${confidentHits.length} confident data extraction pages ${breakdownStr} (${contentForAI.length} characters, reduced from ${extractionResult.markdown?.length || 0})`);
                     console.log('--------------------------------------- IMPORTANT ---------------------------------------');
                 } else {
                     console.log(`Filtered markdown is empty, falling back to full markdown`);
@@ -764,12 +773,18 @@ class FileProcessorWorker {
                     processingResult.ai_processing_time_seconds ||
                     null;
 
+                // Merge pre-processing metadata with processing metadata
+                const finalMetadata = {
+                    ...processingResult.metadata,
+                    ...preProcessingMetadata // Include comprehensive page detection metadata
+                };
+
                 await updateFileProcessingStatus(
                     file.id,
                     'completed',
                     processingResult.data,
                     null,
-                    processingResult.metadata,
+                    finalMetadata,
                     aiProcessingTimeSeconds
                 );
                 console.log(`✅ File ${file.filename} processing completed successfully`);

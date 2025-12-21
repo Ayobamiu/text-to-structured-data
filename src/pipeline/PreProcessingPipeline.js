@@ -8,7 +8,11 @@ import { FormationPageDetectionPreStage } from './stages/FormationPageDetectionP
  * It identifies and filters content to improve AI processing quality.
  * 
  * Stages:
- * 1. Formation Page Detection (pre-processing) - Identifies pages with formation data
+ * 1. Comprehensive Data Extraction Page Detection (pre-processing) - Identifies pages with:
+ *    - Formation data
+ *    - LOG OF OIL, GAS OR TEST WELL pages
+ *    - Well Plugging Record pages
+ *    Returns overall confidentHits (all types combined) to filter markdown for AI processing.
  * 
  * Usage:
  *   const pipeline = new PreProcessingPipeline();
@@ -20,6 +24,9 @@ import { FormationPageDetectionPreStage } from './stages/FormationPageDetectionP
  *     fileInfo: {...},
  *     pages: [...]
  *   });
+ *   
+ *   // Access overall confidentHits (includes Formation + LOG + Plugging Record pages)
+ *   const confidentHits = context.confidentHits;
  */
 export class PreProcessingPipeline extends Pipeline {
     constructor(options = {}) {

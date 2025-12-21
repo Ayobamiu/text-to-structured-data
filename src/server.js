@@ -2144,9 +2144,13 @@ async function processFilesAsync(job, files, schema, schemaName, processingConfi
                     preProcessingMetadata = prePipelineResult.metadata || {};
 
                     if (confidentHits.length > 0) {
-                        console.log(`✅ Pre-processing: Found ${confidentHits.length} confident formation pages for ${file.originalname}`);
+                        const breakdown = preProcessingMetadata?.data_extraction_page_detection_pre?.detectionBreakdown || {};
+                        const breakdownStr = breakdown.total ?
+                            `(Formation: ${breakdown.formation || 0}, LOG: ${breakdown.log || 0}, Plugging: ${breakdown.plugging || 0})` :
+                            '';
+                        console.log(`✅ Pre-processing: Found ${confidentHits.length} confident data extraction pages ${breakdownStr} for ${file.originalname}`);
                     } else {
-                        console.log(`ℹ️ Pre-processing: No confident formation pages found, will use full content for ${file.originalname}`);
+                        console.log(`ℹ️ Pre-processing: No confident data extraction pages found, will use full content for ${file.originalname}`);
                     }
                 } catch (prePipelineError) {
                     console.error(`⚠️ Pre-processing pipeline failed (non-fatal) for ${file.originalname}:`, prePipelineError.message);
@@ -2210,8 +2214,12 @@ async function processFilesAsync(job, files, schema, schemaName, processingConfi
 
                         if (filteredMarkdown.trim().length > 0) {
                             contentForAI = filteredMarkdown;
+                            const breakdown = preProcessingMetadata?.data_extraction_page_detection_pre?.detectionBreakdown || {};
+                            const breakdownStr = breakdown.total ?
+                                `(Formation: ${breakdown.formation || 0}, LOG: ${breakdown.log || 0}, Plugging: ${breakdown.plugging || 0})` :
+                                '';
                             console.log('--------------------------------------- IMPORTANT ---------------------------------------');
-                            console.log(`Using filtered markdown from ${confidentHits.length} confident formation pages (${contentForAI.length} characters, reduced from ${markdown.length})`);
+                            console.log(`Using filtered markdown from ${confidentHits.length} confident data extraction pages ${breakdownStr} (${contentForAI.length} characters, reduced from ${markdown.length})`);
                             console.log('--------------------------------------- IMPORTANT ---------------------------------------');
                         } else {
                             console.log(`Filtered markdown is empty, falling back to full markdown`);
@@ -2235,8 +2243,14 @@ async function processFilesAsync(job, files, schema, schemaName, processingConfi
 
                     console.log(`OpenAI processing completed for ${file.originalname} in ${aiProcessingTimeSeconds.toFixed(2)} seconds`);
 
-                    // Step 6: Update file processing status to completed with timing
-                    await updateFileProcessingStatus(fileRecord.id, 'completed', processingResult.data, null, processingResult.metadata, aiProcessingTimeSeconds);
+                    // Step 6: Merge pre-processing metadata with processing metadata
+                    const finalMetadata = {
+                        ...processingResult.metadata,
+                        ...preProcessingMetadata // Include comprehensive page detection metadata
+                    };
+
+                    // Step 7: Update file processing status to completed with timing
+                    await updateFileProcessingStatus(fileRecord.id, 'completed', processingResult.data, null, finalMetadata, aiProcessingTimeSeconds);
 
                     // Emit file processing completed event
                     io.to(`job-${job.id}`).emit('file-status-update', {

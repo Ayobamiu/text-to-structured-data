@@ -188,15 +188,34 @@ export function heuristicScoreFromMarkdown(text) {
 
     let score = 0;
 
-    // Strong headers - use fuzzy matching for "FORMATION RECORD"
+    // Strong headers - use fuzzy matching for "FORMATION RECORD" and alternative headers
     // Check original first (fast path), then normalized if needed
-    if (fuzzyMatch(t, 'FORMATION RECORD', 2)) {
-        score += 6;
-    } else {
+    const formationHeaders = [
+        'FORMATION RECORD',
+        'SAMPLE DESCRIPTION',
+        'FORMATION AND REMARKS',
+        'LITHOLOGY',
+        'STRATIGRAPHY'
+    ];
+
+    let headerMatched = false;
+    for (const header of formationHeaders) {
+        if (fuzzyMatch(t, header, 2)) {
+            score += 6;
+            headerMatched = true;
+            break;
+        }
+    }
+
+    if (!headerMatched) {
         // Only check normalized if original didn't match
         const norm = getNormalized();
-        if (fuzzyMatch(norm, 'FORMATION RECORD', 1)) {
-            score += 6;
+        for (const header of formationHeaders) {
+            if (fuzzyMatch(norm, header, 1)) {
+                score += 6;
+                headerMatched = true;
+                break;
+            }
         }
     }
 
@@ -237,7 +256,24 @@ export function heuristicScoreFromMarkdown(text) {
         }
     }
 
-    // Geology vocabulary - use exact match first, fuzzy only if needed
+    // Depth range pattern detection (very strong signal for formation pages)
+    // Matches patterns like "3000-3050", "100 - 120", "56–78" (handles various dash types)
+    // This catches paragraph-style depth ranges, not just table formats
+    const depthRangePattern = /\d+\s*[-–—]\s*\d+/g;
+    const depthRanges = text.match(depthRangePattern) || [];
+    if (depthRanges.length > 0) {
+        score += 5; // Strong signal - formation pages have depth ranges
+        // Bonus for multiple depth ranges (very characteristic of formation pages)
+        if (depthRanges.length >= 3) {
+            score += 3;
+        }
+        if (depthRanges.length >= 5) {
+            score += 2;
+        }
+    }
+
+    // Geology vocabulary - formation names and lithology terms
+    // Use exact match first, fuzzy only if needed
     const formations = [
         'TRAVERSE', 'DUNDEE', 'DETROIT', 'SALINA',
         'UTICA', 'TRENTON', 'BASS', 'NIAGARA'
@@ -255,6 +291,26 @@ export function heuristicScoreFromMarkdown(text) {
                 if (norm.includes(f) || fuzzyMatch(norm, f, 1)) {
                     score += 2;
                 }
+            }
+        }
+    });
+
+    // Lithology vocabulary (expanded per ChatGPT suggestions)
+    const lithologyTerms = [
+        'SHALE', 'LIMESTONE', 'DOLOMITE', 'SANDSTONE',
+        'ARGILLACEOUS', 'CALCAREOUS', 'FOSSIL',
+        'POROSITY', 'CRYSTALLINE', 'CHERT',
+        'ANHYDRITE', 'BENTONITE'
+    ];
+    lithologyTerms.forEach(term => {
+        if (t.includes(term)) {
+            score += 2;
+        } else if (fuzzyMatch(t, term, 1)) {
+            score += 2;
+        } else {
+            const norm = getNormalized();
+            if (norm.includes(term) || fuzzyMatch(norm, term, 1)) {
+                score += 2;
             }
         }
     });
