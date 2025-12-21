@@ -160,9 +160,11 @@ class FileProcessorWorker {
         const { fileId, jobId, retries, mode = 'normal' } = queueItem;
         console.log(`🔄 Processing file: ${fileId} (attempt ${retries + 1}, mode: ${mode})`);
 
-        // Declare confidentHits and preProcessingMetadata at function scope so they're accessible in all code paths
+        // Declare confidentHits, preProcessingMetadata, usePageDetection, and jobProcessingConfig at function scope so they're accessible in all code paths
         let confidentHits = [];
         let preProcessingMetadata = {};
+        let usePageDetection = true; // Default to true for backward compatibility
+        let jobProcessingConfig = null; // Will be parsed from job.processing_config
 
         try {
             // Mark file as processing
@@ -242,7 +244,7 @@ class FileProcessorWorker {
 
                 // Get extraction method from job processing config
                 // Parse processing_config if it's a string (JSON stored as text)
-                const jobProcessingConfig = typeof job.processing_config === 'string' ? JSON.parse(job.processing_config) : job.processing_config;
+                jobProcessingConfig = typeof job.processing_config === 'string' ? JSON.parse(job.processing_config) : job.processing_config;
                 const extractionMethod = jobProcessingConfig?.extraction?.method || 'mineru';
                 const extractionOptions = jobProcessingConfig?.extraction?.options || {};
 
@@ -372,7 +374,7 @@ class FileProcessorWorker {
 
                 // Get extraction method from job processing config
                 // Parse processing_config if it's a string (JSON stored as text)
-                const jobProcessingConfig = typeof job.processing_config === 'string' ? JSON.parse(job.processing_config) : job.processing_config;
+                jobProcessingConfig = typeof job.processing_config === 'string' ? JSON.parse(job.processing_config) : job.processing_config;
                 const extractionMethod = jobProcessingConfig?.extraction?.method || 'mineru';
                 const extractionOptions = jobProcessingConfig?.extraction?.options || {};
 
@@ -483,7 +485,7 @@ class FileProcessorWorker {
 
                 // Get extraction method from job processing config
                 // Parse processing_config if it's a string (JSON stored as text)
-                const jobProcessingConfig = typeof job.processing_config === 'string' ? JSON.parse(job.processing_config) : job.processing_config;
+                jobProcessingConfig = typeof job.processing_config === 'string' ? JSON.parse(job.processing_config) : job.processing_config;
                 const extractionMethod = jobProcessingConfig?.extraction?.method || 'mineru';
                 const extractionOptions = jobProcessingConfig?.extraction?.options || {};
 
@@ -585,54 +587,71 @@ class FileProcessorWorker {
                 console.log(`✅ File ${file.filename} extraction completed and updated in database`);
 
                 // Pre-processing pipeline: Run formation page detection before AI processing
-                try {
-                    const { PreProcessingPipeline } = await import('./pipeline/PreProcessingPipeline.js');
-                    const prePipeline = new PreProcessingPipeline({
-                        stopOnError: false,
-                        logProgress: true
-                    });
+                // Check if page detection is enabled in job config (default: true for backward compatibility)
+                // Parse jobProcessingConfig if not already parsed (reuse if available)
+                if (!jobProcessingConfig) {
+                    jobProcessingConfig = typeof job.processing_config === 'string' ? JSON.parse(job.processing_config) : job.processing_config;
+                }
+                // Update usePageDetection (already declared at function scope)
+                usePageDetection = jobProcessingConfig?.usePageDetection !== false; // Default to true
 
-                    // Parse pages if needed
-                    let pagesArray = null;
-                    if (Array.isArray(pagesToStore)) {
-                        pagesArray = pagesToStore;
-                    } else if (extractionResult.pages && Array.isArray(extractionResult.pages)) {
-                        pagesArray = extractionResult.pages;
-                    }
+                if (usePageDetection) {
+                    try {
+                        const { PreProcessingPipeline } = await import('./pipeline/PreProcessingPipeline.js');
+                        const prePipeline = new PreProcessingPipeline({
+                            stopOnError: false,
+                            logProgress: true
+                        });
 
-                    const prePipelineContext = {
-                        fileId: file.id,
-                        jobId: jobId,
-                        filename: file.filename,
-                        extractionStatus: 'completed',
-                        fileInfo: {
-                            id: file.id,
+                        // Parse pages if needed
+                        let pagesArray = null;
+                        if (Array.isArray(pagesToStore)) {
+                            pagesArray = pagesToStore;
+                        } else if (extractionResult.pages && Array.isArray(extractionResult.pages)) {
+                            pagesArray = extractionResult.pages;
+                        }
+
+                        const prePipelineContext = {
+                            fileId: file.id,
+                            jobId: jobId,
                             filename: file.filename,
-                            job_id: jobId,
-                            s3_key: file.s3_key,
-                            storage_type: file.storage_type || 's3',
-                            pages: pagesToStore
-                        },
-                        pages: pagesArray,
-                        metadata: extractionMetadata ? (typeof extractionMetadata === 'string' ? JSON.parse(extractionMetadata) : extractionMetadata) : {}
-                    };
+                            extractionStatus: 'completed',
+                            fileInfo: {
+                                id: file.id,
+                                filename: file.filename,
+                                job_id: jobId,
+                                s3_key: file.s3_key,
+                                storage_type: file.storage_type || 's3',
+                                pages: pagesToStore
+                            },
+                            pages: pagesArray,
+                            metadata: extractionMetadata ? (typeof extractionMetadata === 'string' ? JSON.parse(extractionMetadata) : extractionMetadata) : {}
+                        };
 
-                    const prePipelineResult = await prePipeline.execute(prePipelineContext);
-                    confidentHits = prePipelineResult.confidentHits || [];
-                    preProcessingMetadata = prePipelineResult.metadata || {};
+                        const prePipelineResult = await prePipeline.execute(prePipelineContext);
+                        confidentHits = prePipelineResult.confidentHits || [];
+                        preProcessingMetadata = prePipelineResult.metadata || {};
 
-                    if (confidentHits.length > 0) {
-                        const breakdown = preProcessingMetadata?.data_extraction_page_detection_pre?.detectionBreakdown || {};
-                        const breakdownStr = breakdown.total ?
-                            `(Formation: ${breakdown.formation || 0}, LOG: ${breakdown.log || 0}, Plugging: ${breakdown.plugging || 0})` :
-                            '';
-                        console.log(`✅ Pre-processing: Found ${confidentHits.length} confident data extraction pages ${breakdownStr} for ${file.filename}`);
-                    } else {
-                        console.log(`ℹ️ Pre-processing: No confident data extraction pages found, will use full content for ${file.filename}`);
+                        if (confidentHits.length > 0) {
+                            const breakdown = preProcessingMetadata?.data_extraction_page_detection_pre?.detectionBreakdown || {};
+                            const breakdownStr = breakdown.total ?
+                                `(Formation: ${breakdown.formation || 0}, LOG: ${breakdown.log || 0}, Plugging: ${breakdown.plugging || 0})` :
+                                '';
+                            console.log(`✅ Pre-processing: Found ${confidentHits.length} confident data extraction pages ${breakdownStr} for ${file.filename}`);
+                        } else {
+                            console.log(`ℹ️ Pre-processing: No confident data extraction pages found, will use full content for ${file.filename}`);
+                        }
+                    } catch (prePipelineError) {
+                        console.error(`⚠️ Pre-processing pipeline failed (non-fatal) for ${file.filename}:`, prePipelineError.message);
+                        // Continue with full content if pre-processing fails
                     }
-                } catch (prePipelineError) {
-                    console.error(`⚠️ Pre-processing pipeline failed (non-fatal) for ${file.filename}:`, prePipelineError.message);
-                    // Continue with full content if pre-processing fails
+                } else {
+                    console.log(`ℹ️ Page detection disabled in job config - processing full document for ${file.filename}`);
+                    // Store metadata indicating page detection was skipped
+                    preProcessingMetadata = {
+                        page_detection_skipped: true,
+                        reason: 'disabled_in_job_config'
+                    };
                 }
 
                 // Emit WebSocket event for Stage 1 completion
@@ -732,9 +751,9 @@ class FileProcessorWorker {
                 ...processingOptions
             };
 
-            // Use filtered markdown from confidentHits if available, otherwise use full content
+            // Use filtered markdown from confidentHits if page detection is enabled and hits are available, otherwise use full content
             let contentForAI = extractionResult.markdown;
-            if (confidentHits && confidentHits.length > 0 && extractionResult.pages && Array.isArray(extractionResult.pages)) {
+            if (usePageDetection && confidentHits && confidentHits.length > 0 && extractionResult.pages && Array.isArray(extractionResult.pages)) {
                 // Filter pages to only confidentHits and concatenate their markdown
                 const filteredPages = extractionResult.pages.filter(page =>
                     confidentHits.includes(page.page_number)
@@ -756,7 +775,11 @@ class FileProcessorWorker {
                     console.log(`Filtered markdown is empty, falling back to full markdown`);
                 }
             } else {
-                console.log(`Using full markdown for AI processing (${contentForAI?.length || 0} characters)`);
+                if (!usePageDetection) {
+                    console.log(`Page detection disabled - using full markdown for AI processing (${contentForAI?.length || 0} characters)`);
+                } else {
+                    console.log(`Using full markdown for AI processing (${contentForAI?.length || 0} characters)`);
+                }
             }
 
             const processingResult = await this.processingService.processText(

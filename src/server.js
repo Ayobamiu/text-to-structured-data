@@ -2113,48 +2113,62 @@ async function processFilesAsync(job, files, schema, schemaName, processingConfi
                 console.log(`✅ File extraction status updated for ${file.originalname}`);
 
                 // Pre-processing pipeline: Run formation page detection before AI processing
+                // Check if page detection is enabled in job config (default: true for backward compatibility)
+                // Reuse jobProcessingConfig that was already declared above
+                const usePageDetection = jobProcessingConfig?.usePageDetection !== false; // Default to true
+
                 let confidentHits = [];
                 let preProcessingMetadata = {};
-                try {
-                    const { PreProcessingPipeline } = await import('./pipeline/PreProcessingPipeline.js');
-                    const prePipeline = new PreProcessingPipeline({
-                        stopOnError: false,
-                        logProgress: true
-                    });
 
-                    const prePipelineContext = {
-                        fileId: fileRecord.id,
-                        jobId: job.id,
-                        filename: file.originalname,
-                        extractionStatus: 'completed',
-                        fileInfo: {
-                            id: fileRecord.id,
+                if (usePageDetection) {
+                    try {
+                        const { PreProcessingPipeline } = await import('./pipeline/PreProcessingPipeline.js');
+                        const prePipeline = new PreProcessingPipeline({
+                            stopOnError: false,
+                            logProgress: true
+                        });
+
+                        const prePipelineContext = {
+                            fileId: fileRecord.id,
+                            jobId: job.id,
                             filename: file.originalname,
-                            job_id: job.id,
-                            s3_key: fileRecord.s3_key,
-                            storage_type: fileRecord.storage_type || 's3',
-                            pages: pagesToStore
-                        },
-                        pages: Array.isArray(pages) ? pages : null,
-                        metadata: extractionMetadata ? (typeof extractionMetadata === 'string' ? JSON.parse(extractionMetadata) : extractionMetadata) : {}
-                    };
+                            extractionStatus: 'completed',
+                            fileInfo: {
+                                id: fileRecord.id,
+                                filename: file.originalname,
+                                job_id: job.id,
+                                s3_key: fileRecord.s3_key,
+                                storage_type: fileRecord.storage_type || 's3',
+                                pages: pagesToStore
+                            },
+                            pages: Array.isArray(pages) ? pages : null,
+                            metadata: extractionMetadata ? (typeof extractionMetadata === 'string' ? JSON.parse(extractionMetadata) : extractionMetadata) : {}
+                        };
 
-                    const prePipelineResult = await prePipeline.execute(prePipelineContext);
-                    confidentHits = prePipelineResult.confidentHits || [];
-                    preProcessingMetadata = prePipelineResult.metadata || {};
+                        const prePipelineResult = await prePipeline.execute(prePipelineContext);
+                        confidentHits = prePipelineResult.confidentHits || [];
+                        preProcessingMetadata = prePipelineResult.metadata || {};
 
-                    if (confidentHits.length > 0) {
-                        const breakdown = preProcessingMetadata?.data_extraction_page_detection_pre?.detectionBreakdown || {};
-                        const breakdownStr = breakdown.total ?
-                            `(Formation: ${breakdown.formation || 0}, LOG: ${breakdown.log || 0}, Plugging: ${breakdown.plugging || 0})` :
-                            '';
-                        console.log(`✅ Pre-processing: Found ${confidentHits.length} confident data extraction pages ${breakdownStr} for ${file.originalname}`);
-                    } else {
-                        console.log(`ℹ️ Pre-processing: No confident data extraction pages found, will use full content for ${file.originalname}`);
+                        if (confidentHits.length > 0) {
+                            const breakdown = preProcessingMetadata?.data_extraction_page_detection_pre?.detectionBreakdown || {};
+                            const breakdownStr = breakdown.total ?
+                                `(Formation: ${breakdown.formation || 0}, LOG: ${breakdown.log || 0}, Plugging: ${breakdown.plugging || 0})` :
+                                '';
+                            console.log(`✅ Pre-processing: Found ${confidentHits.length} confident data extraction pages ${breakdownStr} for ${file.originalname}`);
+                        } else {
+                            console.log(`ℹ️ Pre-processing: No confident data extraction pages found, will use full content for ${file.originalname}`);
+                        }
+                    } catch (prePipelineError) {
+                        console.error(`⚠️ Pre-processing pipeline failed (non-fatal) for ${file.originalname}:`, prePipelineError.message);
+                        // Continue with full content if pre-processing fails
                     }
-                } catch (prePipelineError) {
-                    console.error(`⚠️ Pre-processing pipeline failed (non-fatal) for ${file.originalname}:`, prePipelineError.message);
-                    // Continue with full content if pre-processing fails
+                } else {
+                    console.log(`ℹ️ Page detection disabled in job config - processing full document for ${file.originalname}`);
+                    // Store metadata indicating page detection was skipped
+                    preProcessingMetadata = {
+                        page_detection_skipped: true,
+                        reason: 'disabled_in_job_config'
+                    };
                 }
 
                 // Check if this is a text-only extraction job
@@ -2201,9 +2215,9 @@ async function processFilesAsync(job, files, schema, schemaName, processingConfi
                     // Step 5: Process with OpenAI using markdown content
                     console.log(`Step 5: Processing ${file.originalname} with OpenAI using markdown content...`);
 
-                    // Use filtered markdown from confidentHits if available, otherwise use full content
+                    // Use filtered markdown from confidentHits if page detection is enabled and hits are available, otherwise use full content
                     let contentForAI = markdown || rawText;
-                    if (confidentHits.length > 0 && Array.isArray(pages) && markdown) {
+                    if (usePageDetection && confidentHits.length > 0 && Array.isArray(pages) && markdown) {
                         // Filter pages to only confidentHits and concatenate their markdown
                         const filteredPages = pages.filter(page =>
                             confidentHits.includes(page.page_number)
@@ -2225,7 +2239,11 @@ async function processFilesAsync(job, files, schema, schemaName, processingConfi
                             console.log(`Filtered markdown is empty, falling back to full markdown`);
                         }
                     } else {
-                        console.log(`Using ${markdown ? 'markdown' : 'extracted text'} for OpenAI processing (${contentForAI.length} characters)`);
+                        if (!usePageDetection) {
+                            console.log(`Page detection disabled - using ${markdown ? 'markdown' : 'extracted text'} for OpenAI processing (${contentForAI.length} characters)`);
+                        } else {
+                            console.log(`Using ${markdown ? 'markdown' : 'extracted text'} for OpenAI processing (${contentForAI.length} characters)`);
+                        }
                     }
 
                     // Step 5: Process with OpenAI using shared function
