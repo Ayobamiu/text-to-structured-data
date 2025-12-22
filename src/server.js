@@ -1691,13 +1691,23 @@ app.put("/files/:id/verify", authenticateToken, requireRole('admin'), async (req
 app.post("/jobs/:id/files", authenticateToken, upload.array("files", 20), async (req, res) => {
     try {
         const { id: jobId } = req.params;
-        const { schema, schemaName } = req.body;
+        const { schema, schemaName, selected_pages } = req.body;
 
         if (!req.files || req.files.length === 0) {
             return res.status(400).json({
                 status: "error",
                 message: "No files provided"
             });
+        }
+
+        // Parse selected_pages if provided (JSON string or object)
+        let selectedPagesMap = {};
+        if (selected_pages) {
+            try {
+                selectedPagesMap = typeof selected_pages === 'string' ? JSON.parse(selected_pages) : selected_pages;
+            } catch (e) {
+                console.warn('Failed to parse selected_pages:', e.message);
+            }
         }
 
         // Check if job exists
@@ -1742,6 +1752,9 @@ app.post("/jobs/:id/files", authenticateToken, upload.array("files", 20), async 
                 pageCount = 1;
             }
 
+            // Get selected pages for this file if provided
+            const selectedPages = selectedPagesMap[file.originalname] || null;
+
             // Add file record to database
             const fileRecord = await addFileToJob(
                 jobId,
@@ -1752,7 +1765,8 @@ app.post("/jobs/:id/files", authenticateToken, upload.array("files", 20), async 
                 uploadStatus,
                 uploadError,
                 storageType,
-                pageCount
+                pageCount,
+                selectedPages
             );
 
             // Add file to processing queue
@@ -1920,6 +1934,48 @@ app.get("/jobs/:id/files/:status", authenticateToken, async (req, res) => {
     }
 });
 
+// Get PDF page count endpoint - accepts file upload and returns page count
+app.post("/pdf/page-count", authenticateToken, upload.single("file"), async (req, res) => {
+    try {
+        if (!req.file) {
+            return res.status(400).json({
+                status: "error",
+                message: "No file provided"
+            });
+        }
+
+        const isPdf = req.file.mimetype === 'application/pdf' ||
+            req.file.originalname?.toLowerCase().endsWith('.pdf');
+
+        if (!isPdf) {
+            return res.status(400).json({
+                status: "error",
+                message: "File is not a PDF"
+            });
+        }
+
+        const pageCount = await getPdfPageCount(req.file.path);
+
+        if (pageCount === null) {
+            return res.status(500).json({
+                status: "error",
+                message: "Failed to determine page count"
+            });
+        }
+
+        res.json({
+            status: "success",
+            pageCount: pageCount
+        });
+    } catch (error) {
+        console.error("Error getting PDF page count:", error.message);
+        res.status(500).json({
+            status: "error",
+            message: error.message
+        });
+    }
+});
+
 // Get all files across all jobs
 app.get("/files", authenticateToken, async (req, res) => {
     try {
@@ -2014,6 +2070,21 @@ async function processFilesAsync(job, files, schema, schemaName, processingConfi
                 // Get S3 key from file record if available
                 const s3Key = fileRecord.s3_key || null;
 
+                // Get selected_pages from file record if available
+                let selectedPages = null;
+                if (fileRecord.selected_pages) {
+                    try {
+                        selectedPages = typeof fileRecord.selected_pages === 'string'
+                            ? JSON.parse(fileRecord.selected_pages)
+                            : fileRecord.selected_pages;
+                        if (selectedPages && Array.isArray(selectedPages) && selectedPages.length > 0) {
+                            console.log(`📄 Using selected pages for ${file.originalname}: ${selectedPages.join(', ')}`);
+                        }
+                    } catch (e) {
+                        console.warn(`⚠️ Failed to parse selected_pages for ${file.originalname}:`, e.message);
+                    }
+                }
+
                 // Extract text (with fallback if extendai fails)
                 let extractionResult;
                 if (extractionMethod === 'extendai') {
@@ -2025,7 +2096,7 @@ async function processFilesAsync(job, files, schema, schemaName, processingConfi
                     if (!extractionResult.success) {
                         console.log(`⚠️ ExtendAI failed: ${extractionResult.error}`);
                         console.log(`🔄 Falling back to mineru for ${file.originalname}`);
-                        extractionResult = await extractionService.extractText(file.path, file.originalname, 'mineru', extractionOptions);
+                        extractionResult = await extractionService.extractText(file.path, file.originalname, 'mineru', extractionOptions, s3Key, selectedPages);
 
                         // Ensure fallback result has proper structure
                         if (!extractionResult.success) {
@@ -2034,8 +2105,8 @@ async function processFilesAsync(job, files, schema, schemaName, processingConfi
                         console.log(`✅ MinerU fallback extraction successful for ${file.originalname}`);
                     }
                 } else {
-                    // Use specified method (mineru/documentai) via Flask
-                    extractionResult = await extractionService.extractText(file.path, file.originalname, extractionMethod, extractionOptions);
+                    // Use specified method (mineru/documentai/paddleocr) via Flask
+                    extractionResult = await extractionService.extractText(file.path, file.originalname, extractionMethod, extractionOptions, s3Key, selectedPages);
                 }
 
                 const extractionTimeSeconds = extractionResult.extraction_time_seconds || 0;
@@ -2452,11 +2523,21 @@ app.post("/extract", authenticateToken, upload.array("files", 20), async (req, r
             return res.status(400).json({ error: "No request body provided" });
         }
 
-        const { schema, schemaName, jobName, extractionMode = 'full_extraction', processingConfig } = req.body;
+        const { schema, schemaName, jobName, extractionMode = 'full_extraction', processingConfig, selected_pages } = req.body;
 
         if (!req.files || req.files.length === 0) {
             console.error("No files provided in request");
             return res.status(400).json({ error: "No files provided" });
+        }
+
+        // Parse selected_pages if provided (JSON string or object)
+        let selectedPagesMap = {};
+        if (selected_pages) {
+            try {
+                selectedPagesMap = typeof selected_pages === 'string' ? JSON.parse(selected_pages) : selected_pages;
+            } catch (e) {
+                console.warn('Failed to parse selected_pages:', e.message);
+            }
         }
 
         if (!schema) {
@@ -2560,6 +2641,9 @@ app.post("/extract", authenticateToken, upload.array("files", 20), async (req, r
                 pageCount = 1;
             }
 
+            // Get selected pages for this file if provided
+            const selectedPages = selectedPagesMap[file.originalname] || null;
+
             // Create file record
             const fileRecord = await addFileToJob(
                 job.id,
@@ -2570,7 +2654,8 @@ app.post("/extract", authenticateToken, upload.array("files", 20), async (req, r
                 uploadStatus,
                 uploadError,
                 storageType,
-                pageCount
+                pageCount,
+                selectedPages
             );
             console.log(`✅ File record created: ${fileRecord.id}`);
 

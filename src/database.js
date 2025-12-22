@@ -83,15 +83,15 @@ export async function createJob(name, schema, schemaName, userId = null, organiz
 }
 
 // Add file to job
-export async function addFileToJob(jobId, filename, size, s3Key, fileHash, uploadStatus = 'pending', uploadError = null, storageType = 's3', pageCount = null) {
+export async function addFileToJob(jobId, filename, size, s3Key, fileHash, uploadStatus = 'pending', uploadError = null, storageType = 's3', pageCount = null, selectedPages = null) {
     const client = await pool.connect();
     try {
         const fileId = uuidv4();
         const query = `
             INSERT INTO job_files (id, job_id, filename, size, page_count, s3_key, file_hash, 
-                                 extraction_status, processing_status, upload_status, upload_error, storage_type, retry_count, last_retry_at, created_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, NOW())
-            RETURNING id, filename, size, page_count, s3_key, file_hash, upload_status, upload_error, storage_type, retry_count, last_retry_at
+                                 extraction_status, processing_status, upload_status, upload_error, storage_type, retry_count, last_retry_at, selected_pages, created_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, NOW())
+            RETURNING id, filename, size, page_count, s3_key, file_hash, upload_status, upload_error, storage_type, retry_count, last_retry_at, selected_pages
         `;
 
         const values = [
@@ -108,7 +108,8 @@ export async function addFileToJob(jobId, filename, size, s3Key, fileHash, uploa
             uploadError,
             storageType,
             0,
-            null
+            null,
+            selectedPages ? JSON.stringify(selectedPages) : null
         ];
 
         const result = await client.query(query, values);
@@ -882,7 +883,7 @@ export async function getFileById(fileId, includeLargeColumns = false) {
                    jf.storage_type, jf.retry_count, jf.last_retry_at,
                    jf.extraction_time_seconds, jf.ai_processing_time_seconds, 
                    jf.admin_verified, jf.customer_verified, jf.page_count,
-                   jf.extraction_metadata, jf.job_id,
+                   jf.extraction_metadata, jf.job_id, jf.selected_pages,
                    jf.review_status, jf.reviewed_by, jf.reviewed_at, jf.review_notes,
                    j.id as job_id, j.name as job_name, j.schema_data, j.processing_config
             FROM job_files jf
@@ -921,6 +922,16 @@ export async function getFileById(fileId, includeLargeColumns = false) {
                 }
             }
             file.pages = pages || file.pages || null;
+        }
+
+        // Parse selected_pages if it's a string (JSONB can return as string)
+        if (file.selected_pages && typeof file.selected_pages === 'string') {
+            try {
+                file.selected_pages = JSON.parse(file.selected_pages);
+            } catch (e) {
+                console.warn('⚠️ Failed to parse selected_pages in getFileById:', e.message);
+                file.selected_pages = null;
+            }
         }
 
         return file;
@@ -1318,6 +1329,7 @@ export async function getAllFiles(limit = 50, offset = 0, status = null, jobId =
                 jf.extraction_error,
                 jf.processing_error,
                 jf.page_count,
+                jf.selected_pages,
                 jf.admin_verified,
                 jf.customer_verified,
                 jf.extraction_metadata,
@@ -1348,7 +1360,7 @@ export async function getAllFiles(limit = 50, offset = 0, status = null, jobId =
                      jf.extraction_time_seconds, jf.ai_processing_time_seconds, jf.created_at,
                      jf.processed_at, jf.job_id, j.name, j.extraction_mode, jf.result, jf.markdown${includeLargeColumns ? ', jf.actual_result, jf.extracted_text, jf.extracted_tables, jf.pages, jf.openai_feed_blocked, jf.openai_feed_unblocked, jf.source_locations, jf.raw_data' : ''},
                      jf.extraction_error, jf.processing_error, jf.admin_verified,
-                     jf.customer_verified, jf.page_count, jf.extraction_metadata, jf.processing_metadata
+                     jf.customer_verified, jf.page_count, jf.selected_pages, jf.extraction_metadata, jf.processing_metadata
             ORDER BY jf.created_at DESC 
             LIMIT $${++paramCount} OFFSET $${++paramCount}
         `;

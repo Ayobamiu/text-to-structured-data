@@ -171,9 +171,20 @@ class FileProcessorWorker {
             await queueService.markFileAsProcessing(fileId);
 
             // Get file details directly (lightweight - no large columns needed for processing)
+            // Include selected_pages which is small, so we can use it for extraction
             const file = await getFileById(fileId, false);
             if (!file) {
                 throw new Error(`File ${fileId} not found`);
+            }
+
+            // Parse selected_pages if available
+            if (file.selected_pages && typeof file.selected_pages === 'string') {
+                try {
+                    file.selected_pages = JSON.parse(file.selected_pages);
+                } catch (e) {
+                    console.warn('⚠️ Failed to parse selected_pages:', e.message);
+                    file.selected_pages = null;
+                }
             }
 
             // Get job details separately (lightweight - no files needed)
@@ -250,6 +261,9 @@ class FileProcessorWorker {
 
                 console.log(`📋 Using extraction method: ${extractionMethod} (from job processing config)`);
 
+                // Get selected_pages from file if available
+                const selectedPages = file.selected_pages || null;
+
                 // Handle ExtendAI with fallback to mineru
                 if (extractionMethod === 'extendai') {
                     extractionResult = await this.extractWithExtendAI(file, extractionOptions);
@@ -257,7 +271,7 @@ class FileProcessorWorker {
                         console.log(`⚠️ ExtendAI failed: ${extractionResult.error}`);
                         console.log(`🔄 Falling back to mineru for ${file.filename}`);
                         // Fallback to mineru - extractFromS3File will download and process
-                        extractionResult = await this.extractFromS3File(file, 'mineru', extractionOptions);
+                        extractionResult = await this.extractFromS3File(file, 'mineru', extractionOptions, selectedPages);
 
                         // Ensure fallback result has proper structure
                         if (!extractionResult.success) {
@@ -266,7 +280,7 @@ class FileProcessorWorker {
                         console.log(`✅ MinerU fallback extraction successful for ${file.filename}`);
                     }
                 } else {
-                    extractionResult = await this.extractTextFromFile(file, extractionMethod, extractionOptions);
+                    extractionResult = await this.extractTextFromFile(file, extractionMethod, extractionOptions, selectedPages);
                 }
 
                 if (!extractionResult.success) {
@@ -380,6 +394,9 @@ class FileProcessorWorker {
 
                 console.log(`📋 Using extraction method: ${extractionMethod} (from job processing config)`);
 
+                // Get selected_pages from file if available
+                const selectedPages = file.selected_pages || null;
+
                 // Handle ExtendAI with fallback to mineru
                 if (extractionMethod === 'extendai') {
                     extractionResult = await this.extractWithExtendAI(file, extractionOptions);
@@ -387,10 +404,10 @@ class FileProcessorWorker {
                         console.log(`⚠️ ExtendAI failed: ${extractionResult.error}`);
                         console.log(`🔄 Falling back to mineru for ${file.filename}`);
                         // Fallback to mineru - extractFromS3File will download and process
-                        extractionResult = await this.extractFromS3File(file, 'mineru', extractionOptions);
+                        extractionResult = await this.extractFromS3File(file, 'mineru', extractionOptions, selectedPages);
                     }
                 } else {
-                    extractionResult = await this.extractTextFromFile(file, extractionMethod, extractionOptions);
+                    extractionResult = await this.extractTextFromFile(file, extractionMethod, extractionOptions, selectedPages);
                 }
 
                 if (!extractionResult.success) {
@@ -491,6 +508,9 @@ class FileProcessorWorker {
 
                 console.log(`📋 Using extraction method: ${extractionMethod} (from job processing config)`);
 
+                // Get selected_pages from file if available
+                const selectedPages = file.selected_pages || null;
+
                 // Handle ExtendAI with fallback to mineru
                 if (extractionMethod === 'extendai') {
                     extractionResult = await this.extractWithExtendAI(file, extractionOptions);
@@ -498,7 +518,7 @@ class FileProcessorWorker {
                         console.log(`⚠️ ExtendAI failed: ${extractionResult.error}`);
                         console.log(`🔄 Falling back to mineru for ${file.filename}`);
                         // Fallback to mineru - extractFromS3File will download and process
-                        extractionResult = await this.extractFromS3File(file, 'mineru', extractionOptions);
+                        extractionResult = await this.extractFromS3File(file, 'mineru', extractionOptions, selectedPages);
 
                         // Ensure fallback result has proper structure
                         if (!extractionResult.success) {
@@ -507,7 +527,7 @@ class FileProcessorWorker {
                         console.log(`✅ MinerU fallback extraction successful for ${file.filename}`);
                     }
                 } else {
-                    extractionResult = await this.extractTextFromFile(file, extractionMethod, extractionOptions);
+                    extractionResult = await this.extractTextFromFile(file, extractionMethod, extractionOptions, selectedPages);
                 }
 
                 if (!extractionResult.success) {
@@ -908,7 +928,7 @@ class FileProcessorWorker {
         }
     }
 
-    async extractTextFromFile(file, method = 'mineru', options = {}) {
+    async extractTextFromFile(file, method = 'mineru', options = {}, selectedPages = null) {
         try {
             console.log(`📄 Extracting text from: ${file.filename} using ${method}`);
 
@@ -919,7 +939,7 @@ class FileProcessorWorker {
 
             // Check if file is stored in S3
             if (file.s3_key && this.s3Service.isCloudStorageEnabled()) {
-                return await this.extractFromS3File(file, method, options);
+                return await this.extractFromS3File(file, method, options, selectedPages);
             } else {
                 // File is not available for processing
                 throw new Error('File not available for processing (not in S3)');
@@ -934,9 +954,15 @@ class FileProcessorWorker {
         }
     }
 
-    async extractFromS3File(file, method = 'mineru', options = {}) {
+    async extractFromS3File(file, method = 'mineru', options = {}, selectedPages = null) {
         try {
             console.log(`📄 Processing S3 file: ${file.s3_key} with ${method}`);
+
+            // Use parameter if provided, otherwise fall back to file object
+            selectedPages = selectedPages || file.selected_pages || null;
+            if (selectedPages && Array.isArray(selectedPages) && selectedPages.length > 0) {
+                console.log(`📄 Using selected pages: ${selectedPages.join(', ')}`);
+            }
 
             // For ExtendAI, use direct S3 URL (no need to download)
             if (method === 'extendai') {
@@ -960,7 +986,9 @@ class FileProcessorWorker {
                     tempPath,
                     file.filename,
                     method,
-                    options
+                    options,
+                    file.s3_key,
+                    selectedPages
                 );
 
                 return extractionResult;

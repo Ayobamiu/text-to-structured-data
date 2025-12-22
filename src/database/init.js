@@ -5,7 +5,7 @@ const { Pool } = pg;
 export async function initializeDatabase() {
     console.log('🚀 Initializing database...');
     console.log('🔧 IPv4 fix applied - forcing IPv4 connections only');
-    
+
     // Debug environment variables
     console.log('🔍 Environment check:');
     console.log('  DATABASE_URL:', process.env.DATABASE_URL ? 'SET' : 'NOT SET');
@@ -147,6 +147,7 @@ CREATE TABLE IF NOT EXISTS job_files (
     processing_metadata JSONB,
     extraction_error TEXT,
     processing_error TEXT,
+    selected_pages JSONB,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
     processed_at TIMESTAMP WITH TIME ZONE
@@ -230,6 +231,31 @@ ON CONFLICT (id) DO NOTHING;
                 console.log('✅ Token column already correct');
             } else {
                 console.log('⚠️ Token column fix skipped:', error.message);
+            }
+        }
+
+        // Add selected_pages column to job_files table if it doesn't exist
+        try {
+            await client.query(`
+                DO $$
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT 1 FROM information_schema.columns
+                        WHERE table_name = 'job_files' AND column_name = 'selected_pages'
+                    ) THEN
+                        ALTER TABLE job_files ADD COLUMN selected_pages JSONB;
+                        RAISE NOTICE 'Added selected_pages column to job_files table';
+                    ELSE
+                        RAISE NOTICE 'selected_pages column already exists in job_files table';
+                    END IF;
+                END $$;
+            `);
+            console.log('✅ selected_pages column migration completed');
+        } catch (error) {
+            if (error.message.includes('already exists') || error.message.includes('does not exist')) {
+                console.log('✅ selected_pages column already exists');
+            } else {
+                console.log('⚠️ selected_pages column migration skipped:', error.message);
             }
         }
 

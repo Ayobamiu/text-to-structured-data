@@ -21,9 +21,10 @@ class ExtractionService {
      * @param {string} method - Extraction method ('mineru', 'documentai', 'paddleocr', or 'extendai')
      * @param {Object} options - Method-specific options
      * @param {string} s3Key - Optional S3 key if file is in S3 (required for extendai)
+     * @param {number[]} selectedPages - Optional array of page numbers to extract (1-indexed, only for paddleocr)
      * @returns {Promise<Object>} Extraction result
      */
-    async extractText(filePath, filename, method = 'mineru', options = {}, s3Key = null) {
+    async extractText(filePath, filename, method = 'mineru', options = {}, s3Key = null, selectedPages = null) {
         try {
             console.log(`📄 Extracting text using ${method} method for ${filename}`);
 
@@ -34,7 +35,7 @@ class ExtractionService {
 
             // Handle PaddleOCR extraction (separate Flask service)
             if (method === 'paddleocr') {
-                return await this.extractWithPaddleOCR(filePath, filename, options);
+                return await this.extractWithPaddleOCR(filePath, filename, options, selectedPages);
             }
 
             // Fall through to Flask service for mineru/documentai
@@ -111,9 +112,10 @@ class ExtractionService {
      * @param {string} filePath - Path to the PDF/image file
      * @param {string} filename - Original filename
      * @param {Object} options - Extraction options
+     * @param {number[]} selectedPages - Optional array of page numbers to extract (1-indexed)
      * @returns {Promise<Object>} Extraction result
      */
-    async extractWithPaddleOCR(filePath, filename, options = {}) {
+    async extractWithPaddleOCR(filePath, filename, options = {}, selectedPages = null) {
         try {
             const FormData = (await import('form-data')).default;
             const formData = new FormData();
@@ -121,6 +123,12 @@ class ExtractionService {
                 filename: filename,
                 contentType: filename.endsWith('.pdf') ? "application/pdf" : "image/*",
             });
+
+            // Add selected_pages if provided
+            if (selectedPages && Array.isArray(selectedPages) && selectedPages.length > 0) {
+                formData.append("selected_pages", JSON.stringify(selectedPages));
+                console.log(`📄 Extracting selected pages: ${selectedPages.join(', ')}`);
+            }
 
             console.log(`🌐 Calling PaddleOCR Flask service: ${this.paddleocrFlaskUrl}/extract`);
             const response = await axios.post(`${this.paddleocrFlaskUrl}/extract`, formData, {
