@@ -84,6 +84,18 @@ export async function createJob(name, schema, schemaName, userId = null, organiz
 
 // Add file to job
 export async function addFileToJob(jobId, filename, size, s3Key, fileHash, uploadStatus = 'pending', uploadError = null, storageType = 's3', pageCount = null, selectedPages = null) {
+    console.log('🔍 addFileToJob debug:', {
+        jobId,
+        filename,
+        size,
+        s3Key,
+        fileHash,
+        uploadStatus,
+        uploadError,
+        storageType,
+        pageCount,
+        selectedPages
+    });
     const client = await pool.connect();
     try {
         const fileId = uuidv4();
@@ -399,6 +411,8 @@ export async function getJobStatus(jobId, includeLargeColumns = false) {
 }
 
 // Update file extraction status
+// NOTE: This function does NOT update page_count to preserve the original PDF page count
+// (especially when selected_pages are used, we want to keep the original total, not the selected pages count)
 export async function updateFileExtractionStatus(
     fileId,
     status,
@@ -412,33 +426,17 @@ export async function updateFileExtractionStatus(
     openaiFeedUnblocked = null,
     extractionMetadata = null,
     rawData = null,
-    pageCount = null // Optional: preserve or update page_count
+    pageCount = null // Parameter kept for backward compatibility, but page_count is NEVER updated
 ) {
     const client = await pool.connect();
     try {
-        // Build query conditionally - only update page_count if provided
-        let updatePageCount = pageCount !== null && pageCount !== undefined;
-
-        // Ensure pageCount is an integer if provided
-        let pageCountValue = null;
-        if (updatePageCount) {
-            pageCountValue = typeof pageCount === 'number' ? Math.floor(pageCount) : parseInt(pageCount, 10);
-            if (isNaN(pageCountValue) || pageCountValue < 0) {
-                console.warn(`⚠️ Invalid pageCount value: ${pageCount}, skipping page_count update`);
-                // Fall back to not updating page_count
-                updatePageCount = false;
-                pageCountValue = null;
-            }
-        }
-
-        // When updatePageCount is true: $1-$11 are regular params, $12 is fileId, $13 is pageCount
-        // When updatePageCount is false: $1-$11 are regular params, $12 is fileId
+        // Query does NOT include page_count - we preserve the original value
         const query = `
             UPDATE job_files 
             SET extraction_status = $1, extracted_text = $2, extracted_tables = $3, 
                 markdown = $4, pages = $5, extraction_error = $6, extraction_time_seconds = $7,
                 openai_feed_blocked = $8, openai_feed_unblocked = $9, extraction_metadata = $10,
-                raw_data = $11${updatePageCount ? ', page_count = $13' : ''}, updated_at = NOW()
+                raw_data = $11, updated_at = NOW()
             WHERE id = $12
             RETURNING id, job_id, filename
         `;
@@ -447,45 +445,26 @@ export async function updateFileExtractionStatus(
         const openaiFeedBlockedValue = (openaiFeedBlocked && openaiFeedBlocked.trim().length > 0) ? openaiFeedBlocked : null;
         const openaiFeedUnblockedValue = (openaiFeedUnblocked && openaiFeedUnblocked.trim().length > 0) ? openaiFeedUnblocked : null;
 
-        const values = updatePageCount
-            ? [
-                status,
-                extractedText,
-                extractedTables ? JSON.stringify(extractedTables) : null,
-                markdown,
-                pages ? JSON.stringify(pages) : null,
-                error,
-                extractionTimeSeconds,
-                openaiFeedBlockedValue,
-                openaiFeedUnblockedValue,
-                extractionMetadata ? JSON.stringify(extractionMetadata) : null,
-                rawData ? JSON.stringify(rawData) : null,
-                fileId,
-                pageCountValue
-            ]
-            : [
-                status,
-                extractedText,
-                extractedTables ? JSON.stringify(extractedTables) : null,
-                markdown,
-                pages ? JSON.stringify(pages) : null,
-                error,
-                extractionTimeSeconds,
-                openaiFeedBlockedValue,
-                openaiFeedUnblockedValue,
-                extractionMetadata ? JSON.stringify(extractionMetadata) : null,
-                rawData ? JSON.stringify(rawData) : null,
-                fileId
-            ];
+        const values = [
+            status,
+            extractedText,
+            extractedTables ? JSON.stringify(extractedTables) : null,
+            markdown,
+            pages ? JSON.stringify(pages) : null,
+            error,
+            extractionTimeSeconds,
+            openaiFeedBlockedValue,
+            openaiFeedUnblockedValue,
+            extractionMetadata ? JSON.stringify(extractionMetadata) : null,
+            rawData ? JSON.stringify(rawData) : null,
+            fileId
+        ];
 
         // Debug logging
         console.log('🔍 updateFileExtractionStatus debug:', {
             fileId,
             status,
             extractionTimeSeconds,
-            updatePageCount,
-            pageCount,
-            pageCountType: typeof pageCount,
             openaiFeedBlocked: openaiFeedBlockedValue ? `${openaiFeedBlockedValue.length} chars` : 'null',
             openaiFeedUnblocked: openaiFeedUnblockedValue ? `${openaiFeedUnblockedValue.length} chars` : 'null',
             hasExtractionMetadata: !!extractionMetadata,
@@ -494,8 +473,7 @@ export async function updateFileExtractionStatus(
             rawDataType: rawData ? typeof rawData : 'null',
             rawDataKeys: rawData && typeof rawData === 'object' ? Object.keys(rawData).slice(0, 5) : null,
             valuesLength: values.length,
-            lastValue: values[values.length - 1],
-            lastValueType: typeof values[values.length - 1],
+            note: 'page_count is NOT updated by this function'
         });
 
         const result = await client.query(query, values);
