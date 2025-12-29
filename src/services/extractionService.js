@@ -1,7 +1,10 @@
 import axios from 'axios';
 import FormData from 'form-data';
 import fs from 'fs';
+import path from 'path';
+import { PutObjectCommand } from '@aws-sdk/client-s3';
 import ExtendAIService from './extendAIService.js';
+import { extractPagesFromPdf } from './formationPageDetectionService.js';
 
 const FLASK_URL = process.env.FLASK_URL || "http://localhost:5001";
 const PADDLEOCR_FLASK_URL = process.env.PADDLEOCR_FLASK_URL || "http://localhost:5002";
@@ -21,7 +24,7 @@ class ExtractionService {
      * @param {string} method - Extraction method ('mineru', 'documentai', 'paddleocr', or 'extendai')
      * @param {Object} options - Method-specific options
      * @param {string} s3Key - Optional S3 key if file is in S3 (required for extendai)
-     * @param {number[]} selectedPages - Optional array of page numbers to extract (1-indexed, only for paddleocr)
+     * @param {number[]} selectedPages - Optional array of page numbers to extract (1-indexed, for paddleocr and extendai)
      * @returns {Promise<Object>} Extraction result
      */
     async extractText(filePath, filename, method = 'mineru', options = {}, s3Key = null, selectedPages = null) {
@@ -30,7 +33,7 @@ class ExtractionService {
 
             // Handle ExtendAI extraction (requires S3 signed URL)
             if (method === 'extendai') {
-                return await this.extractWithExtendAI(filename, s3Key, options);
+                return await this.extractWithExtendAI(filename, s3Key, options, selectedPages);
             }
 
             // Handle PaddleOCR extraction (separate Flask service)
@@ -361,9 +364,10 @@ class ExtractionService {
      * @param {string} filename - Original filename
      * @param {string} s3Key - S3 key of the file
      * @param {Object} options - Extraction options
+     * @param {number[]} selectedPages - Optional array of page numbers to extract (1-indexed)
      * @returns {Promise<Object>} Extraction result
      */
-    async extractWithExtendAI(filename, s3Key, options = {}) {
+    async extractWithExtendAI(filename, s3Key, options = {}, selectedPages = null) {
         // Try ExtendAI first
         try {
             if (!s3Key || !this.s3Service) {
@@ -375,19 +379,85 @@ class ExtractionService {
                 throw new Error('ExtendAI not configured');
             }
 
-            console.log(`🚀 Attempting ExtendAI extraction for ${filename}`);
+            let finalS3Key = s3Key;
+            let tempS3Key = null;
+
+            // If selectedPages is provided, filter the PDF first
+            if (selectedPages && Array.isArray(selectedPages) && selectedPages.length > 0) {
+                console.log(`📄 Filtering PDF to selected pages: ${selectedPages.join(', ')}`);
+
+                try {
+                    // Download original PDF from S3
+                    const pdfBuffer = await this.s3Service.downloadFile(s3Key);
+
+                    // Extract only selected pages
+                    const filteredPdfBuffer = await extractPagesFromPdf(pdfBuffer, selectedPages);
+                    console.log(`✅ Extracted ${selectedPages.length} pages into filtered PDF (${filteredPdfBuffer.length} bytes)`);
+
+                    // Upload filtered PDF to S3 temporarily
+                    const timestamp = Date.now();
+                    const random = Math.random().toString(36).substring(2);
+                    const ext = path.extname(filename);
+                    const baseName = path.basename(filename, ext);
+                    const tempFilename = `${baseName}_filtered_${timestamp}_${random}${ext}`;
+                    tempS3Key = `temp/${tempFilename}`;
+
+                    const uploadCommand = new PutObjectCommand({
+                        Bucket: this.s3Service.bucketName,
+                        Key: tempS3Key,
+                        Body: filteredPdfBuffer,
+                        ContentType: 'application/pdf',
+                        Metadata: {
+                            originalS3Key: s3Key,
+                            selectedPages: selectedPages.join(','),
+                            extractedAt: new Date().toISOString()
+                        }
+                    });
+
+                    await this.s3Service.s3Client.send(uploadCommand);
+                    console.log(`✅ Filtered PDF uploaded to S3: ${tempS3Key}`);
+
+                    // Use filtered PDF for ExtendAI
+                    finalS3Key = tempS3Key;
+                } catch (filterError) {
+                    console.error(`❌ Error filtering PDF pages: ${filterError.message}`);
+                    throw new Error(`Failed to filter PDF pages: ${filterError.message}`);
+                }
+            }
+
+            console.log(`🚀 Attempting ExtendAI extraction for ${filename}${selectedPages ? ` (filtered to ${selectedPages.length} pages)` : ''}`);
 
             // Generate signed URL and extract with ExtendAI
             const result = await this.extendAIService.extractFromS3(
-                s3Key,
+                finalS3Key,
                 filename,
                 (key, expiresIn) => this.s3Service.generateSignedUrl(key, expiresIn)
             );
+
+            // Clean up temporary filtered PDF if it was created
+            if (tempS3Key) {
+                try {
+                    await this.s3Service.deleteFile(tempS3Key);
+                    console.log(`🗑️ Cleaned up temporary filtered PDF: ${tempS3Key}`);
+                } catch (cleanupError) {
+                    console.warn(`⚠️ Failed to clean up temporary PDF ${tempS3Key}: ${cleanupError.message}`);
+                }
+            }
 
             console.log(`✅ ExtendAI extraction successful for ${filename}`);
             return result;
 
         } catch (extendAIError) {
+            // Clean up temporary filtered PDF if it was created (even on error)
+            if (tempS3Key) {
+                try {
+                    await this.s3Service.deleteFile(tempS3Key);
+                    console.log(`🗑️ Cleaned up temporary filtered PDF after error: ${tempS3Key}`);
+                } catch (cleanupError) {
+                    console.warn(`⚠️ Failed to clean up temporary PDF ${tempS3Key}: ${cleanupError.message}`);
+                }
+            }
+
             console.warn(`⚠️ ExtendAI extraction failed: ${extendAIError.message}`);
             console.log(`🔄 Falling back to mineru for ${filename}`);
 

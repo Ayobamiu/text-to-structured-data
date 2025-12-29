@@ -2090,7 +2090,7 @@ async function processFilesAsync(job, files, schema, schemaName, processingConfi
                 if (extractionMethod === 'extendai') {
                     // Try ExtendAI with fallback to mineru
                     console.log(`🚀 Attempting ExtendAI extraction for ${file.originalname}`);
-                    extractionResult = await extractionService.extractWithExtendAI(file.originalname, s3Key, extractionOptions);
+                    extractionResult = await extractionService.extractWithExtendAI(file.originalname, s3Key, extractionOptions, selectedPages);
 
                     // If ExtendAI fails, fallback to mineru
                     if (!extractionResult.success) {
@@ -2187,6 +2187,9 @@ async function processFilesAsync(job, files, schema, schemaName, processingConfi
                 // Check if page detection is enabled in job config (default: true for backward compatibility)
                 // Reuse jobProcessingConfig that was already declared above
                 const usePageDetection = jobProcessingConfig?.usePageDetection !== false; // Default to true
+                console.log('--------------------------------------- IMPORTANT ---------------------------------------');
+                console.log({ jobProcessingConfig, usePageDetection });
+                console.log('--------------------------------------- IMPORTANT ---------------------------------------');
 
                 let confidentHits = [];
                 let preProcessingMetadata = {};

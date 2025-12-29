@@ -266,7 +266,7 @@ class FileProcessorWorker {
 
                 // Handle ExtendAI with fallback to mineru
                 if (extractionMethod === 'extendai') {
-                    extractionResult = await this.extractWithExtendAI(file, extractionOptions);
+                    extractionResult = await this.extractWithExtendAI(file, extractionOptions, selectedPages);
                     if (!extractionResult.success) {
                         console.log(`⚠️ ExtendAI failed: ${extractionResult.error}`);
                         console.log(`🔄 Falling back to mineru for ${file.filename}`);
@@ -399,7 +399,7 @@ class FileProcessorWorker {
 
                 // Handle ExtendAI with fallback to mineru
                 if (extractionMethod === 'extendai') {
-                    extractionResult = await this.extractWithExtendAI(file, extractionOptions);
+                    extractionResult = await this.extractWithExtendAI(file, extractionOptions, selectedPages);
                     if (!extractionResult.success) {
                         console.log(`⚠️ ExtendAI failed: ${extractionResult.error}`);
                         console.log(`🔄 Falling back to mineru for ${file.filename}`);
@@ -513,7 +513,7 @@ class FileProcessorWorker {
 
                 // Handle ExtendAI with fallback to mineru
                 if (extractionMethod === 'extendai') {
-                    extractionResult = await this.extractWithExtendAI(file, extractionOptions);
+                    extractionResult = await this.extractWithExtendAI(file, extractionOptions, selectedPages);
                     if (!extractionResult.success) {
                         console.log(`⚠️ ExtendAI failed: ${extractionResult.error}`);
                         console.log(`🔄 Falling back to mineru for ${file.filename}`);
@@ -614,6 +614,9 @@ class FileProcessorWorker {
                 }
                 // Update usePageDetection (already declared at function scope)
                 usePageDetection = jobProcessingConfig?.usePageDetection !== false; // Default to true
+                console.log('--------------------------------------- IMPORTANT ---------------------------------------');
+                console.log({ processing_config: job.processing_config, usePageDetection });
+                console.log('--------------------------------------- IMPORTANT ---------------------------------------');
 
                 if (usePageDetection) {
                     try {
@@ -909,16 +912,23 @@ class FileProcessorWorker {
      * Extract with ExtendAI (requires S3 file)
      * @param {Object} file - File record with s3_key
      * @param {Object} options - Extraction options
+     * @param {number[]} selectedPages - Optional array of page numbers to extract (1-indexed)
      * @returns {Promise<Object>} Extraction result
      */
-    async extractWithExtendAI(file, options = {}) {
+    async extractWithExtendAI(file, options = {}, selectedPages = null) {
         try {
             if (!file.s3_key) {
                 throw new Error('S3 key required for ExtendAI extraction');
             }
 
+            // Use parameter if provided, otherwise fall back to file object
+            selectedPages = selectedPages || file.selected_pages || null;
+            if (selectedPages && Array.isArray(selectedPages) && selectedPages.length > 0) {
+                console.log(`📄 Using selected pages for ExtendAI: ${selectedPages.join(', ')}`);
+            }
+
             console.log(`🚀 Attempting ExtendAI extraction for ${file.filename} (S3: ${file.s3_key})`);
-            return await this.extractionService.extractWithExtendAI(file.filename, file.s3_key, options);
+            return await this.extractionService.extractWithExtendAI(file.filename, file.s3_key, options, selectedPages);
         } catch (error) {
             console.error('❌ ExtendAI extraction error:', error.message);
             return {
@@ -934,7 +944,7 @@ class FileProcessorWorker {
 
             // Handle ExtendAI extraction (requires S3)
             if (method === 'extendai') {
-                return await this.extractWithExtendAI(file, options);
+                return await this.extractWithExtendAI(file, options, selectedPages);
             }
 
             // Check if file is stored in S3
@@ -964,9 +974,9 @@ class FileProcessorWorker {
                 console.log(`📄 Using selected pages: ${selectedPages.join(', ')}`);
             }
 
-            // For ExtendAI, use direct S3 URL (no need to download)
+            // For ExtendAI, use direct S3 URL (no need to download, but may need to filter pages)
             if (method === 'extendai') {
-                return await this.extractWithExtendAI(file, options);
+                return await this.extractWithExtendAI(file, options, selectedPages);
             }
 
             // For other methods, download file and use Flask service
