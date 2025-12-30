@@ -159,7 +159,8 @@ class MGSDataService {
                 // Clean up the permit number (remove spaces, special chars)
                 const cleaned = result[field].replace(/[^\d]/g, '');
                 if (cleaned.length > 0) {
-                    return cleaned;
+                    // Remove leading zeros (e.g., "09426" -> "9426")
+                    return this.normalizePermitNumber(cleaned);
                 }
             }
         }
@@ -230,9 +231,11 @@ class MGSDataService {
         // Always extract permit number from filename and replace it in the result
         const permitNumber = this.extractPermitFromFilename(filename);
         if (permitNumber) {
+            // Normalize permit number (remove leading zeros)
+            const normalizedPermit = this.normalizePermitNumber(permitNumber);
             return {
                 ...result,
-                permit_number: permitNumber
+                permit_number: normalizedPermit
             };
         }
 
