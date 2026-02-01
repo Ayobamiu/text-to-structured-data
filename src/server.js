@@ -233,7 +233,7 @@ app.get("/test-db", async (req, res) => {
     }
 });
 
-// Redis connection test
+// Queue database connection test (legacy endpoint name)
 app.get("/test-redis", async (req, res) => {
     try {
         const result = await queueService.testConnection();
@@ -241,7 +241,7 @@ app.get("/test-redis", async (req, res) => {
             status: "success",
             redis: {
                 connected: result,
-                message: result ? "Redis connection successful" : "Redis connection failed"
+                message: result ? "Queue database connection successful" : "Queue database connection failed"
             }
         });
     } catch (error) {
@@ -399,16 +399,7 @@ app.post("/queue/files/:fileId", async (req, res) => {
         }
 
         // Check if file is already in queue
-        const client = await queueService.connect();
-        const queueItems = await client.zRange(queueService.queueKey, 0, -1);
-        const isInQueue = queueItems.some(item => {
-            try {
-                const data = JSON.parse(item);
-                return data.fileId === fileId;
-            } catch {
-                return false;
-            }
-        });
+        const isInQueue = await queueService.isFileInQueue(fileId);
 
         if (isInQueue) {
             return res.status(400).json({
@@ -3036,16 +3027,7 @@ app.post("/files/reprocess", authenticateToken, async (req, res) => {
                 }
 
                 // Check if file is already in queue
-                const client = await queueService.connect();
-                const queueItems = await client.zRange(queueService.queueKey, 0, -1);
-                const isInQueue = queueItems.some(item => {
-                    try {
-                        const data = JSON.parse(item);
-                        return data.fileId === fileId;
-                    } catch {
-                        return false;
-                    }
-                });
+                const isInQueue = await queueService.isFileInQueue(fileId);
 
                 if (isInQueue) {
                     console.log(`File ${fileId} already in processing queue`);
@@ -3057,7 +3039,7 @@ app.post("/files/reprocess", authenticateToken, async (req, res) => {
                 }
 
                 // Check if file is currently being processed
-                const isProcessing = await client.hExists(queueService.processingKey, fileId);
+                const isProcessing = await queueService.isFileProcessing(fileId);
                 if (isProcessing) {
                     console.log(`File ${fileId} currently being processed`);
                     skippedFiles.push({
