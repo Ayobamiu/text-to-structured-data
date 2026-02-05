@@ -97,15 +97,15 @@ class FileProcessorWorker {
         console.log('🛑 Stopping File Processor Worker...');
         this.logWorkerStats();
 
-        // Disconnect from Redis
+        // Disconnect from queue database pool
         await queueService.disconnect();
     }
 
     async testConnections() {
-        // Test Redis connection
-        const isRedisConnected = await queueService.testConnection();
-        if (!isRedisConnected) {
-            throw new Error('Redis connection failed. Worker cannot start.');
+        // Test queue database connection
+        const isQueueConnected = await queueService.testConnection();
+        if (!isQueueConnected) {
+            throw new Error('Queue database connection failed. Worker cannot start.');
         }
 
         // Test S3 connection

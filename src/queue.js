@@ -1,71 +1,115 @@
-import { createClient } from 'redis';
 import dotenv from 'dotenv';
+import pool from './database.js';
 
 dotenv.config();
 
 class QueueService {
     constructor() {
-        this.redisUrl = process.env.REDIS_URL || 'redis://localhost:6379';
-        this.client = null;
         this.queueKey = 'file_processing_queue';
         this.processingKey = 'file_processing_active';
         this.maxRetries = 3;
         this.retryDelay = 5000; // 5 seconds
+        this.schemaLoaded = false;
+        this.availableAtColumn = 'updated_at';
+        this.processingStartedAtColumn = 'updated_at';
+        this.hasQueueControl = false;
     }
 
     async connect() {
-        if (!this.client) {
-            this.client = createClient({
-                url: this.redisUrl,
-                socket: {
-                    connectTimeout: 10000, // 10 seconds
-                    lazyConnect: true
-                }
-            });
-
-            this.client.on('error', (err) => {
-                console.error('❌ Redis Client Error:', err);
-            });
-
-            this.client.on('connect', () => {
-                console.log('✅ Redis client connected');
-            });
-
-            this.client.on('reconnecting', () => {
-                console.log('🔄 Redis client reconnecting...');
-            });
-
-            this.client.on('end', () => {
-                console.log('🛑 Redis client disconnected');
-            });
-
-            try {
-                await this.client.connect();
-                console.log('✅ Redis connection successful');
-            } catch (error) {
-                console.error('❌ Failed to connect to Redis:', error.message);
-                throw error;
-            }
-        }
-        return this.client;
+        await this.ensureSchemaInfo();
+        return pool;
     }
 
     async disconnect() {
-        if (this.client) {
-            await this.client.quit();
-            this.client = null;
-            console.log('🛑 Redis client disconnected');
-        }
+        await pool.end();
+        console.log('🛑 Queue database connection pool closed');
     }
 
     async testConnection() {
         try {
-            const client = await this.connect();
-            const pong = await client.ping();
-            return pong === 'PONG';
+            const client = await pool.connect();
+            await client.query('SELECT 1');
+            client.release();
+            return true;
         } catch (error) {
-            console.error('❌ Redis connection test failed:', error.message);
+            console.error('❌ Queue database connection test failed:', error.message);
             return false;
+        }
+    }
+
+    async ensureSchemaInfo() {
+        if (this.schemaLoaded) {
+            return;
+        }
+
+        const client = await pool.connect();
+        try {
+            const columnsResult = await client.query(`
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema = 'public'
+                  AND table_name = 'file_processing_queue'
+            `);
+            const columns = columnsResult.rows.map(row => row.column_name);
+
+            const availableCandidates = ['available_at', 'next_attempt_at', 'scheduled_at', 'run_at'];
+            this.availableAtColumn = availableCandidates.find(col => columns.includes(col)) || 'updated_at';
+
+            const processingCandidates = ['processing_started_at', 'started_at', 'processing_at'];
+            this.processingStartedAtColumn = processingCandidates.find(col => columns.includes(col)) || 'updated_at';
+
+            const queueControlResult = await client.query(`SELECT to_regclass('public.queue_control') AS name`);
+            this.hasQueueControl = Boolean(queueControlResult.rows[0]?.name);
+        } finally {
+            client.release();
+        }
+
+        this.schemaLoaded = true;
+    }
+
+    buildQueueItem(row) {
+        return {
+            fileId: row.file_id,
+            jobId: row.job_id,
+            priority: row.priority ?? 0,
+            retries: row.retries ?? 0,
+            status: row.status,
+            mode: row.mode || 'normal',
+            timestamp: row.created_at ? new Date(row.created_at).getTime() : Date.now()
+        };
+    }
+
+    async insertQueueItem({ fileId, jobId, priority, mode, retries, delayMs = 0 }) {
+        await this.ensureSchemaInfo();
+
+        const availableAtColumn = this.availableAtColumn;
+        const hasDelay = delayMs > 0;
+        const delayExpr = hasDelay ? `NOW() + ($6 * INTERVAL '1 millisecond')` : 'NOW()';
+
+        const availableAtInsert = availableAtColumn !== 'updated_at'
+            ? `, ${availableAtColumn}`
+            : '';
+        const availableAtValues = availableAtColumn !== 'updated_at'
+            ? `, ${delayExpr}`
+            : '';
+        const updatedAtValue = availableAtColumn === 'updated_at' ? delayExpr : 'NOW()';
+
+        const query = `
+            INSERT INTO file_processing_queue (file_id, job_id, priority, status, mode, retries, created_at, updated_at${availableAtInsert})
+            VALUES ($1, $2, $3, 'queued', $4, $5, NOW(), ${updatedAtValue}${availableAtValues})
+            RETURNING id, file_id, job_id, priority, status, mode, retries, created_at, updated_at
+        `;
+
+        const params = hasDelay
+            ? [fileId, jobId, priority, mode, retries, delayMs]
+            : [fileId, jobId, priority, mode, retries];
+
+        const client = await pool.connect();
+        try {
+            const result = await client.query(query, params);
+            return result.rows[0];
+        } finally {
+            client.release();
         }
     }
 
@@ -73,26 +117,16 @@ class QueueService {
     async addFileToQueue(fileId, jobId, priority = 0, mode = 'normal') {
         console.log(`🔄 Adding file ${fileId} to queue with priority ${priority} (mode: ${mode})`);
         try {
-            const client = await this.connect();
-
-            const queueItem = {
+            const row = await this.insertQueueItem({
                 fileId,
                 jobId,
                 priority,
-                timestamp: Date.now(),
-                retries: 0,
-                status: 'queued',
-                mode: mode // 'normal', 'reprocess', 'extraction-only', 'both', 'force-full'
-            };
-
-            // Add to sorted set (priority queue)
-            await client.zAdd(this.queueKey, {
-                score: priority,
-                value: JSON.stringify(queueItem)
+                mode,
+                retries: 0
             });
 
             console.log(`✅ File ${fileId} added to queue with priority ${priority} (mode: ${mode})`);
-            return queueItem;
+            return this.buildQueueItem(row);
         } catch (error) {
             console.error('❌ Error adding file to queue:', error.message);
             throw error;
@@ -102,18 +136,56 @@ class QueueService {
     // Get next file from queue
     async getNextFile() {
         try {
-            const client = await this.connect();
+            await this.ensureSchemaInfo();
+            const client = await pool.connect();
+            try {
+                await client.query('BEGIN');
 
-            // Get the highest priority item (lowest score)
-            const result = await client.zPopMin(this.queueKey);
+                const nextQuery = `
+                    SELECT id, file_id, job_id, priority, status, mode, retries, created_at, updated_at
+                    FROM file_processing_queue
+                    WHERE status = 'queued'
+                      AND ${this.availableAtColumn} <= NOW()
+                    ORDER BY priority ASC, created_at ASC
+                    LIMIT 1
+                    FOR UPDATE SKIP LOCKED
+                `;
 
-            if (!result || result.length === 0) {
-                return null;
+                const nextResult = await client.query(nextQuery);
+                if (nextResult.rows.length === 0) {
+                    await client.query('ROLLBACK');
+                    return null;
+                }
+
+                const nextRow = nextResult.rows[0];
+
+                const updateFields = [
+                    `status = 'processing'`,
+                    `updated_at = NOW()`
+                ];
+                if (this.processingStartedAtColumn !== 'updated_at') {
+                    updateFields.push(`${this.processingStartedAtColumn} = NOW()`);
+                }
+
+                const updateQuery = `
+                    UPDATE file_processing_queue
+                    SET ${updateFields.join(', ')}
+                    WHERE id = $1
+                    RETURNING id, file_id, job_id, priority, status, mode, retries, created_at, updated_at
+                `;
+
+                const updatedResult = await client.query(updateQuery, [nextRow.id]);
+                await client.query('COMMIT');
+
+                const queueItem = this.buildQueueItem(updatedResult.rows[0]);
+                console.log(`✅ Retrieved file ${queueItem.fileId} from queue`);
+                return queueItem;
+            } catch (error) {
+                await client.query('ROLLBACK');
+                throw error;
+            } finally {
+                client.release();
             }
-
-            const queueItem = JSON.parse(result.value);
-            console.log(`✅ Retrieved file ${queueItem.fileId} from queue`);
-            return queueItem;
         } catch (error) {
             console.error('❌ Error getting next file from queue:', error.message);
             throw error;
@@ -123,8 +195,27 @@ class QueueService {
     // Mark file as processing
     async markFileAsProcessing(fileId) {
         try {
-            const client = await this.connect();
-            await client.hSet(this.processingKey, fileId, Date.now());
+            await this.ensureSchemaInfo();
+            const client = await pool.connect();
+            try {
+                const updateFields = [
+                    `status = 'processing'`,
+                    `updated_at = NOW()`
+                ];
+                if (this.processingStartedAtColumn !== 'updated_at') {
+                    updateFields.push(`${this.processingStartedAtColumn} = NOW()`);
+                }
+
+                const query = `
+                    UPDATE file_processing_queue
+                    SET ${updateFields.join(', ')}
+                    WHERE file_id = $1
+                      AND status = 'processing'
+                `;
+                await client.query(query, [fileId]);
+            } finally {
+                client.release();
+            }
             console.log(`✅ File ${fileId} marked as processing`);
         } catch (error) {
             console.error('❌ Error marking file as processing:', error.message);
@@ -135,8 +226,15 @@ class QueueService {
     // Remove file from processing
     async removeFileFromProcessing(fileId) {
         try {
-            const client = await this.connect();
-            await client.hDel(this.processingKey, fileId);
+            const client = await pool.connect();
+            try {
+                await client.query(
+                    `DELETE FROM file_processing_queue WHERE file_id = $1 AND status = 'processing'`,
+                    [fileId]
+                );
+            } finally {
+                client.release();
+            }
             console.log(`✅ File ${fileId} removed from processing`);
         } catch (error) {
             console.error('❌ Error removing file from processing:', error.message);
@@ -147,18 +245,21 @@ class QueueService {
     // Clear all stuck processing files
     async clearAllProcessingFiles() {
         try {
-            const client = await this.connect();
-            const processingFiles = await client.hGetAll(this.processingKey);
-            const fileIds = Object.keys(processingFiles);
-
-            if (fileIds.length === 0) {
-                console.log('✅ No processing files to clear');
-                return 0;
+            const client = await pool.connect();
+            try {
+                const result = await client.query(
+                    `DELETE FROM file_processing_queue WHERE status = 'processing' RETURNING file_id`
+                );
+                if (result.rows.length === 0) {
+                    console.log('✅ No processing files to clear');
+                    return 0;
+                }
+                const fileIds = result.rows.map(row => row.file_id);
+                console.log(`✅ Cleared ${fileIds.length} stuck processing files:`, fileIds);
+                return fileIds.length;
+            } finally {
+                client.release();
             }
-
-            await client.del(this.processingKey);
-            console.log(`✅ Cleared ${fileIds.length} stuck processing files:`, fileIds);
-            return fileIds.length;
         } catch (error) {
             console.error('❌ Error clearing processing files:', error.message);
             throw error;
@@ -168,15 +269,19 @@ class QueueService {
     // Retry failed file
     async retryFile(fileId, jobId, priority = 0, mode = 'normal') {
         try {
-            const client = await this.connect();
-
-            // Get current retry count
-            const processingData = await client.hGet(this.processingKey, fileId);
+            await this.ensureSchemaInfo();
+            const client = await pool.connect();
             let retries = 0;
-
-            if (processingData) {
-                const data = JSON.parse(processingData);
-                retries = data.retries || 0;
+            try {
+                const retryResult = await client.query(
+                    `SELECT retries FROM file_processing_queue WHERE file_id = $1 AND status = 'processing' ORDER BY updated_at DESC LIMIT 1`,
+                    [fileId]
+                );
+                if (retryResult.rows.length > 0) {
+                    retries = retryResult.rows[0].retries || 0;
+                }
+            } finally {
+                client.release();
             }
 
             if (retries >= this.maxRetries) {
@@ -186,19 +291,13 @@ class QueueService {
 
             // Add back to queue with delay
             const delay = this.retryDelay * Math.pow(2, retries); // Exponential backoff
-            const queueItem = {
+            await this.insertQueueItem({
                 fileId,
                 jobId,
                 priority,
-                timestamp: Date.now() + delay,
+                mode,
                 retries: retries + 1,
-                status: 'retry',
-                mode: mode
-            };
-
-            await client.zAdd(this.queueKey, {
-                score: priority + delay,
-                value: JSON.stringify(queueItem)
+                delayMs: delay
             });
 
             console.log(`🔄 File ${fileId} retried (attempt ${retries + 1}/${this.maxRetries})`);
@@ -212,46 +311,71 @@ class QueueService {
     // Get queue statistics
     async getQueueStats() {
         try {
-            const client = await this.connect();
+            await this.ensureSchemaInfo();
+            const client = await pool.connect();
+            try {
+                const queueSizeResult = await client.query(
+                    `SELECT COUNT(*)::int AS count FROM file_processing_queue WHERE status = 'queued'`
+                );
+                const processingCountResult = await client.query(
+                    `SELECT COUNT(*)::int AS count FROM file_processing_queue WHERE status = 'processing'`
+                );
 
-            const queueSize = await client.zCard(this.queueKey);
-            const processingCount = await client.hLen(this.processingKey);
+                const queueSize = queueSizeResult.rows[0]?.count || 0;
+                const processingCount = processingCountResult.rows[0]?.count || 0;
 
-            // Get next items in queue
-            const nextItems = await client.zRange(this.queueKey, 0, 4, { REV: false });
-            const nextFiles = nextItems.map(item => {
-                try {
-                    return JSON.parse(item);
-                } catch {
-                    return null;
-                }
-            }).filter(Boolean);
+                const nextItemsResult = await client.query(`
+                    SELECT file_id, job_id, priority, status, mode, retries, created_at
+                    FROM file_processing_queue
+                    WHERE status = 'queued'
+                      AND ${this.availableAtColumn} <= NOW()
+                    ORDER BY priority ASC, created_at ASC
+                    LIMIT 5
+                `);
+                const nextFiles = nextItemsResult.rows.map(row => this.buildQueueItem(row));
 
-            // Get processing files details
-            const processingFiles = await this.getProcessingFiles();
+                const processingFiles = await this.getProcessingFiles();
 
-            // Get queue health metrics
-            const oldestItem = await client.zRange(this.queueKey, 0, 0, { REV: false, WITHSCORES: true });
-            const newestItem = await client.zRange(this.queueKey, -1, -1, { REV: false, WITHSCORES: true });
+                const oldestItemResult = await client.query(`
+                    SELECT created_at
+                    FROM file_processing_queue
+                    WHERE status = 'queued'
+                    ORDER BY created_at ASC
+                    LIMIT 1
+                `);
+                const newestItemResult = await client.query(`
+                    SELECT created_at
+                    FROM file_processing_queue
+                    WHERE status = 'queued'
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                `);
 
-            const oldestTimestamp = oldestItem.length > 0 ? oldestItem[0].score : null;
-            const newestTimestamp = newestItem.length > 0 ? newestItem[0].score : null;
+                const oldestTimestamp = oldestItemResult.rows[0]?.created_at
+                    ? new Date(oldestItemResult.rows[0].created_at).getTime()
+                    : null;
+                const newestTimestamp = newestItemResult.rows[0]?.created_at
+                    ? new Date(newestItemResult.rows[0].created_at).getTime()
+                    : null;
 
-            const avgWaitTime = oldestTimestamp ? Date.now() - oldestTimestamp : 0;
+                const avgWaitTime = oldestTimestamp ? Date.now() - oldestTimestamp : 0;
 
-            return {
-                queueSize,
-                processingCount,
-                nextFiles,
-                processingFiles,
-                maxRetries: this.maxRetries,
-                retryDelay: this.retryDelay,
-                metrics: {
-                    avgWaitTimeMs: avgWaitTime,
-                    oldestItemAge: oldestTimestamp ? Date.now() - oldestTimestamp : 0,
-                    queueHealth: this.calculateQueueHealth(queueSize, processingCount, avgWaitTime)
-                }
-            };
+                return {
+                    queueSize,
+                    processingCount,
+                    nextFiles,
+                    processingFiles,
+                    maxRetries: this.maxRetries,
+                    retryDelay: this.retryDelay,
+                    metrics: {
+                        avgWaitTimeMs: avgWaitTime,
+                        oldestItemAge: oldestTimestamp ? Date.now() - oldestTimestamp : 0,
+                        queueHealth: this.calculateQueueHealth(queueSize, processingCount, avgWaitTime)
+                    }
+                };
+            } finally {
+                client.release();
+            }
         } catch (error) {
             console.error('❌ Error getting queue stats:', error.message);
             throw error;
@@ -285,9 +409,12 @@ class QueueService {
     // Clear queue (for testing)
     async clearQueue() {
         try {
-            const client = await this.connect();
-            await client.del(this.queueKey);
-            await client.del(this.processingKey);
+            const client = await pool.connect();
+            try {
+                await client.query('DELETE FROM file_processing_queue');
+            } finally {
+                client.release();
+            }
             console.log('🗑️ Queue cleared');
         } catch (error) {
             console.error('❌ Error clearing queue:', error.message);
@@ -298,8 +425,39 @@ class QueueService {
     // Pause queue processing
     async pauseQueue() {
         try {
-            const client = await this.connect();
-            await client.set('queue_paused', 'true');
+            await this.ensureSchemaInfo();
+            if (!this.hasQueueControl) {
+                throw new Error('queue_control table not found. Please add it to enable pause/resume.');
+            }
+
+            const client = await pool.connect();
+            try {
+                const columnsResult = await client.query(`
+                    SELECT column_name
+                    FROM information_schema.columns
+                    WHERE table_schema = 'public'
+                      AND table_name = 'queue_control'
+                `);
+                const columns = columnsResult.rows.map(row => row.column_name);
+
+                if (columns.includes('key')) {
+                    await client.query(`
+                        INSERT INTO queue_control (key, paused, updated_at)
+                        VALUES ('queue', true, NOW())
+                        ON CONFLICT (key)
+                        DO UPDATE SET paused = EXCLUDED.paused, updated_at = NOW()
+                    `);
+                } else {
+                    await client.query(`
+                        INSERT INTO queue_control (id, paused, updated_at)
+                        VALUES (1, true, NOW())
+                        ON CONFLICT (id)
+                        DO UPDATE SET paused = EXCLUDED.paused, updated_at = NOW()
+                    `);
+                }
+            } finally {
+                client.release();
+            }
             console.log('⏸️ Queue paused');
         } catch (error) {
             console.error('❌ Error pausing queue:', error.message);
@@ -310,8 +468,39 @@ class QueueService {
     // Resume queue processing
     async resumeQueue() {
         try {
-            const client = await this.connect();
-            await client.del('queue_paused');
+            await this.ensureSchemaInfo();
+            if (!this.hasQueueControl) {
+                throw new Error('queue_control table not found. Please add it to enable pause/resume.');
+            }
+
+            const client = await pool.connect();
+            try {
+                const columnsResult = await client.query(`
+                    SELECT column_name
+                    FROM information_schema.columns
+                    WHERE table_schema = 'public'
+                      AND table_name = 'queue_control'
+                `);
+                const columns = columnsResult.rows.map(row => row.column_name);
+
+                if (columns.includes('key')) {
+                    await client.query(`
+                        INSERT INTO queue_control (key, paused, updated_at)
+                        VALUES ('queue', false, NOW())
+                        ON CONFLICT (key)
+                        DO UPDATE SET paused = EXCLUDED.paused, updated_at = NOW()
+                    `);
+                } else {
+                    await client.query(`
+                        INSERT INTO queue_control (id, paused, updated_at)
+                        VALUES (1, false, NOW())
+                        ON CONFLICT (id)
+                        DO UPDATE SET paused = EXCLUDED.paused, updated_at = NOW()
+                    `);
+                }
+            } finally {
+                client.release();
+            }
             console.log('▶️ Queue resumed');
         } catch (error) {
             console.error('❌ Error resuming queue:', error.message);
@@ -322,9 +511,31 @@ class QueueService {
     // Check if queue is paused
     async isQueuePaused() {
         try {
-            const client = await this.connect();
-            const paused = await client.get('queue_paused');
-            return paused === 'true';
+            await this.ensureSchemaInfo();
+            if (!this.hasQueueControl) {
+                return false;
+            }
+
+            const client = await pool.connect();
+            try {
+                const columnsResult = await client.query(`
+                    SELECT column_name
+                    FROM information_schema.columns
+                    WHERE table_schema = 'public'
+                      AND table_name = 'queue_control'
+                `);
+                const columns = columnsResult.rows.map(row => row.column_name);
+
+                if (columns.includes('key')) {
+                    const result = await client.query(`SELECT paused FROM queue_control WHERE key = 'queue'`);
+                    return result.rows.length > 0 ? result.rows[0].paused === true : false;
+                }
+
+                const result = await client.query(`SELECT paused FROM queue_control WHERE id = 1`);
+                return result.rows.length > 0 ? result.rows[0].paused === true : false;
+            } finally {
+                client.release();
+            }
         } catch (error) {
             console.error('❌ Error checking queue status:', error.message);
             return false;
@@ -334,24 +545,12 @@ class QueueService {
     // Remove specific file from queue
     async removeFileFromQueue(fileId) {
         try {
-            const client = await this.connect();
-
-            // Remove from main queue
-            const queueItems = await client.zRange(this.queueKey, 0, -1);
-            for (const item of queueItems) {
-                try {
-                    const data = JSON.parse(item);
-                    if (data.fileId === fileId) {
-                        await client.zRem(this.queueKey, item);
-                        break;
-                    }
-                } catch (e) {
-                    // Skip invalid items
-                }
+            const client = await pool.connect();
+            try {
+                await client.query(`DELETE FROM file_processing_queue WHERE file_id = $1`, [fileId]);
+            } finally {
+                client.release();
             }
-
-            // Remove from processing set
-            await client.hDel(this.processingKey, fileId);
 
             console.log(`🗑️ File ${fileId} removed from queue`);
         } catch (error) {
@@ -363,36 +562,43 @@ class QueueService {
     // Get detailed queue analytics
     async getQueueAnalytics() {
         try {
-            const client = await this.connect();
+            const client = await pool.connect();
+            try {
+                const queueSizeResult = await client.query(
+                    `SELECT COUNT(*)::int AS count FROM file_processing_queue WHERE status = 'queued'`
+                );
+                const processingCountResult = await client.query(
+                    `SELECT COUNT(*)::int AS count FROM file_processing_queue WHERE status = 'processing'`
+                );
 
-            // Get queue size over time (simplified)
-            const queueSize = await client.zCard(this.queueKey);
-            const processingCount = await client.hLen(this.processingKey);
+                const queueSize = queueSizeResult.rows[0]?.count || 0;
+                const processingCount = processingCountResult.rows[0]?.count || 0;
 
-            // Get processing files with timestamps
-            const processingFiles = await this.getProcessingFiles();
+                const processingFiles = await this.getProcessingFiles();
 
-            // Calculate processing times
-            const now = Date.now();
-            const processingTimes = processingFiles.map(file => {
-                if (file.timestamp) {
-                    return now - file.timestamp;
-                }
-                return 0;
-            });
+                const now = Date.now();
+                const processingTimes = processingFiles.map(file => {
+                    if (file.timestamp) {
+                        return now - file.timestamp;
+                    }
+                    return 0;
+                });
 
-            const avgProcessingTime = processingTimes.length > 0
-                ? processingTimes.reduce((a, b) => a + b, 0) / processingTimes.length
-                : 0;
+                const avgProcessingTime = processingTimes.length > 0
+                    ? processingTimes.reduce((a, b) => a + b, 0) / processingTimes.length
+                    : 0;
 
-            return {
-                queueSize,
-                processingCount,
-                avgProcessingTimeMs: avgProcessingTime,
-                processingFiles: processingFiles.length,
-                queueUtilization: processingCount > 0 ? (processingCount / (processingCount + queueSize)) * 100 : 0,
-                timestamp: now
-            };
+                return {
+                    queueSize,
+                    processingCount,
+                    avgProcessingTimeMs: avgProcessingTime,
+                    processingFiles: processingFiles.length,
+                    queueUtilization: processingCount > 0 ? (processingCount / (processingCount + queueSize)) * 100 : 0,
+                    timestamp: now
+                };
+            } finally {
+                client.release();
+            }
         } catch (error) {
             console.error('❌ Error getting queue analytics:', error.message);
             throw error;
@@ -402,24 +608,71 @@ class QueueService {
     // Get processing files
     async getProcessingFiles() {
         try {
-            const client = await this.connect();
-            const processing = await client.hGetAll(this.processingKey);
+            await this.ensureSchemaInfo();
+            const client = await pool.connect();
+            try {
+                const result = await client.query(`
+                    SELECT file_id, job_id, priority, status, mode, retries,
+                           ${this.processingStartedAtColumn} AS processing_started_at,
+                           created_at, updated_at
+                    FROM file_processing_queue
+                    WHERE status = 'processing'
+                    ORDER BY updated_at DESC
+                `);
 
-            return Object.entries(processing).map(([fileId, data]) => {
-                try {
+                return result.rows.map(row => {
+                    const startedAt = row.processing_started_at || row.updated_at || row.created_at;
                     return {
-                        fileId,
-                        ...JSON.parse(data)
+                        fileId: row.file_id,
+                        jobId: row.job_id,
+                        priority: row.priority ?? 0,
+                        status: row.status,
+                        mode: row.mode || 'normal',
+                        retries: row.retries ?? 0,
+                        timestamp: startedAt ? new Date(startedAt).getTime() : Date.now()
                     };
-                } catch {
-                    return {
-                        fileId,
-                        timestamp: data
-                    };
-                }
-            });
+                });
+            } finally {
+                client.release();
+            }
         } catch (error) {
             console.error('❌ Error getting processing files:', error.message);
+            throw error;
+        }
+    }
+
+    async isFileInQueue(fileId) {
+        try {
+            const client = await pool.connect();
+            try {
+                const result = await client.query(
+                    `SELECT 1 FROM file_processing_queue WHERE file_id = $1 AND status = 'queued' LIMIT 1`,
+                    [fileId]
+                );
+                return result.rows.length > 0;
+            } finally {
+                client.release();
+            }
+        } catch (error) {
+            console.error('❌ Error checking queue for file:', error.message);
+            throw error;
+        }
+    }
+
+    async isFileProcessing(fileId) {
+        try {
+            const client = await pool.connect();
+            try {
+                const result = await client.query(
+                    `SELECT 1 FROM file_processing_queue WHERE file_id = $1 AND status = 'processing' LIMIT 1`,
+                    [fileId]
+                );
+                return result.rows.length > 0;
+            } finally {
+                client.release();
+            }
+        } catch (error) {
+            console.error('❌ Error checking processing for file:', error.message);
             throw error;
         }
     }
