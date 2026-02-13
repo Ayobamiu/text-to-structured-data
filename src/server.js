@@ -61,6 +61,9 @@ import {
     getModelsForMethod,
     getDefaultModel
 } from "./config/processingConfig.js";
+import dns from 'dns';
+// Set default result order to IPv4 first to avoid Railway IPv6 issues
+dns.setDefaultResultOrder('ipv4first');
 
 dotenv.config();
 
