@@ -29,16 +29,32 @@ function sslConfigForHost(hostname, searchParams) {
     if (mode === 'disable') {
         return false;
     }
-    if (
+    const useSsl =
         mode === 'require' ||
         mode === 'verify-full' ||
         mode === 'verify-ca' ||
         mode === 'prefer' ||
-        hostname.includes('supabase.co')
-    ) {
-        return { rejectUnauthorized: true, servername: hostname };
+        hostname.includes('supabase.co');
+    if (!useSsl) {
+        return undefined;
     }
-    return undefined;
+
+    // DATABASE_SSL_REJECT_UNAUTHORIZED: 'true' | 'false' (optional override for all remote SSL)
+    const strictEnv = process.env.DATABASE_SSL_REJECT_UNAUTHORIZED;
+    const forceStrict = strictEnv === 'true' || strictEnv === '1';
+    const forceRelaxed = strictEnv === 'false' || strictEnv === '0';
+
+    // Transaction pooler (*.pooler.supabase.com): with IP + SNI, Node often fails chain validation
+    // (SELF_SIGNED_CERT_IN_CHAIN) even though traffic is still TLS-encrypted. Supabase docs commonly
+    // use ssl with certificate verification off for this endpoint in Node/serverless.
+    const isSupabasePooler = hostname.includes('pooler.supabase.com');
+    if (isSupabasePooler && !forceStrict) {
+        return { rejectUnauthorized: false, servername: hostname };
+    }
+    if (forceRelaxed) {
+        return { rejectUnauthorized: false, servername: hostname };
+    }
+    return { rejectUnauthorized: true, servername: hostname };
 }
 
 /**
@@ -88,7 +104,11 @@ export async function resolvePgPoolConfig(connectionString, extraPoolOptions = {
         if (ssl !== undefined) {
             config.ssl = ssl;
         }
-        console.log(`🔧 Postgres: resolved ${hostname} → ${address} (IPv4 + TLS SNI)`);
+        const sslNote =
+            config.ssl && config.ssl.rejectUnauthorized === false
+                ? ' (TLS verify relaxed for this host)'
+                : '';
+        console.log(`🔧 Postgres: resolved ${hostname} → ${address} (IPv4 + TLS SNI)${sslNote}`);
         return config;
     } catch (e) {
         console.warn('⚠️ Postgres IPv4 resolution skipped:', e.message);
