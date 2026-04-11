@@ -2,6 +2,7 @@ import pg from 'pg';
 import { v4 as uuidv4 } from 'uuid';
 import dotenv from 'dotenv';
 import { FileProcessingPipeline } from './pipeline/FileProcessingPipeline.js';
+import { resolvePgPoolConfig } from './utils/pgConnection.js';
 
 // Only load .env file in development
 if (process.env.NODE_ENV !== 'production') {
@@ -10,17 +11,16 @@ if (process.env.NODE_ENV !== 'production') {
 
 const { Pool } = pg;
 
-// Database connection pool
-const pool = new Pool({
-    connectionString: process.env.DATABASE_URL || 'postgresql://postgres:password@localhost:5432/batch_processor',
-    // Force IPv4 to avoid Railway IPv6 issues
-    family: 4,
-    max: 20, // Maximum number of clients in the pool
-    idleTimeoutMillis: 30000, // Close idle clients after 30 seconds
-    connectionTimeoutMillis: 10000, // Return an error after 10 seconds if connection could not be established
-    // Note: statement_timeout and query_timeout are not valid Pool options
-    // These need to be set per-connection or via SQL SET command
-});
+const defaultDbUrl = 'postgresql://postgres:password@localhost:5432/batch_processor';
+
+// Database connection pool (IPv4 + TLS SNI when needed — see resolvePgPoolConfig)
+const pool = new Pool(
+    await resolvePgPoolConfig(process.env.DATABASE_URL || defaultDbUrl, {
+        max: 20,
+        idleTimeoutMillis: 30000,
+        connectionTimeoutMillis: 10000,
+    })
+);
 
 // Test database connection
 export async function testConnection() {

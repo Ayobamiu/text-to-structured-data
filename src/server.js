@@ -67,16 +67,25 @@ dns.setDefaultResultOrder('ipv4first');
 
 dotenv.config();
 
+// CORS / Socket.IO allowed origins (extend with CORS_ORIGINS=comma,separated,urls)
+// If the API is down (e.g. 502 from Railway), the edge response often has no CORS headers;
+// the browser then reports "blocked by CORS" even though the real issue is the gateway error.
+const corsOrigins = [
+    'http://localhost:3001',
+    'http://localhost:3002',
+    'http://localhost:8080',
+    'https://workspace.coreextract.app',
+    ...(process.env.CORS_ORIGINS || '')
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean),
+];
+
 const app = express();
 const server = createServer(app);
 const io = new Server(server, {
     cors: {
-        origin: [
-            'http://localhost:3001',
-            'http://localhost:3002',
-            'http://localhost:8080',
-            'https://workspace.coreextract.app'
-        ],
+        origin: corsOrigins,
         methods: ['GET', 'POST'],
         credentials: true
     }
@@ -87,12 +96,7 @@ setWebSocketInstance(io);
 
 // CORS configuration (must be before security middleware)
 app.use(cors({
-    origin: [
-        'http://localhost:3001',
-        'http://localhost:3002',
-        'http://localhost:8080',
-        'https://workspace.coreextract.app'
-    ],
+    origin: corsOrigins,
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization'],

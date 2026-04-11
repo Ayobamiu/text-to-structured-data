@@ -1,10 +1,11 @@
 import pg from 'pg';
+import { resolvePgPoolConfig } from '../utils/pgConnection.js';
 
 const { Pool } = pg;
 
 export async function initializeDatabase() {
     console.log('🚀 Initializing database...');
-    console.log('🔧 IPv4 fix applied - forcing IPv4 connections only');
+    console.log('🔧 IPv4 + TLS SNI when connecting to remote Postgres (Railway → Supabase)');
 
     // Debug environment variables
     console.log('🔍 Environment check:');
@@ -14,15 +15,13 @@ export async function initializeDatabase() {
     const connectionString = process.env.DATABASE_URL || 'postgresql://postgres:password@localhost:5432/batch_processor';
     console.log('🔗 Using connection string:', connectionString.replace(/:[^:@]*@/, ':***@'));
 
-    const pool = new Pool({
-        connectionString: connectionString,
-        // Force IPv4 to avoid Railway IPv6 issues
-        family: 4,
-        // Additional connection options for Railway
-        connectionTimeoutMillis: 10000,
-        idleTimeoutMillis: 30000,
-        max: 10,
-    });
+    const pool = new Pool(
+        await resolvePgPoolConfig(connectionString, {
+            connectionTimeoutMillis: 10000,
+            idleTimeoutMillis: 30000,
+            max: 10,
+        })
+    );
 
     try {
         const client = await pool.connect();
