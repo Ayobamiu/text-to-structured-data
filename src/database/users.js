@@ -299,7 +299,7 @@ export async function createUserSession(userId, token, sessionData = {}) {
         const values = [
             userId,
             token,
-            sessionData.ipAddress || null,
+            sanitizeInetAddress(sessionData.ipAddress),
             sessionData.userAgent || null,
             expiresAt
         ];
@@ -439,6 +439,16 @@ export async function getUserStats(userId) {
 
 // --- Audit Logging ---
 
+function sanitizeInetAddress(raw) {
+    if (!raw || typeof raw !== 'string') return null;
+    // x-forwarded-for / proxies can send "client, proxy1, proxy2"; INET only accepts one address
+    const first = raw.split(',')[0].trim();
+    // Strip IPv6 zone IDs (e.g. ::1%lo0) and reject clearly invalid values
+    const cleaned = first.replace(/%.*$/, '');
+    if (!cleaned || cleaned.length > 45) return null;
+    return cleaned;
+}
+
 export async function createAuditLog(userId, action, resourceType = null, resourceId = null, details = null, ipAddress = null, userAgent = null) {
     const client = await pool.connect();
     try {
@@ -447,7 +457,7 @@ export async function createAuditLog(userId, action, resourceType = null, resour
             VALUES ($1, $2, $3, $4, $5, $6, $7)
             RETURNING id, created_at
         `;
-        const values = [userId, action, resourceType, resourceId, details, ipAddress, userAgent];
+        const values = [userId, action, resourceType, resourceId, details, sanitizeInetAddress(ipAddress), userAgent];
         const result = await client.query(query, values);
         return result.rows[0];
     } finally {

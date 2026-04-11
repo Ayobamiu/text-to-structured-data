@@ -94,6 +94,9 @@ const io = new Server(server, {
 // Set WebSocket instance for preview routes
 setWebSocketInstance(io);
 
+// Behind Railway / reverse proxy: trust first proxy so req.ip resolves correctly
+app.set('trust proxy', 1);
+
 // CORS configuration (must be before security middleware)
 app.use(cors({
     origin: corsOrigins,

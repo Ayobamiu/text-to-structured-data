@@ -22,8 +22,11 @@ import { createAuditLog } from '../database/users.js';
 
 const router = express.Router();
 
-// Helper to get IP address
-const getIpAddress = (req) => req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+// Helper to get client IP address (first entry from x-forwarded-for chain)
+const getIpAddress = (req) => {
+    const raw = req.headers['x-forwarded-for'] || req.socket.remoteAddress || '';
+    return raw.split(',')[0].trim() || null;
+};
 
 // --- Organization CRUD Routes ---
 

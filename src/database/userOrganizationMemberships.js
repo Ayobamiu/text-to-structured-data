@@ -49,6 +49,14 @@ export async function getUserOrganizationMemberships(userId) {
     }
 }
 
+function normalizeOrgMembershipRole(role) {
+    const allowed = ['owner', 'admin', 'member', 'viewer'];
+    if (role && allowed.includes(role)) {
+        return role;
+    }
+    return 'member';
+}
+
 export async function getUserOrganizations(userId) {
     const client = await pool.connect();
     try {
@@ -76,7 +84,71 @@ export async function getUserOrganizations(userId) {
             ORDER BY uom.joined_at DESC
         `;
         const result = await client.query(query, [userId]);
-        return result.rows;
+        if (result.rows.length > 0) {
+            return result.rows;
+        }
+
+        // Legacy / partial-migration: user has users.organization_id but no membership row.
+        // Prod often hit this if add_user_organization_memberships never ran or user was created off-path.
+        const legacy = await client.query(
+            `SELECT organization_id, role FROM users WHERE id = $1 AND organization_id IS NOT NULL`,
+            [userId]
+        );
+        if (legacy.rows.length === 0) {
+            return [];
+        }
+
+        const { organization_id: orgId, role: userTableRole } = legacy.rows[0];
+        const orgRole = normalizeOrgMembershipRole(userTableRole);
+
+        const orgResult = await client.query(
+            `
+            SELECT 
+                o.id,
+                o.name,
+                o.slug,
+                o.domain,
+                o.plan,
+                o.settings,
+                o.billing_email,
+                o.stripe_customer_id,
+                o.subscription_status,
+                o.subscription_plan,
+                o.subscription_current_period_end,
+                o.created_at,
+                o.updated_at
+            FROM organizations o
+            WHERE o.id = $1
+            `,
+            [orgId]
+        );
+        if (orgResult.rows.length === 0) {
+            return [];
+        }
+
+        const o = orgResult.rows[0];
+        try {
+            await client.query(
+                `
+                INSERT INTO user_organization_memberships (user_id, organization_id, role, joined_at)
+                VALUES ($1, $2, $3, NOW())
+                ON CONFLICT (user_id, organization_id) DO NOTHING
+                `,
+                [userId, orgId, orgRole]
+            );
+            console.log(`🔧 Repaired missing org membership for user ${userId} → org ${orgId} (${orgRole})`);
+        } catch (repairErr) {
+            console.warn('⚠️ Could not auto-repair org membership:', repairErr.message);
+        }
+
+        return [
+            {
+                ...o,
+                user_role: orgRole,
+                joined_at: new Date().toISOString(),
+                invited_by: null,
+            },
+        ];
     } finally {
         client.release();
     }
