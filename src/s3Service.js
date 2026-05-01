@@ -9,15 +9,19 @@ dotenv.config();
 
 class S3Service {
     constructor() {
+        const accessKeyId = process.env.AWS_ACCESS_KEY_ID?.trim();
+        const secretAccessKey = process.env.AWS_SECRET_ACCESS_KEY?.trim();
+        const region = (process.env.AWS_REGION || 'us-east-1').trim();
+
         this.s3Client = new S3Client({
-            region: process.env.AWS_REGION || 'us-east-1',
+            region,
             credentials: {
-                accessKeyId: process.env.AWS_ACCESS_KEY_ID,
-                secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+                accessKeyId,
+                secretAccessKey,
             },
         });
 
-        this.bucketName = process.env.S3_BUCKET_NAME || 'document-extractor-files';
+        this.bucketName = (process.env.S3_BUCKET_NAME || 'document-extractor-files').trim();
         this.enabled = process.env.CLOUD_STORAGE_ENABLED === 'true';
         this.fileRetentionDays = parseInt(process.env.FILE_RETENTION_DAYS) || 7;
     }
@@ -27,12 +31,24 @@ class S3Service {
         return this.enabled;
     }
 
+    /** Safe segment for S3 keys: ASCII-ish (NBSP / odd Unicode from OS filenames breaks some signing paths). */
+    asciiSafeStem(originalName) {
+        const ext = path.extname(originalName);
+        const stem = path.basename(originalName, ext);
+        const cleaned = stem
+            .replace(/\u00A0/g, ' ')
+            .replace(/[^\w.\- ()[\]]+/g, '_')
+            .trim()
+            .slice(0, 120);
+        return cleaned.length ? cleaned : 'file';
+    }
+
     // Generate unique filename with hash
     generateUniqueFilename(originalName) {
         const timestamp = Date.now();
         const random = Math.random().toString(36).substring(2);
         const ext = path.extname(originalName);
-        const baseName = path.basename(originalName, ext);
+        const baseName = this.asciiSafeStem(originalName);
 
         return `${baseName}_${timestamp}_${random}${ext}`;
     }
@@ -40,6 +56,11 @@ class S3Service {
     // Calculate file hash for integrity checking
     calculateFileHash(fileBuffer) {
         return crypto.createHash('sha256').update(fileBuffer).digest('hex');
+    }
+
+    /** Base64 UTF-8 so S3 user metadata stays ASCII-safe (Unicode/NBSP filenames break SigV4 otherwise). */
+    encodeFilenameForMetadata(originalName) {
+        return Buffer.from(originalName ?? '', 'utf8').toString('base64');
     }
 
     // Upload logo file to S3
@@ -58,7 +79,7 @@ class S3Service {
                 Body: fileBuffer,
                 ContentType: this.getContentType(originalName),
                 Metadata: {
-                    'original-name': originalName,
+                    'original-filename-b64': this.encodeFilenameForMetadata(originalName),
                     'upload-type': 'logo',
                     'uploaded-at': new Date().toISOString()
                 }
@@ -140,13 +161,13 @@ class S3Service {
                 Bucket: this.bucketName,
                 Key: key,
                 Body: fileBuffer,
-                ContentType: file.mimetype,
+                ContentType: file.mimetype || this.getContentType(file.originalname),
                 Metadata: {
-                    originalName: file.originalname,
-                    jobId: jobId,
-                    fileHash: fileHash,
-                    uploadedAt: new Date().toISOString(),
-                    expiresAt: expiresAt.toISOString()
+                    'original-filename-b64': this.encodeFilenameForMetadata(file.originalname),
+                    jobid: jobId,
+                    filehash: fileHash,
+                    uploadedat: new Date().toISOString(),
+                    expiresat: expiresAt.toISOString()
                 }
             });
 
