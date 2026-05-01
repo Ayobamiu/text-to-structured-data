@@ -1,7 +1,11 @@
+
+
 /**
  * Processing Methods and Models Configuration
  * Centralized configuration for all AI processing providers
  */
+
+import { Extend, ExtendClient } from "extend-ai";
 
 export const PROCESSING_METHODS = {
     OPENAI: 'openai',
@@ -191,6 +195,72 @@ export function isValidModel(method, model) {
     return models.includes(model);
 }
 
+
+export function getExtendAIConfig() {
+    return {
+        "engine": "parse_performance",
+        "target": "markdown",
+        "blockOptions": {
+            "text": {
+                "agentic": {
+                    "enabled": true
+                },
+                "signatureDetectionEnabled": false
+            },
+            "tables": {
+                "agentic": {
+                    "enabled": true
+                },
+                "targetFormat": "html",
+                "cellBlocksEnabled": false,
+                "tableHeaderContinuationEnabled": true
+            },
+            "figures": {
+                "enabled": true,
+                "figureImageClippingEnabled": true,
+                "advancedChartExtractionEnabled": false
+            },
+            "barcodes": {
+                "readingEnabled": false,
+                "imageClippingEnabled": false
+            },
+            "formulas": {
+                "enabled": false
+            },
+            "keyValue": {
+                "blankFieldFormattingEnabled": false
+            }
+        },
+        "engineVersion": "2.0.0-beta",
+        "advancedOptions": {
+            "returnOcr": {
+                "words": false
+            },
+            "pageRanges": [],
+            "parallelism": 1,
+            "enrichmentFormat": "xml",
+            "excelParsingMode": "advanced",
+            "agenticOcrEnabled": false,
+            "pageBreaksEnabled": false,
+            "alwaysConvertToPdf": false,
+            "formattingDetection": [],
+            "pageRotationEnabled": true,
+            "excelSkipCalculation": true,
+            "excelUseRawCellValues": false,
+            "excelSkipHiddenContent": false,
+            "imageConversionQuality": "medium",
+            "verticalGroupingThreshold": 1
+        },
+        "chunkingStrategy": {
+            "type": "page",
+            "options": {
+                "maxCharacters": 10000,
+                "minCharacters": 500
+            }
+        }
+    }
+}
+
 export default {
     PROCESSING_METHODS,
     OPENAI_MODELS,
@@ -204,6 +274,7 @@ export default {
     getModelsForMethod,
     getDefaultModel,
     getDefaultOptions,
-    isValidModel
+    isValidModel,
+    getExtendAIConfig
 };
 

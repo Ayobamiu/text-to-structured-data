@@ -1,5 +1,6 @@
 import { ExtendClient } from 'extend-ai';
 import dotenv from 'dotenv';
+import { getExtendAIConfig } from '../config/processingConfig.js';
 
 dotenv.config();
 
@@ -56,7 +57,7 @@ class ExtendAIService {
                 file: {
                     fileName: filename,
                     fileUrl: fileUrl
-                }
+                }, config: getExtendAIConfig()
             });
 
             // Log response for debugging
