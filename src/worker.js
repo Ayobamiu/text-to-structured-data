@@ -1,3 +1,4 @@
+import http from 'http';
 import axios from 'axios';
 import dotenv from 'dotenv';
 import { io } from 'socket.io-client';
@@ -1036,6 +1037,34 @@ process.on('SIGTERM', async () => {
 });
 
 const worker = new FileProcessorWorker();
+
+// Lightweight HTTP server so platforms like Railway can health-check the
+// worker (it doesn't otherwise bind to a port and the dashboard would show
+// it as offline). Also gives us a real /health endpoint for monitoring.
+const HEALTH_PORT = parseInt(process.env.PORT || process.env.WORKER_HEALTH_PORT || '8080', 10);
+const healthServer = http.createServer((req, res) => {
+    if (req.url === '/health' || req.url === '/') {
+        const uptimeSeconds = Math.floor((Date.now() - worker.startTime.getTime()) / 1000);
+        const body = {
+            status: worker.isRunning ? 'healthy' : 'starting',
+            service: 'ai-worker',
+            socketConnected: Boolean(worker.socket && worker.socket.connected),
+            processedCount: worker.processedCount,
+            errorCount: worker.errorCount,
+            uptimeSeconds
+        };
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(body));
+        return;
+    }
+    res.writeHead(404, { 'Content-Type': 'text/plain' });
+    res.end('Not Found');
+});
+
+healthServer.listen(HEALTH_PORT, () => {
+    console.log(`🩺 Worker health endpoint listening on :${HEALTH_PORT}/health`);
+});
+
 worker.start().catch(error => {
     console.error('💥 Worker failed to start:', error);
     process.exit(1);
