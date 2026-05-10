@@ -8,9 +8,8 @@
  * once per detected section per file. Cache is invalidated on any write
  * through this module.
  *
- * This module is intentionally NOT wired into the worker / processingService
- * yet. Phase 0 ships the registry as read-ready infrastructure; the wiring
- * happens in Phase 1 when per-section extraction lands.
+ * Per-section extraction and the visual classifier read active schemas here.
+ * Admin CRUD lives in `server.js` under `/registry/document-types/*` (admin JWT).
  */
 
 import pool from '../database.js';
@@ -445,6 +444,172 @@ export async function setClassifierHints(slug, hints) {
  * Useful when a draft schema has been validated against held-out files and
  * is ready to take over from the previous active version.
  */
+/**
+ * Full document type row + current schema summary (for registry admin UI).
+ * @param {string} slug
+ * @returns {Promise<Object|null>}
+ */
+export async function getDocumentTypeDetail(slug) {
+    const client = await pool.connect();
+    try {
+        const r = await client.query(
+            `SELECT dt.id AS document_type_id,
+                    dt.slug,
+                    dt.display_name,
+                    dt.description,
+                    dt.default_extractor,
+                    dt.routing_confidence_threshold,
+                    dt.status,
+                    dt.classifier_hints,
+                    dt.created_at,
+                    dt.updated_at,
+                    dt.current_schema_version_id,
+                    s.version AS current_schema_version,
+                    s.schema_name AS current_schema_name,
+                    s.status AS current_schema_row_status
+             FROM document_types dt
+             LEFT JOIN schemas s ON s.id = dt.current_schema_version_id
+             WHERE dt.slug = $1`,
+            [slug]
+        );
+        return r.rows[0] || null;
+    } finally {
+        client.release();
+    }
+}
+
+/**
+ * List schema versions for a slug, newest first. Each row includes `is_current`.
+ * @returns {Promise<Array<Object>|null>} null if document type missing
+ */
+export async function listSchemaVersionsForSlug(slug) {
+    const client = await pool.connect();
+    try {
+        const dt = await client.query(
+            `SELECT id, current_schema_version_id FROM document_types WHERE slug = $1`,
+            [slug]
+        );
+        if (dt.rows.length === 0) return null;
+
+        const documentTypeId = dt.rows[0].id;
+        const currentId = dt.rows[0].current_schema_version_id;
+
+        const versions = await client.query(
+            `SELECT s.id,
+                    s.version,
+                    s.schema_name,
+                    s.status,
+                    s.notes,
+                    s.created_at,
+                    (s.id = $2) AS is_current
+             FROM schemas s
+             WHERE s.document_type_id = $1
+             ORDER BY s.version DESC`,
+            [documentTypeId, currentId]
+        );
+        return versions.rows;
+    } finally {
+        client.release();
+    }
+}
+
+/**
+ * PATCH fields on document_types (slug is immutable).
+ */
+export async function updateDocumentType(slug, patch = {}) {
+    if (!slug) throw new Error('updateDocumentType requires slug');
+
+    const allowed = {
+        displayName: 'display_name',
+        description: 'description',
+        defaultExtractor: 'default_extractor',
+        routingConfidenceThreshold: 'routing_confidence_threshold',
+        status: 'status',
+    };
+
+    const cols = [];
+    const vals = [];
+    let i = 1;
+
+    for (const [jsKey, sqlCol] of Object.entries(allowed)) {
+        if (patch[jsKey] !== undefined) {
+            cols.push(`${sqlCol} = $${i}`);
+            vals.push(patch[jsKey]);
+            i++;
+        }
+    }
+
+    if (cols.length === 0) {
+        throw new Error('updateDocumentType: no valid fields to update');
+    }
+
+    vals.push(slug);
+
+    const client = await pool.connect();
+    try {
+        const r = await client.query(
+            `UPDATE document_types
+             SET ${cols.join(', ')}, updated_at = NOW()
+             WHERE slug = $${i}
+             RETURNING id, slug, display_name, description, default_extractor,
+                       routing_confidence_threshold, status, updated_at`,
+            vals
+        );
+        if (r.rows.length === 0) {
+            throw new Error(`document_type '${slug}' not found`);
+        }
+        bustCache();
+        return r.rows[0];
+    } finally {
+        client.release();
+    }
+}
+
+/**
+ * Hard-delete a document type and all schema versions (schemas.document_type_id ON DELETE CASCADE).
+ * Also sets current_schema_version_id via CASCADE from document_types row removal.
+ */
+export async function deleteDocumentTypeBySlug(slug) {
+    if (!slug) throw new Error('deleteDocumentTypeBySlug requires slug');
+
+    const client = await pool.connect();
+    try {
+        const r = await client.query(
+            `DELETE FROM document_types WHERE slug = $1 RETURNING id, slug`,
+            [slug]
+        );
+        bustCache();
+        return r.rows[0] || null;
+    } finally {
+        client.release();
+    }
+}
+
+/**
+ * Clear classifier_hints completely (UI "remove hints").
+ */
+export async function clearClassifierHints(slug) {
+    if (!slug) throw new Error('clearClassifierHints requires slug');
+
+    const client = await pool.connect();
+    try {
+        const result = await client.query(
+            `UPDATE document_types
+             SET classifier_hints = NULL, updated_at = NOW()
+             WHERE slug = $1
+             RETURNING slug, classifier_hints, updated_at`,
+            [slug]
+        );
+        if (result.rows.length === 0) {
+            throw new Error(`document_type '${slug}' not found`);
+        }
+        bustCache();
+        return result.rows[0];
+    } finally {
+        client.release();
+    }
+}
+
 export async function setCurrentSchemaVersion(documentTypeSlug, version) {
     const client = await pool.connect();
     try {
@@ -490,5 +655,10 @@ export default {
     registerDocumentType,
     registerSchema,
     setClassifierHints,
+    clearClassifierHints,
     setCurrentSchemaVersion,
+    getDocumentTypeDetail,
+    listSchemaVersionsForSlug,
+    updateDocumentType,
+    deleteDocumentTypeBySlug,
 };

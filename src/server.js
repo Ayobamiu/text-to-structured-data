@@ -102,7 +102,8 @@ app.set('trust proxy', 1);
 app.use(cors({
     origin: corsOrigins,
     credentials: true,
-    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    // PATCH required for registry admin (document type updates) from browser preflight.
+    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization'],
     optionsSuccessStatus: 200 // Some legacy browsers (IE11, various SmartTVs) choke on 204
 }));
@@ -181,6 +182,7 @@ io.on('connection', (socket) => {
 // Apply JSON parsing only to specific routes (not multipart routes)
 app.use('/jobs', express.json());
 app.use('/queue', express.json());
+app.use('/registry', express.json());
 app.use('/system-stats', express.json());
 app.use('/test-db', express.json());
 app.use('/test-redis', express.json());
@@ -972,6 +974,303 @@ app.get("/document-types", authenticateToken, async (req, res) => {
             status: "error",
             message: error.message,
         });
+    }
+});
+
+const REGISTRY_SLUG_PARAM = /^[a-z][a-z0-9_]{0,99}$/;
+
+/** Admin-only middleware pair for registry CRUD. */
+function registryAdmin(req, res, next) {
+    authenticateToken(req, res, () => requireRole('admin')(req, res, next));
+}
+
+function validateRegistrySlug(slug, res) {
+    if (!slug || typeof slug !== 'string' || !REGISTRY_SLUG_PARAM.test(slug)) {
+        res.status(400).json({
+            status: 'error',
+            message: 'Invalid slug. Use lowercase letters, digits, underscore; max 100 chars.',
+        });
+        return false;
+    }
+    return true;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Schema registry admin API (Phase 2 UI). Admin JWT only (`role === admin`).
+// Powers the Document types & schemas CRUD screen in the web app.
+// ─────────────────────────────────────────────────────────────────────────────
+
+app.get("/registry/document-types/:slug/detail", registryAdmin, async (req, res) => {
+    try {
+        const { slug } = req.params;
+        if (!validateRegistrySlug(slug, res)) return;
+
+        const {
+            getDocumentTypeDetail,
+            listSchemaVersionsForSlug,
+        } = await import('./services/schemaRegistry.js');
+
+        const detail = await getDocumentTypeDetail(slug);
+        if (!detail) {
+            return res.status(404).json({ status: 'error', message: `Unknown document type '${slug}'` });
+        }
+        const versions = await listSchemaVersionsForSlug(slug);
+
+        res.json({
+            status: 'success',
+            documentType: {
+                slug: detail.slug,
+                display_name: detail.display_name,
+                description: detail.description,
+                default_extractor: detail.default_extractor,
+                routing_confidence_threshold: detail.routing_confidence_threshold,
+                status: detail.status,
+                classifier_hints: detail.classifier_hints,
+                created_at: detail.created_at,
+                updated_at: detail.updated_at,
+                current_schema_version_id: detail.current_schema_version_id,
+                current_schema_version: detail.current_schema_version,
+                current_schema_name: detail.current_schema_name,
+                current_schema_row_status: detail.current_schema_row_status,
+                version_count: Array.isArray(versions) ? versions.length : 0,
+            },
+            schemaVersions: versions || [],
+        });
+    } catch (error) {
+        console.error('❌ registry detail:', error.message);
+        res.status(500).json({ status: 'error', message: error.message });
+    }
+});
+
+app.get("/registry/document-types/:slug/schemas/:version", registryAdmin, async (req, res) => {
+    try {
+        const { slug, version } = req.params;
+        if (!validateRegistrySlug(slug, res)) return;
+        const v = parseInt(version, 10);
+        if (!Number.isInteger(v) || v < 1) {
+            return res.status(400).json({ status: 'error', message: 'Invalid version number' });
+        }
+
+        const { getSchemaVersion } = await import('./services/schemaRegistry.js');
+        const row = await getSchemaVersion(slug, v);
+        if (!row) {
+            return res.status(404).json({ status: 'error', message: `No schema v${v} for '${slug}'` });
+        }
+
+        res.json({
+            status: 'success',
+            schema: {
+                schemaId: row.schemaId,
+                version: row.version,
+                schemaName: row.schemaName,
+                status: row.status,
+                schema: row.schema,
+                promptHints: row.promptHints,
+                documentTypeSlug: row.documentTypeSlug,
+                defaultExtractor: row.defaultExtractor,
+            },
+        });
+    } catch (error) {
+        console.error('❌ registry get schema version:', error.message);
+        res.status(500).json({ status: 'error', message: error.message });
+    }
+});
+
+app.post("/registry/document-types", registryAdmin, async (req, res) => {
+    try {
+        const {
+            slug,
+            displayName,
+            description = null,
+            defaultExtractor = 'extendai',
+            routingConfidenceThreshold = 0.75,
+            initialSchema = null,
+        } = req.body || {};
+
+        console.log({ slug, displayName, description, defaultExtractor, routingConfidenceThreshold, initialSchema });
+
+        if (!slug || !displayName) {
+            return res.status(400).json({ status: 'error', message: 'slug and displayName are required' });
+        }
+        if (!validateRegistrySlug(slug, res)) return;
+
+        const svc = await import('./services/schemaRegistry.js');
+        const existing = await svc.getDocumentTypeBySlug(slug);
+        if (existing) {
+            return res.status(409).json({
+                status: 'error',
+                message: `Document type '${slug}' already exists`,
+            });
+        }
+
+        await svc.registerDocumentType({
+            slug,
+            displayName,
+            description,
+            defaultExtractor,
+            routingConfidenceThreshold: Number(routingConfidenceThreshold),
+        });
+
+        let schemaRegistered = null;
+        if (initialSchema && typeof initialSchema.jsonSchema === 'object') {
+            const { unwrapSchemaPayload, extractHintsAndClean } = await import('./utils/schemaHintsExtract.js');
+            const wrapped = unwrapSchemaPayload({ jsonSchema: initialSchema.jsonSchema, schemaName: initialSchema.schemaName });
+            const schemaName =
+                wrapped.schemaName || initialSchema.schemaName || `${slug}_extraction`;
+            const { cleanedSchema, promptHints } = extractHintsAndClean(wrapped.rawSchema);
+
+            schemaRegistered = await svc.registerSchema({
+                documentTypeSlug: slug,
+                jsonSchema: cleanedSchema,
+                promptHints,
+                schemaName,
+                notes: initialSchema.notes || 'Created via registry UI',
+                setActive: initialSchema.setActive !== false,
+            });
+        }
+
+        const detail = await svc.getDocumentTypeDetail(slug);
+        res.status(201).json({
+            status: 'success',
+            documentType: detail,
+            initialSchemaRegistered: schemaRegistered,
+        });
+    } catch (error) {
+        console.error('❌ registry create document type:', error.message);
+        res.status(400).json({ status: 'error', message: error.message });
+    }
+});
+
+app.patch("/registry/document-types/:slug", registryAdmin, async (req, res) => {
+    try {
+        const { slug } = req.params;
+        if (!validateRegistrySlug(slug, res)) return;
+
+        const b = req.body || {};
+        const patch = {};
+        if (b.displayName !== undefined) patch.displayName = b.displayName;
+        if (b.description !== undefined) patch.description = b.description;
+        if (b.defaultExtractor !== undefined) patch.defaultExtractor = b.defaultExtractor;
+        if (b.routingConfidenceThreshold !== undefined) {
+            patch.routingConfidenceThreshold = Number(b.routingConfidenceThreshold);
+        }
+        if (b.status !== undefined) {
+            if (!['active', 'deprecated'].includes(b.status)) {
+                return res.status(400).json({
+                    status: 'error',
+                    message: 'status must be active or deprecated',
+                });
+            }
+            patch.status = b.status;
+        }
+
+        const { updateDocumentType } = await import('./services/schemaRegistry.js');
+        const row = await updateDocumentType(slug, patch);
+
+        res.json({ status: 'success', documentType: row });
+    } catch (error) {
+        console.error('❌ registry patch document type:', error.message);
+        res.status(400).json({ status: 'error', message: error.message });
+    }
+});
+
+app.delete("/registry/document-types/:slug", registryAdmin, async (req, res) => {
+    try {
+        const { slug } = req.params;
+        if (!validateRegistrySlug(slug, res)) return;
+
+        const { deleteDocumentTypeBySlug } = await import('./services/schemaRegistry.js');
+        const deleted = await deleteDocumentTypeBySlug(slug);
+        if (!deleted) {
+            return res.status(404).json({ status: 'error', message: `Unknown document type '${slug}'` });
+        }
+
+        res.json({ status: 'success', deleted: { slug: deleted.slug, id: deleted.id } });
+    } catch (error) {
+        console.error('❌ registry delete document type:', error.message);
+        res.status(500).json({ status: 'error', message: error.message });
+    }
+});
+
+app.put("/registry/document-types/:slug/classifier-hints", registryAdmin, async (req, res) => {
+    try {
+        const { slug } = req.params;
+        if (!validateRegistrySlug(slug, res)) return;
+
+        const hints = req.body?.hints;
+        const svc = await import('./services/schemaRegistry.js');
+
+        let row;
+        if (hints === null || hints === undefined) {
+            row = await svc.clearClassifierHints(slug);
+        } else if (hints && typeof hints === 'object' && !Array.isArray(hints)) {
+            row = await svc.setClassifierHints(slug, hints);
+        } else {
+            return res.status(400).json({
+                status: 'error',
+                message: 'body.hints must be a JSON object, or omit / null to clear',
+            });
+        }
+
+        res.json({ status: 'success', classifier_hints: row.classifier_hints, updated_at: row.updated_at });
+    } catch (error) {
+        console.error('❌ registry classifier-hints:', error.message);
+        res.status(400).json({ status: 'error', message: error.message });
+    }
+});
+
+app.post("/registry/document-types/:slug/schemas", registryAdmin, async (req, res) => {
+    try {
+        const { slug } = req.params;
+        if (!validateRegistrySlug(slug, res)) return;
+
+        const body = req.body || {};
+        if (!body.jsonSchema || typeof body.jsonSchema !== 'object') {
+            return res.status(400).json({ status: 'error', message: 'jsonSchema object is required' });
+        }
+
+        const { unwrapSchemaPayload, extractHintsAndClean } = await import('./utils/schemaHintsExtract.js');
+        const { registerSchema } = await import('./services/schemaRegistry.js');
+
+        const wrapped = unwrapSchemaPayload({
+            jsonSchema: body.jsonSchema,
+            schemaName: body.schemaName,
+        });
+        const schemaName = wrapped.schemaName || body.schemaName || `${slug}_extraction`;
+        const { cleanedSchema, promptHints } = extractHintsAndClean(wrapped.rawSchema);
+
+        const result = await registerSchema({
+            documentTypeSlug: slug,
+            jsonSchema: cleanedSchema,
+            promptHints,
+            schemaName,
+            notes: body.notes || null,
+            setActive: body.setActive !== false,
+        });
+
+        res.status(201).json({ status: 'success', schema: result });
+    } catch (error) {
+        console.error('❌ registry register schema:', error.message);
+        res.status(400).json({ status: 'error', message: error.message });
+    }
+});
+
+app.post("/registry/document-types/:slug/schemas/:version/promote", registryAdmin, async (req, res) => {
+    try {
+        const { slug, version } = req.params;
+        if (!validateRegistrySlug(slug, res)) return;
+        const v = parseInt(version, 10);
+        if (!Number.isInteger(v) || v < 1) {
+            return res.status(400).json({ status: 'error', message: 'Invalid version' });
+        }
+
+        const { setCurrentSchemaVersion } = await import('./services/schemaRegistry.js');
+        const out = await setCurrentSchemaVersion(slug, v);
+
+        res.json({ status: 'success', promoted: out });
+    } catch (error) {
+        console.error('❌ registry promote schema:', error.message);
+        res.status(400).json({ status: 'error', message: error.message });
     }
 });
 

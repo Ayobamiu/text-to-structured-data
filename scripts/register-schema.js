@@ -38,20 +38,12 @@ import fs from 'fs';
 import path from 'path';
 import dotenv from 'dotenv';
 import { fileURLToPath } from 'url';
+import { extractHintsAndClean } from '../src/utils/schemaHintsExtract.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 dotenv.config({ path: path.join(__dirname, '..', '.env') });
-
-const HINT_FIELD_KEYS = [
-    'x-locators',
-    'x-rules',
-    'x-instructions',
-    'x-date-formats',
-    'x-constraints',
-];
-const HINT_ROOT_KEYS = ['x-system-role', 'x-guidelines', 'x-validators'];
 
 function parseArgs(argv) {
     const args = {};
@@ -83,87 +75,6 @@ function usage() {
             '  [--draft]',
         ].join('\n')
     );
-}
-
-/**
- * Walk a JSON Schema tree and produce:
- *   - cleanedSchema: same shape, x-* keys removed
- *   - promptHints:   { system_role, guidelines, validators, field_hints: {<path>: {...}} }
- *
- * Schema paths used in field_hints follow these conventions:
- *   'pluggings'         — top-level array property
- *   'pluggings[].type'  — property `type` of items inside `pluggings`
- *   'casing.size'       — property `size` of an object property `casing`
- *
- * (Path uses property names + '[]' for array items; mirrors how a human
- * would describe "the type field of each plugging row.")
- */
-function extractHintsAndClean(schemaRoot) {
-    const promptHints = { field_hints: {} };
-
-    if (!schemaRoot || typeof schemaRoot !== 'object') {
-        return { cleanedSchema: schemaRoot, promptHints };
-    }
-
-    // Root-level hints
-    if (schemaRoot['x-system-role']) {
-        promptHints.system_role = schemaRoot['x-system-role'];
-    }
-    if (Array.isArray(schemaRoot['x-guidelines'])) {
-        promptHints.guidelines = schemaRoot['x-guidelines'];
-    }
-    if (Array.isArray(schemaRoot['x-validators'])) {
-        promptHints.validators = schemaRoot['x-validators'];
-    }
-
-    function walk(node, currentPath) {
-        if (!node || typeof node !== 'object') return node;
-        if (Array.isArray(node)) return node.map((n) => walk(n, currentPath));
-
-        const out = {};
-        const fieldHint = {};
-
-        for (const [k, v] of Object.entries(node)) {
-            if (HINT_ROOT_KEYS.includes(k)) {
-                // Already captured at root level; drop here so they don't
-                // accidentally land deeper in the tree.
-                continue;
-            }
-            if (HINT_FIELD_KEYS.includes(k)) {
-                // Map x-locators -> locators, etc.
-                const hintKey = k.replace(/^x-/, '').replace(/-/g, '_');
-                fieldHint[hintKey] = v;
-                continue;
-            }
-
-            if (k === 'properties' && v && typeof v === 'object') {
-                out[k] = {};
-                for (const [propName, propSchema] of Object.entries(v)) {
-                    const propPath = currentPath
-                        ? `${currentPath}.${propName}`
-                        : propName;
-                    out[k][propName] = walk(propSchema, propPath);
-                }
-            } else if (k === 'items' && v && typeof v === 'object') {
-                // Array items — annotate path with []
-                const itemPath = currentPath ? `${currentPath}[]` : '[]';
-                out[k] = walk(v, itemPath);
-            } else if (typeof v === 'object' && v !== null) {
-                out[k] = walk(v, currentPath);
-            } else {
-                out[k] = v;
-            }
-        }
-
-        if (Object.keys(fieldHint).length > 0 && currentPath) {
-            promptHints.field_hints[currentPath] = fieldHint;
-        }
-
-        return out;
-    }
-
-    const cleanedSchema = walk(schemaRoot, '');
-    return { cleanedSchema, promptHints };
 }
 
 async function main() {
