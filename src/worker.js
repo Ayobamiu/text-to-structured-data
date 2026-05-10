@@ -13,6 +13,8 @@ import {
 import S3Service from './s3Service.js';
 import ExtractionService from './services/extractionService.js';
 import ProcessingService from './services/processingService.js';
+import { VisualPageClassifierStage } from './pipeline/stages/VisualPageClassifierStage.js';
+import { flattenExtractionPages } from './services/sectionGrouper.js';
 
 dotenv.config();
 
@@ -30,6 +32,10 @@ class FileProcessorWorker {
         this.s3Service = new S3Service();
         this.extractionService = new ExtractionService(this.s3Service);
         this.processingService = new ProcessingService();
+        // Per-file scratch space populated by deriveSelectedPages() and
+        // consumed when assembling extraction_metadata. Worker is single-
+        // threaded over files so this doesn't race.
+        this.lastClassifierMeta = null;
 
         // Initialize Socket.IO client for WebSocket events
         this.socket = io(SERVER_URL, {
@@ -262,8 +268,9 @@ class FileProcessorWorker {
 
                 console.log(`📋 Using extraction method: ${extractionMethod} (from job processing config)`);
 
-                // Get selected_pages from file if available
-                const selectedPages = file.selected_pages || null;
+                // Resolve selected_pages: manual file-level selection wins, otherwise
+                // the visual classifier (when enabled) narrows the page set.
+                const selectedPages = await this.deriveSelectedPages(file, jobProcessingConfig);
 
                 // Handle ExtendAI with fallback to mineru
                 if (extractionMethod === 'extendai') {
@@ -332,6 +339,12 @@ class FileProcessorWorker {
                     extractionMetadata.openai_feed_unblocked_length = openaiFeedUnblocked.length;
                 }
 
+                // Surface classifier provenance in extraction metadata.
+                if (this.lastClassifierMeta) {
+                    extractionMetadata.visual_page_classifier = this.lastClassifierMeta;
+                    this.lastClassifierMeta = null;
+                }
+
                 // Debug logging to check values
                 console.log('🔍 Extraction result debug (extraction-only mode):', {
                     filename: file.filename,
@@ -395,8 +408,9 @@ class FileProcessorWorker {
 
                 console.log(`📋 Using extraction method: ${extractionMethod} (from job processing config)`);
 
-                // Get selected_pages from file if available
-                const selectedPages = file.selected_pages || null;
+                // Resolve selected_pages: manual file-level selection wins, otherwise
+                // the visual classifier (when enabled) narrows the page set.
+                const selectedPages = await this.deriveSelectedPages(file, jobProcessingConfig);
 
                 // Handle ExtendAI with fallback to mineru
                 if (extractionMethod === 'extendai') {
@@ -459,6 +473,12 @@ class FileProcessorWorker {
                     extractionMetadata.openai_feed_unblocked_length = openaiFeedUnblocked.length;
                 }
 
+                // Surface classifier provenance in extraction metadata.
+                if (this.lastClassifierMeta) {
+                    extractionMetadata.visual_page_classifier = this.lastClassifierMeta;
+                    this.lastClassifierMeta = null;
+                }
+
                 // Update extraction status for both modes with all fields
                 await updateFileExtractionStatus(
                     file.id,
@@ -509,8 +529,9 @@ class FileProcessorWorker {
 
                 console.log(`📋 Using extraction method: ${extractionMethod} (from job processing config)`);
 
-                // Get selected_pages from file if available
-                const selectedPages = file.selected_pages || null;
+                // Resolve selected_pages: manual file-level selection wins, otherwise
+                // the visual classifier (when enabled) narrows the page set.
+                const selectedPages = await this.deriveSelectedPages(file, jobProcessingConfig);
 
                 // Handle ExtendAI with fallback to mineru
                 if (extractionMethod === 'extendai') {
@@ -575,6 +596,14 @@ class FileProcessorWorker {
                 }
                 if (openaiFeedUnblocked) {
                     extractionMetadata.openai_feed_unblocked_length = openaiFeedUnblocked.length;
+                }
+
+                // Surface classifier provenance in extraction metadata so we can
+                // tell at a glance whether a given file was page-narrowed by the
+                // visual classifier and what it decided.
+                if (this.lastClassifierMeta) {
+                    extractionMetadata.visual_page_classifier = this.lastClassifierMeta;
+                    this.lastClassifierMeta = null;
                 }
 
                 // Debug logging to check values
@@ -906,6 +935,142 @@ class FileProcessorWorker {
                     error.message
                 );
             }
+        }
+    }
+
+    /**
+     * Decide which pages the extractor should see.
+     *
+     * Order of precedence:
+     *   1. Manual file-level `selected_pages`. If a human picked pages, we
+     *      respect that — they have more context than the classifier.
+     *   2. Visual classifier output, when `processing_config.useVisualClassifier`
+     *      is true on the job. We run the classifier on the file's PDF, persist
+     *      `detected_sections` to the DB, and use the union of every section's
+     *      `extraction_pages`.
+     *   3. `null` — meaning "no narrowing, extractor processes the whole file"
+     *      (today's default behaviour).
+     *
+     * Failure / edge cases all fall back to (3) so we never accidentally
+     * skip extraction:
+     *   - Classifier disabled or feature flag missing
+     *   - File has no s3_key (classifier needs to download a PDF)
+     *   - Classifier throws or returns no sections
+     *   - Classifier returns sections but zero extractable pages (all
+     *     duplicates / boilerplate). Better to OCR the whole file than to
+     *     silently extract nothing.
+     *
+     * Side effect: when the classifier ran successfully, this method stashes
+     * a small summary on `this.lastClassifierMeta` so the calling extraction
+     * branch can fold it into the file's extraction_metadata for visibility.
+     * Stash is consumed (set back to null) on read. Safe because the worker
+     * processes one file at a time.
+     */
+    async deriveSelectedPages(file, jobProcessingConfig) {
+        // Reset stash for this file.
+        this.lastClassifierMeta = null;
+
+        // (1) Manual selection wins.
+        if (file.selected_pages && Array.isArray(file.selected_pages) && file.selected_pages.length > 0) {
+            console.log(`📄 Using manual selected_pages for ${file.filename}: ${file.selected_pages.join(', ')}`);
+            return file.selected_pages;
+        }
+
+        // (2) Visual classifier, gated by feature flag.
+        if (jobProcessingConfig?.useVisualClassifier !== true) {
+            return null;
+        }
+
+        const classifierResult = await this.runVisualClassifier(file, jobProcessingConfig);
+        if (!classifierResult || !classifierResult.detectedSections) {
+            return null;
+        }
+
+        const sections = classifierResult.detectedSections.sections || [];
+        // Permissive default: include pending_review sections too. There is no
+        // routing-review UI yet (Phase 1 item #4); excluding pending_review
+        // would silently drop those pages forever. Tighten this once the UI
+        // lands.
+        const pages = flattenExtractionPages(sections, { includePendingReview: true });
+
+        if (pages.length === 0) {
+            console.warn(
+                `⚠️ Visual classifier returned no extractable pages for ${file.filename} ` +
+                `(${sections.length} section(s)) — falling back to full document`
+            );
+            this.lastClassifierMeta = {
+                ran: true,
+                fell_back: true,
+                fell_back_reason: 'no_extractable_pages',
+                section_count: sections.length,
+                file_status: classifierResult.detectedSections.status,
+                classifier: classifierResult.detectedSections.classifier,
+            };
+            return null;
+        }
+
+        const totalPages = classifierResult.detectedSections.pages?.length || pages.length;
+        console.log(
+            `📄 Using visual-classifier-derived pages for ${file.filename}: ` +
+            `${pages.length}/${totalPages} (${pages.join(', ')})`
+        );
+
+        this.lastClassifierMeta = {
+            ran: true,
+            fell_back: false,
+            section_count: sections.length,
+            file_status: classifierResult.detectedSections.status,
+            extraction_pages: pages,
+            total_pages: totalPages,
+            classifier: classifierResult.detectedSections.classifier,
+        };
+
+        return pages;
+    }
+
+    /**
+     * Run the VisualPageClassifierStage directly (without going through a
+     * full pipeline runner). The stage handles its own DB persistence of
+     * detected_sections and degrades gracefully on failure.
+     *
+     * Returns `{ detectedSections, visualPageClassifier }` on success, or
+     * `null` when the stage chose not to run / failed silently.
+     */
+    async runVisualClassifier(file, jobProcessingConfig) {
+        const stage = new VisualPageClassifierStage({ s3Service: this.s3Service });
+        const stageContext = {
+            fileId: file.id,
+            jobId: file.job_id,
+            filename: file.filename,
+            fileInfo: {
+                id: file.id,
+                filename: file.filename,
+                job_id: file.job_id,
+                s3_key: file.s3_key,
+                storage_type: file.storage_type || 's3',
+            },
+            processingConfig: jobProcessingConfig || {},
+        };
+
+        if (!stage.shouldRun(stageContext)) {
+            console.log(`ℹ️ Visual classifier did not run for ${file.filename} (gating conditions not met)`);
+            return null;
+        }
+
+        try {
+            stage.validate(stageContext);
+            const result = await stage.execute(stageContext);
+            if (!result?.detectedSections) {
+                console.warn(`⚠️ Visual classifier returned no detected_sections for ${file.filename}`);
+                return null;
+            }
+            return result;
+        } catch (error) {
+            // Stage's own handleError logs; we just don't rethrow because the
+            // classifier is optional — falling back to full-document extraction
+            // is always preferable to failing the whole file.
+            stage.handleError(error, stageContext);
+            return null;
         }
     }
 

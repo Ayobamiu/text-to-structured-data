@@ -54,6 +54,7 @@ export async function listDocumentTypes({ includeDeprecated = false } = {}) {
         const result = await client.query(
             `SELECT id, slug, display_name, description, default_extractor,
                     routing_confidence_threshold, current_schema_version_id,
+                    classifier_hints,
                     status, created_at, updated_at
              FROM document_types
              ${includeDeprecated ? '' : "WHERE status = 'active'"}
@@ -70,6 +71,61 @@ export async function listDocumentTypes({ includeDeprecated = false } = {}) {
 }
 
 /**
+ * Get the subset of active document types matching the requested slugs.
+ *
+ * Used by callers (CLI, classifier stage, future job-creation API) that want
+ * to restrict classification to a known set of document types — e.g. "this
+ * batch is all well logs, only consider mgs_well_log + 'none'".
+ *
+ * Behaviour:
+ *   - Empty / null / undefined slugs → returns ALL active types
+ *     (delegates to listDocumentTypes). This is the documented default so
+ *     callers can leave the field optional without surprise.
+ *   - Errors loudly when any requested slug doesn't match an active type,
+ *     listing both the missing slugs and the available ones. Silently
+ *     filtering would mask config typos that waste classifier money.
+ *   - Result is sorted to match the requested-slug order so the response
+ *     schema enum is deterministic across calls.
+ *
+ * @param {Array<string>|null|undefined} slugs
+ * @param {Object} [opts]
+ * @param {boolean} [opts.includeDeprecated=false]
+ * @returns {Promise<Array<Object>>}
+ */
+export async function getDocumentTypesBySlugs(slugs, opts = {}) {
+    const requested = Array.isArray(slugs)
+        ? [...new Set(slugs.filter((s) => typeof s === 'string' && s.length > 0))]
+        : [];
+
+    if (requested.length === 0) {
+        return listDocumentTypes(opts);
+    }
+
+    const all = await listDocumentTypes(opts);
+    const bySlug = new Map(all.map((d) => [d.slug, d]));
+
+    const found = [];
+    const missing = [];
+    for (const slug of requested) {
+        const dt = bySlug.get(slug);
+        if (dt) {
+            found.push(dt);
+        } else {
+            missing.push(slug);
+        }
+    }
+
+    if (missing.length > 0) {
+        const available = all.map((d) => d.slug).join(', ') || '(none registered)';
+        throw new Error(
+            `Unknown document_type slug(s): ${missing.join(', ')}. Available active types: ${available}.`
+        );
+    }
+
+    return found;
+}
+
+/**
  * Get a single document type by slug.
  * @param {string} slug
  * @returns {Promise<Object|null>}
@@ -80,6 +136,7 @@ export async function getDocumentTypeBySlug(slug) {
         const result = await client.query(
             `SELECT id, slug, display_name, description, default_extractor,
                     routing_confidence_threshold, current_schema_version_id,
+                    classifier_hints,
                     status, created_at, updated_at
              FROM document_types
              WHERE slug = $1`,
@@ -345,6 +402,45 @@ export async function registerSchema({
 }
 
 /**
+ * Set (replace) the classifier_hints object on a document type.
+ *
+ * Why a replace, not a merge: hints are short, hand-edited objects whose
+ * authors expect "what I wrote is what gets used." A merge would let stale
+ * skip_when rules silently linger, which is the exact failure mode hints
+ * are meant to prevent.
+ *
+ * @param {string} slug
+ * @param {Object} hints   Free-form object; see migrations/add_classifier_hints_to_document_types.js for shape.
+ *                         Typically { skip_when: [...], keep_when: [...] }.
+ *
+ * @returns {Promise<{ slug, classifier_hints, updated_at }>}
+ */
+export async function setClassifierHints(slug, hints) {
+    if (!slug) throw new Error('setClassifierHints requires slug');
+    if (!hints || typeof hints !== 'object' || Array.isArray(hints)) {
+        throw new Error('setClassifierHints requires a plain object for hints');
+    }
+
+    const client = await pool.connect();
+    try {
+        const result = await client.query(
+            `UPDATE document_types
+             SET classifier_hints = $1::jsonb, updated_at = NOW()
+             WHERE slug = $2
+             RETURNING slug, classifier_hints, updated_at`,
+            [JSON.stringify(hints), slug]
+        );
+        if (result.rows.length === 0) {
+            throw new Error(`document_type '${slug}' not found`);
+        }
+        bustCache();
+        return result.rows[0];
+    } finally {
+        client.release();
+    }
+}
+
+/**
  * Promote a draft (or older active) schema version to current_schema_version.
  * Useful when a draft schema has been validated against held-out files and
  * is ready to take over from the previous active version.
@@ -387,10 +483,12 @@ export async function setCurrentSchemaVersion(documentTypeSlug, version) {
 
 export default {
     listDocumentTypes,
+    getDocumentTypesBySlugs,
     getDocumentTypeBySlug,
     getActiveSchema,
     getSchemaVersion,
     registerDocumentType,
     registerSchema,
+    setClassifierHints,
     setCurrentSchemaVersion,
 };

@@ -1,0 +1,19 @@
+{
+  "_comment_about_this_file": "Per-document-type classifier hints for mgs_well_log. Loaded into document_types.classifier_hints via `node ai/scripts/set-classifier-hints.js --slug mgs_well_log --file ai/data/classifier-hints/mgs_well_log.json`. Edits land in the registry, get spliced into the visual classifier's system prompt for any page being evaluated against this slug, and override the generic page_purpose definitions when there's a conflict.",
+
+  "_iteration_notes": [
+    "v1: caught permits (p2, p3, p6) but over-applied to the well plugging record (p7).",
+    "v2 (this version): replaced the 'permit form' framing with an explicit Application-vs-Record distinction. Applications/Permits (administrative requests) are skipped; Records/Logs (factual documents) are kept — even when they're about the same activity (e.g. plugging an abandoned well).",
+    "Removed the prior duplicate-detection hint: the model classifies one page in isolation and cannot reliably tell that page N repeats page M. Semantic duplicates are tracked separately via the perceptual-hash deduplicator (planned)."
+  ],
+
+  "skip_when": [
+    "If the page is an APPLICATION or PERMIT form — titles like 'Application for Permit', 'Application for Permit to Drill', 'Permit to Drill', 'Application for Permission to Abandon' — classify the page as document_type_slug='none'. These are administrative request/permission documents, NOT the well log we extract. They may carry well metadata (location, casing, formations) but that data is also recorded on the actual log pages and would cause duplicate / wrong-source extraction.",
+    "Critical distinction — apply this rule strictly: an APPLICATION ('Application for X', 'Permit to X', 'Permission to X') is administrative and should be SKIPPED (document_type_slug='none'). A RECORD or LOG ('Well Plugging Record', 'Well Construction Log', 'Driller's Log', 'Formation Log', 'Completion Record') is the actual data document and should be KEPT as document_type_slug='mgs_well_log' with page_purpose='data'. Both kinds of pages may discuss the same activity (drilling, plugging, abandonment) — the title verb matters more than the topic."
+  ],
+
+  "keep_when": [
+    "An actual MGS well log has a tabular log structure with depth/elevation columns running down the page, formation or lithology descriptions per depth interval, and well construction details (casing, screen, surface completion). It is primarily a LOG of measurements and observations.",
+    "The mgs_well_log document type INCLUDES well plugging RECORDS (titles like 'Well Plugging Record'). These document HOW the well was plugged — cement intervals, plugging materials, depths sealed — and contain extractable data. Do NOT confuse a 'Well Plugging Record' (kept) with an 'Application for Permission to Abandon' (skipped); they are different documents that may be filed in the same packet."
+  ]
+}
