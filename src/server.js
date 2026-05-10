@@ -932,6 +932,118 @@ app.get("/files/:id/download", authenticateToken, async (req, res) => {
     }
 });
 
+// ──────────────────────────────────────────────────────────────────────────
+// Visual Page Classifier endpoints
+// ──────────────────────────────────────────────────────────────────────────
+//
+// GET  /document-types
+//   Lists active document types from the schema registry. Used by the
+//   frontend to populate the "restrict classifier to" multi-select on
+//   job creation / job config.
+//
+// GET  /files/:id/pages/:n/thumbnail.jpg
+//   Renders a single PDF page from S3 to a JPEG on demand. Used by the
+//   "Document routing" panel on the file detail page so each per-page row
+//   can show a small preview alongside the classifier's decision.
+//   Cached aggressively because output is deterministic for a given
+//   file+page (same PDF bytes, same renderer, same options).
+
+app.get("/document-types", authenticateToken, async (req, res) => {
+    try {
+        const { listDocumentTypes } = await import("./services/schemaRegistry.js");
+        const includeDeprecated = req.query.includeDeprecated === 'true';
+        const types = await listDocumentTypes({ includeDeprecated });
+        res.json({
+            status: "success",
+            documentTypes: types.map((t) => ({
+                id: t.id,
+                slug: t.slug,
+                display_name: t.display_name,
+                description: t.description,
+                default_extractor: t.default_extractor,
+                routing_confidence_threshold: t.routing_confidence_threshold,
+                status: t.status,
+                has_classifier_hints: t.classifier_hints != null,
+            })),
+        });
+    } catch (error) {
+        console.error('❌ Error listing document types:', error.message);
+        res.status(500).json({
+            status: "error",
+            message: error.message,
+        });
+    }
+});
+
+app.get("/files/:id/pages/:n/thumbnail.jpg", authenticateToken, async (req, res) => {
+    try {
+        const { id, n } = req.params;
+        const pageNumber = parseInt(n, 10);
+
+        if (!Number.isInteger(pageNumber) || pageNumber < 1) {
+            return res.status(400).json({ status: "error", message: "Invalid page number" });
+        }
+
+        // Width clamped to a sane range (the classifier itself uses 768).
+        const widthPx = Math.max(128, Math.min(2048, parseInt(req.query.width, 10) || 480));
+        const jpegQuality = Math.max(40, Math.min(95, parseInt(req.query.q, 10) || 75));
+
+        // Look up the file row (need s3_key + access check).
+        const client = await pool.connect();
+        let file;
+        try {
+            const { rows } = await client.query(
+                `SELECT id, filename, s3_key, job_id, storage_type
+                 FROM job_files WHERE id = $1`,
+                [id]
+            );
+            file = rows[0];
+        } finally {
+            client.release();
+        }
+
+        if (!file) {
+            return res.status(404).json({ status: "error", message: "File not found" });
+        }
+
+        const hasAccess = await checkFileAccess(id, req.user, res);
+        if (!hasAccess) return; // checkFileAccess already wrote a response
+
+        if (!file.s3_key) {
+            return res.status(400).json({ status: "error", message: "File has no S3 key — thumbnails require S3 storage" });
+        }
+
+        const s3 = new S3Service();
+        if (!s3.isCloudStorageEnabled()) {
+            return res.status(503).json({ status: "error", message: "S3 storage disabled on this server" });
+        }
+
+        const pdfBuffer = await s3.downloadFile(file.s3_key);
+
+        const { rasterizePdf } = await import("./services/pdfRasterizer.js");
+        const pages = await rasterizePdf(pdfBuffer, {
+            widthPx,
+            jpegQuality,
+            firstPage: pageNumber,
+            lastPage: pageNumber,
+        });
+
+        if (pages.length === 0) {
+            return res.status(404).json({ status: "error", message: `Page ${pageNumber} not found in PDF` });
+        }
+
+        const jpeg = pages[0].jpeg;
+        // Browser cache: thumbnails are deterministic for a given file+page+options.
+        res.set('Content-Type', 'image/jpeg');
+        res.set('Cache-Control', 'private, max-age=86400, immutable');
+        res.set('Content-Length', String(jpeg.length));
+        res.send(jpeg);
+    } catch (error) {
+        console.error(`❌ Error rendering page thumbnail:`, error.message);
+        res.status(500).json({ status: "error", message: error.message });
+    }
+});
+
 // Update file results endpoint
 app.put("/files/:id/results", authenticateToken, async (req, res) => {
     try {
@@ -2110,20 +2222,25 @@ async function processFilesAsync(job, files, schema, schemaName, processingConfi
                 // Get S3 key from file record if available
                 const s3Key = fileRecord.s3_key || null;
 
-                // Get selected_pages from file record if available
-                let selectedPages = null;
-                if (fileRecord.selected_pages) {
-                    try {
-                        selectedPages = typeof fileRecord.selected_pages === 'string'
-                            ? JSON.parse(fileRecord.selected_pages)
-                            : fileRecord.selected_pages;
-                        if (selectedPages && Array.isArray(selectedPages) && selectedPages.length > 0) {
-                            console.log(`📄 Using selected pages for ${file.originalname}: ${selectedPages.join(', ')}`);
-                        }
-                    } catch (e) {
-                        console.warn(`⚠️ Failed to parse selected_pages for ${file.originalname}:`, e.message);
-                    }
-                }
+                // Resolve which pages the extractor should see. This is the
+                // single source of truth for "manual selection wins, otherwise
+                // run the visual classifier (if enabled), otherwise extract
+                // the whole file". Same helper that the worker uses, so both
+                // paths stay aligned.
+                const { deriveSelectedPagesAndMeta } = await import('./services/visualClassifierWiring.js');
+                const fileForHelper = {
+                    id: fileRecord.id,
+                    filename: file.originalname,
+                    s3_key: s3Key,
+                    selected_pages: fileRecord.selected_pages ?? null,
+                    storage_type: fileRecord.storage_type || 's3',
+                    job_id: job.id,
+                };
+                const { selectedPages, classifierMeta: visualClassifierMeta } = await deriveSelectedPagesAndMeta({
+                    file: fileForHelper,
+                    jobProcessingConfig,
+                    s3Service,
+                });
 
                 // Extract text (with fallback if extendai fails)
                 let extractionResult;
@@ -2184,6 +2301,13 @@ async function processFilesAsync(job, files, schema, schemaName, processingConfi
                 }
                 if (openaiFeedUnblocked) {
                     extractionMetadata.openai_feed_unblocked_length = openaiFeedUnblocked.length;
+                }
+
+                // Surface visual classifier provenance so the routing panel
+                // (and any debugging) can see what the classifier decided
+                // and whether the extractor honoured it or fell back.
+                if (visualClassifierMeta) {
+                    extractionMetadata.visual_page_classifier = visualClassifierMeta;
                 }
 
                 // Extract page count (pages could be array or number)
