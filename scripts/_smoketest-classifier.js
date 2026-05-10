@@ -264,26 +264,33 @@ console.log('\n[1.55] flattenExtractionPages — union across sections');
 }
 
 {
-    // includePendingReview default = true: every section contributes
-    // regardless of status. This is the "no routing-review UI yet" mode.
-    const sections = [
-        { document_type_slug: 'a', extraction_pages: [1, 2], status: 'auto_approved' },
-        { document_type_slug: 'b', extraction_pages: [5],    status: 'pending_review' },
-    ];
-    assert(deepEqualJSON(flattenExtractionPages(sections), [1, 2, 5]), 'pending_review included by default');
-}
-
-{
-    // includePendingReview = false: pending_review sections held back; both
-    // 'auto_approved' and 'approved' (post human-review) sections pass.
+    // Default (since the routing-review UI shipped): pending_review sections
+    // are held back; only 'auto_approved' and 'approved' (post human-review)
+    // sections contribute pages.
     const sections = [
         { document_type_slug: 'a', extraction_pages: [1, 2], status: 'auto_approved' },
         { document_type_slug: 'b', extraction_pages: [5],    status: 'pending_review' },
         { document_type_slug: 'c', extraction_pages: [9],    status: 'approved' },
     ];
     assert(
-        deepEqualJSON(flattenExtractionPages(sections, { includePendingReview: false }), [1, 2, 9]),
-        'includePendingReview=false skips pending_review but keeps approved'
+        deepEqualJSON(flattenExtractionPages(sections), [1, 2, 9]),
+        'default skips pending_review but keeps auto_approved + approved'
+    );
+}
+
+{
+    // Explicit includePendingReview=true: opt-in escape hatch for backfills /
+    // smoke tests that intentionally want to ignore the review gate.
+    const sections = [
+        { document_type_slug: 'a', extraction_pages: [1, 2], status: 'auto_approved' },
+        { document_type_slug: 'b', extraction_pages: [5],    status: 'pending_review' },
+    ];
+    assert(
+        deepEqualJSON(
+            flattenExtractionPages(sections, { includePendingReview: true }),
+            [1, 2, 5]
+        ),
+        'includePendingReview=true overrides the gate'
     );
 }
 

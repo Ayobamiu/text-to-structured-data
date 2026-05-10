@@ -964,6 +964,38 @@ export async function getFileResult(fileId) {
     }
 }
 
+/**
+ * Replace the `detected_sections` JSONB blob on a job_files row.
+ *
+ * Used by the routing-review endpoints (Phase 1, item #4). Caller is
+ * responsible for any validation; this is a dumb writer.
+ *
+ * @param {string} fileId
+ * @param {Object} detectedSections   Full new blob (not a patch).
+ * @returns {Promise<{id, job_id, filename, detected_sections}>}
+ */
+export async function updateFileDetectedSections(fileId, detectedSections) {
+    const client = await pool.connect();
+    try {
+        const { rows } = await client.query(
+            `UPDATE job_files
+             SET detected_sections = $1::jsonb, updated_at = NOW()
+             WHERE id = $2
+             RETURNING id, job_id, filename, detected_sections`,
+            [JSON.stringify(detectedSections), fileId]
+        );
+        if (rows.length === 0) {
+            throw new Error('File not found');
+        }
+        return rows[0];
+    } catch (error) {
+        console.error('❌ Error updating file detected_sections:', error.message);
+        throw error;
+    } finally {
+        client.release();
+    }
+}
+
 // Update file verification status
 export async function updateFileVerification(fileId, adminVerified = null, customerVerified = null) {
     const client = await pool.connect();

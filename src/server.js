@@ -34,6 +34,7 @@ import pool, {
     updateFileReviewStatus,
     bulkUpdateFileReviewStatus,
     bulkUpdateFileVerification,
+    updateFileDetectedSections,
     userHasJobAccess
 } from "./database.js";
 import { getUserById } from "./database/users.js";
@@ -2068,6 +2069,162 @@ app.put("/files/:id/review", authenticateToken, async (req, res) => {
             message: "Failed to update file review status",
             error: error.message
         });
+    }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Routing-review write endpoints (Phase 1, item #4)
+//
+// The visual classifier marks each section 'auto_approved' or 'pending_review'.
+// These endpoints let an operator:
+//   - approve a pending_review section,
+//   - re-route it to a different document type,
+//   - split it into two at a chosen page boundary.
+//
+// All three persist the new `detected_sections` blob on job_files and emit a
+// `file-status-update` event so any open routing panel refreshes. Per-section
+// extraction (worker side) gates on `flattenExtractionPages({
+// includePendingReview: false })`, so flipping a section to 'approved' is what
+// makes its pages eligible for the next reprocess pass.
+// ─────────────────────────────────────────────────────────────────────────────
+
+function parseSectionIndex(value, res) {
+    const idx = parseInt(value, 10);
+    if (!Number.isInteger(idx) || idx < 0) {
+        res.status(400).json({ status: 'error', message: 'Invalid section index' });
+        return null;
+    }
+    return idx;
+}
+
+async function loadFileWithSections(fileId, res) {
+    const file = await getFileResult(fileId);
+    if (!file) {
+        res.status(404).json({ status: 'error', message: 'File not found' });
+        return null;
+    }
+    if (!file.detected_sections || !Array.isArray(file.detected_sections.sections)) {
+        res.status(400).json({
+            status: 'error',
+            message: 'File has no detected_sections (visual classifier did not run on it)',
+        });
+        return null;
+    }
+    return file;
+}
+
+function emitDetectedSectionsUpdate(file, detectedSections) {
+    io.to(`job-${file.job_id}`).emit('file-status-update', {
+        jobId: file.job_id,
+        fileId: file.id,
+        filename: file.filename,
+        detected_sections: detectedSections,
+        message: `Routing updated for ${file.filename}`,
+        timestamp: new Date().toISOString(),
+    });
+}
+
+app.post("/files/:id/sections/:index/approve", authenticateToken, async (req, res) => {
+    try {
+        const fileId = req.params.id;
+        const index = parseSectionIndex(req.params.index, res);
+        if (index === null) return;
+
+        const hasAccess = await checkFileAccess(fileId, req.user, res);
+        if (!hasAccess) return;
+
+        const file = await loadFileWithSections(fileId, res);
+        if (!file) return;
+
+        const { applyApproveSection } = await import('./services/sectionRoutingEdits.js');
+        const updated = applyApproveSection(file.detected_sections, { index });
+
+        await updateFileDetectedSections(fileId, updated);
+        emitDetectedSectionsUpdate(file, updated);
+
+        res.json({ status: 'success', detected_sections: updated });
+    } catch (error) {
+        console.error('❌ section approve:', error.message);
+        res.status(400).json({ status: 'error', message: error.message });
+    }
+});
+
+app.post("/files/:id/sections/:index/change-slug", authenticateToken, async (req, res) => {
+    try {
+        const fileId = req.params.id;
+        const index = parseSectionIndex(req.params.index, res);
+        if (index === null) return;
+
+        const slug = req.body?.slug;
+        if (!slug || typeof slug !== 'string') {
+            return res.status(400).json({ status: 'error', message: 'slug is required (string)' });
+        }
+
+        const hasAccess = await checkFileAccess(fileId, req.user, res);
+        if (!hasAccess) return;
+
+        const file = await loadFileWithSections(fileId, res);
+        if (!file) return;
+
+        // Validate slug exists in registry. We don't restrict to active-only
+        // here — the operator may need to route to a deprecated type for
+        // historical consistency; the registry is the source of truth.
+        const { getDocumentTypeBySlug } = await import('./services/schemaRegistry.js');
+        const dt = await getDocumentTypeBySlug(slug);
+        if (!dt) {
+            return res.status(400).json({
+                status: 'error',
+                message: `Unknown document type '${slug}'`,
+            });
+        }
+
+        const { applyChangeSectionSlug } = await import('./services/sectionRoutingEdits.js');
+        const updated = applyChangeSectionSlug(file.detected_sections, {
+            index,
+            slug,
+            threshold: dt.routing_confidence_threshold,
+        });
+
+        await updateFileDetectedSections(fileId, updated);
+        emitDetectedSectionsUpdate(file, updated);
+
+        res.json({ status: 'success', detected_sections: updated });
+    } catch (error) {
+        console.error('❌ section change-slug:', error.message);
+        res.status(400).json({ status: 'error', message: error.message });
+    }
+});
+
+app.post("/files/:id/sections/:index/split", authenticateToken, async (req, res) => {
+    try {
+        const fileId = req.params.id;
+        const index = parseSectionIndex(req.params.index, res);
+        if (index === null) return;
+
+        const atPage = parseInt(req.body?.atPage, 10);
+        if (!Number.isInteger(atPage) || atPage < 1) {
+            return res.status(400).json({
+                status: 'error',
+                message: 'atPage must be a positive page number',
+            });
+        }
+
+        const hasAccess = await checkFileAccess(fileId, req.user, res);
+        if (!hasAccess) return;
+
+        const file = await loadFileWithSections(fileId, res);
+        if (!file) return;
+
+        const { applySplitSection } = await import('./services/sectionRoutingEdits.js');
+        const updated = applySplitSection(file.detected_sections, { index, atPage });
+
+        await updateFileDetectedSections(fileId, updated);
+        emitDetectedSectionsUpdate(file, updated);
+
+        res.json({ status: 'success', detected_sections: updated });
+    } catch (error) {
+        console.error('❌ section split:', error.message);
+        res.status(400).json({ status: 'error', message: error.message });
     }
 });
 

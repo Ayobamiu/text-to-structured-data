@@ -80,10 +80,10 @@ export async function deriveSelectedPagesAndMeta({ file, jobProcessingConfig, s3
     }
 
     const sections = classifierResult.detectedSections.sections || [];
-    // Permissive default: include pending_review sections too. There is no
-    // routing-review UI yet (Phase 1 item #4); excluding pending_review
-    // would silently drop those pages forever. Tighten this once the UI lands.
-    const pages = flattenExtractionPages(sections, { includePendingReview: true });
+    // Routing-review gate is on (Phase 1 item #4): pending_review sections
+    // are held back and must be approved (or rerouted/split) by an operator
+    // in the routing panel before they're eligible for extraction.
+    const pages = flattenExtractionPages(sections);
 
     if (pages.length === 0) {
         console.warn(

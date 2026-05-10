@@ -243,22 +243,20 @@ export function getGrouperMetadata() {
  *
  * @param {Array} sections  - Output of groupIntoSections().
  * @param {Object} [opts]
- * @param {boolean} [opts.includePendingReview=true]
- *   When true (default), pages from sections in 'pending_review' status are
- *   included. We keep the default permissive because there is no routing-
- *   review UI yet (Phase 1, item #4); excluding pending_review sections now
- *   would mean those pages would never reach the extractor and the data
- *   would be silently dropped.
+ * @param {boolean} [opts.includePendingReview=false]
+ *   When false (the default, since the routing-review UI shipped — Phase 1,
+ *   item #4), pages from sections in 'pending_review' status are HELD BACK.
+ *   The operator must approve those sections in the routing panel; on the
+ *   next reprocess pass they are picked up.
  *
- *   Once the routing-review UI exists, callers should pass
- *   `includePendingReview: false` so unreviewed sections are held back
- *   until a human approves them.
+ *   Pass `true` only when you intentionally want to ignore the review gate
+ *   (e.g. one-off scripts, smoke tests, backfills before review went live).
  *
  * @returns {number[]} Unique page numbers, ascending.
  */
 export function flattenExtractionPages(sections, opts = {}) {
     if (!Array.isArray(sections) || sections.length === 0) return [];
-    const includePendingReview = opts.includePendingReview !== false;
+    const includePendingReview = opts.includePendingReview === true;
     const pages = new Set();
     for (const s of sections) {
         if (!includePendingReview && s.status !== 'auto_approved' && s.status !== 'approved') {
