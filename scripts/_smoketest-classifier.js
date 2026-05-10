@@ -25,6 +25,7 @@ import {
     assignDuplicates,
     countDuplicates,
 } from '../src/services/pageDeduplicator.js';
+import { extractAndProcessPerSection } from '../src/services/perSectionExtractor.js';
 
 let failures = 0;
 
@@ -394,6 +395,208 @@ console.log('\n[2] Rasterizer + dedup roundtrip (synthetic 4-page PDF, page 4 = 
     assert(annotated[3].duplicate_of === 2, 'page 4 flagged as duplicate of page 2');
     assert(annotated[0].duplicate_of === null && annotated[1].duplicate_of === null && annotated[2].duplicate_of === null, 'pages 1-3 are canonical');
     assert(countDuplicates(annotated) === 1, 'exactly 1 duplicate detected end-to-end');
+}
+
+// ─── Test 3: per-section extractor (v2 envelope assembly) ───────────────────
+console.log('\n[3] Per-section extractor — v2 envelope assembly');
+
+// Tiny fakes so we can drive the orchestrator without a DB or OpenAI.
+function fakeProcessingService({ failingSlugs = new Set(), throwingSlugs = new Set() } = {}) {
+    return {
+        async processText(text, schemaInfo) {
+            const slug = schemaInfo?.documentTypeSlug;
+            if (throwingSlugs.has(slug)) throw new Error(`boom: ${slug}`);
+            if (failingSlugs.has(slug)) {
+                return { success: false, error: `forced failure: ${slug}` };
+            }
+            // Echo back something the test can recognise per slug.
+            return {
+                success: true,
+                data: {
+                    slug,
+                    text_length: text.length,
+                    sample: text.slice(0, 24),
+                },
+                metadata: { processing_time_seconds: 0.01 },
+            };
+        },
+    };
+}
+
+function makeFakeGetActiveSchema(registered) {
+    // `registered` is a Map<slug, version> — registered schemas only.
+    return async (slug) => {
+        if (!registered.has(slug)) return null;
+        return {
+            schemaName: `${slug}_extraction`,
+            schema: { type: 'object', properties: {} },
+            promptHints: {},
+            version: registered.get(slug),
+            documentTypeSlug: slug,
+            displayName: slug,
+            defaultExtractor: 'openai',
+            schemaId: `fake-${slug}`,
+        };
+    };
+}
+
+function makePages(numPages) {
+    return Array.from({ length: numPages }, (_, i) => ({
+        page_number: i + 1,
+        text: `# Page ${i + 1} content with some real-ish words to extract`,
+    }));
+}
+
+{
+    // Single section, single slug → envelope = { slug: [{...}] }
+    const result = await extractAndProcessPerSection({
+        detectedSections: {
+            sections: [
+                { document_type_slug: 'mgs_well_log', page_range: [2, 4], extraction_pages: [2, 3, 4] },
+            ],
+        },
+        pages: makePages(5),
+        processingService: fakeProcessingService(),
+        getActiveSchema: makeFakeGetActiveSchema(new Map([['mgs_well_log', 1]])),
+    });
+    assert(deepEqualJSON(Object.keys(result.resultEnvelope), ['mgs_well_log']), 'envelope has one slug key');
+    assert(Array.isArray(result.resultEnvelope.mgs_well_log), 'value is an array');
+    assert(result.resultEnvelope.mgs_well_log.length === 1, 'one instance');
+    assert(result.sectionResults[0].status === 'success', 'section status = success');
+    assert(result.anySuccess === true, 'anySuccess = true');
+    assert(result.schemasUsed.mgs_well_log.version === 1, 'schemasUsed records version 1');
+}
+
+{
+    // Multi-instance same slug → envelope value is a 2-element array, in
+    // document order (section_index ascending).
+    const result = await extractAndProcessPerSection({
+        detectedSections: {
+            sections: [
+                { document_type_slug: 'boring_log', page_range: [1, 2], extraction_pages: [1, 2] },
+                { document_type_slug: 'boring_log', page_range: [5, 6], extraction_pages: [5, 6] },
+            ],
+        },
+        pages: makePages(8),
+        processingService: fakeProcessingService(),
+        getActiveSchema: makeFakeGetActiveSchema(new Map([['boring_log', 2]])),
+    });
+    assert(result.resultEnvelope.boring_log.length === 2, 'multi-instance same-slug → array length 2');
+    assert(result.resultEnvelope.boring_log[0].sample.startsWith('# Page 1'), 'first instance from pages 1-2');
+    assert(result.resultEnvelope.boring_log[1].sample.startsWith('# Page 5'), 'second instance from pages 5-6 (document order preserved)');
+    assert(result.sectionResults.length === 2, 'two section_results');
+    assert(result.schemasUsed.boring_log.version === 2, 'schemasUsed records the active version');
+}
+
+{
+    // Multi-slug → multiple keys in the envelope, each an array.
+    const result = await extractAndProcessPerSection({
+        detectedSections: {
+            sections: [
+                { document_type_slug: 'boring_log',  page_range: [1, 2], extraction_pages: [1, 2] },
+                { document_type_slug: 'aquifer_test', page_range: [3, 4], extraction_pages: [3, 4] },
+            ],
+        },
+        pages: makePages(5),
+        processingService: fakeProcessingService(),
+        getActiveSchema: makeFakeGetActiveSchema(new Map([['boring_log', 1], ['aquifer_test', 1]])),
+    });
+    assert(deepEqualJSON(Object.keys(result.resultEnvelope).sort(), ['aquifer_test', 'boring_log']), 'envelope has both slug keys');
+    assert(result.resultEnvelope.boring_log.length === 1 && result.resultEnvelope.aquifer_test.length === 1, 'each slug has its own array');
+}
+
+{
+    // Section with NO registered schema → status = skipped_no_schema, NOT in envelope.
+    // Other sections' success should be unaffected.
+    const result = await extractAndProcessPerSection({
+        detectedSections: {
+            sections: [
+                { document_type_slug: 'boring_log',  page_range: [1, 2], extraction_pages: [1, 2] },
+                { document_type_slug: 'lab_qc',      page_range: [4, 4], extraction_pages: [4]    },
+            ],
+        },
+        pages: makePages(5),
+        processingService: fakeProcessingService(),
+        getActiveSchema: makeFakeGetActiveSchema(new Map([['boring_log', 1]])), // lab_qc NOT registered
+    });
+    assert(result.resultEnvelope.boring_log?.length === 1, 'boring_log section still succeeded');
+    assert(!('lab_qc' in result.resultEnvelope), 'unschemed slug missing from envelope');
+    const labQc = result.sectionResults.find((r) => r.slug === 'lab_qc');
+    assert(labQc.status === 'skipped_no_schema', 'unschemed section status = skipped_no_schema');
+    assert(typeof labQc.error === 'string' && labQc.error.includes('lab_qc'), 'error message names the missing slug');
+    assert(result.anySuccess === true, 'anySuccess true because boring_log succeeded');
+}
+
+{
+    // Section with empty extraction_pages → skipped_no_pages.
+    const result = await extractAndProcessPerSection({
+        detectedSections: {
+            sections: [
+                { document_type_slug: 'boring_log', page_range: [1, 2], extraction_pages: [] },
+            ],
+        },
+        pages: makePages(5),
+        processingService: fakeProcessingService(),
+        getActiveSchema: makeFakeGetActiveSchema(new Map([['boring_log', 1]])),
+    });
+    assert(result.sectionResults[0].status === 'skipped_no_pages', 'empty extraction_pages → skipped_no_pages');
+    assert(Object.keys(result.resultEnvelope).length === 0, 'envelope is empty');
+    assert(result.anySuccess === false, 'anySuccess false');
+}
+
+{
+    // AI returns success=false → status = failed; other sections still complete.
+    const result = await extractAndProcessPerSection({
+        detectedSections: {
+            sections: [
+                { document_type_slug: 'good_slug', page_range: [1, 1], extraction_pages: [1] },
+                { document_type_slug: 'bad_slug',  page_range: [2, 2], extraction_pages: [2] },
+            ],
+        },
+        pages: makePages(3),
+        processingService: fakeProcessingService({ failingSlugs: new Set(['bad_slug']) }),
+        getActiveSchema: makeFakeGetActiveSchema(new Map([['good_slug', 1], ['bad_slug', 1]])),
+    });
+    assert(result.resultEnvelope.good_slug?.length === 1, 'good_slug succeeded');
+    assert(!('bad_slug' in result.resultEnvelope), 'bad_slug NOT in envelope');
+    assert(result.sectionResults.find((r) => r.slug === 'bad_slug').status === 'failed', 'bad_slug status = failed');
+    assert(result.anySuccess === true, 'anySuccess true because good_slug succeeded');
+}
+
+{
+    // processText THROWS (network error etc.) → caught and recorded as failed.
+    const result = await extractAndProcessPerSection({
+        detectedSections: {
+            sections: [
+                { document_type_slug: 'throwy', page_range: [1, 1], extraction_pages: [1] },
+            ],
+        },
+        pages: makePages(2),
+        processingService: fakeProcessingService({ throwingSlugs: new Set(['throwy']) }),
+        getActiveSchema: makeFakeGetActiveSchema(new Map([['throwy', 1]])),
+    });
+    assert(result.sectionResults[0].status === 'failed', 'thrown error → status = failed');
+    assert(result.sectionResults[0].error === 'boom: throwy', 'thrown error.message captured');
+    assert(result.anySuccess === false, 'anySuccess false');
+}
+
+{
+    // All sections failed/skipped → anySuccess = false. Caller decides what
+    // to do (the worker throws so the file is marked failed).
+    const result = await extractAndProcessPerSection({
+        detectedSections: {
+            sections: [
+                { document_type_slug: 'unknown_a', page_range: [1, 1], extraction_pages: [1] },
+                { document_type_slug: 'unknown_b', page_range: [2, 2], extraction_pages: [2] },
+            ],
+        },
+        pages: makePages(3),
+        processingService: fakeProcessingService(),
+        getActiveSchema: makeFakeGetActiveSchema(new Map()), // none registered
+    });
+    assert(result.anySuccess === false, 'anySuccess false when nothing succeeded');
+    assert(Object.keys(result.resultEnvelope).length === 0, 'envelope is empty');
+    assert(result.sectionResults.every((r) => r.status === 'skipped_no_schema'), 'every section skipped');
 }
 
 console.log('');

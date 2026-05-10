@@ -28,7 +28,11 @@ import { flattenExtractionPages } from './sectionGrouper.js';
  * @param {Object}   args.jobProcessingConfig Parsed processing_config from
  *                                            the job.
  * @param {Object}   args.s3Service          Live S3Service instance.
- * @returns {Promise<{ selectedPages: number[]|null, classifierMeta: Object|null }>}
+ * @returns {Promise<{
+ *   selectedPages: number[]|null,
+ *   classifierMeta: Object|null,
+ *   detectedSections: Object|null
+ * }>}
  *
  *   selectedPages
  *     - manual file selected_pages if set (precedence #1)
@@ -43,6 +47,15 @@ import { flattenExtractionPages } from './sectionGrouper.js';
  *       fall_back/fall_back_reason field when the run succeeded but yielded
  *       no extractable pages. Callers should fold this into
  *       extraction_metadata.visual_page_classifier.
+ *
+ *   detectedSections
+ *     - null when the classifier did not run, or ran and produced no usable
+ *       sections (in which case the caller should NOT attempt per-section
+ *       extraction — fall back to the v1 single-schema path).
+ *     - the classifier output object (same shape as `job_files.detected_sections`)
+ *       when the run succeeded with ≥1 extractable page. Per-section extraction
+ *       consumes this directly so the caller doesn't have to re-fetch from
+ *       the DB.
  */
 export async function deriveSelectedPagesAndMeta({ file, jobProcessingConfig, s3Service }) {
     // (1) Manual selection wins. Tolerate string-encoded JSON because some
@@ -53,17 +66,17 @@ export async function deriveSelectedPagesAndMeta({ file, jobProcessingConfig, s3
     }
     if (Array.isArray(manual) && manual.length > 0) {
         console.log(`📄 Using manual selected_pages for ${file.filename}: ${manual.join(', ')}`);
-        return { selectedPages: manual, classifierMeta: null };
+        return { selectedPages: manual, classifierMeta: null, detectedSections: null };
     }
 
     // (2) Visual classifier, gated by feature flag.
     if (jobProcessingConfig?.useVisualClassifier !== true) {
-        return { selectedPages: null, classifierMeta: null };
+        return { selectedPages: null, classifierMeta: null, detectedSections: null };
     }
 
     const classifierResult = await runVisualClassifier({ file, jobProcessingConfig, s3Service });
     if (!classifierResult || !classifierResult.detectedSections) {
-        return { selectedPages: null, classifierMeta: null };
+        return { selectedPages: null, classifierMeta: null, detectedSections: null };
     }
 
     const sections = classifierResult.detectedSections.sections || [];
@@ -79,6 +92,10 @@ export async function deriveSelectedPagesAndMeta({ file, jobProcessingConfig, s3
         );
         return {
             selectedPages: null,
+            // Even though we're falling back to the v1 path on selection, we
+            // still surface detectedSections so downstream callers can see
+            // the (empty) routing decision in the UI.
+            detectedSections: classifierResult.detectedSections,
             classifierMeta: {
                 ran: true,
                 fell_back: true,
@@ -98,6 +115,7 @@ export async function deriveSelectedPagesAndMeta({ file, jobProcessingConfig, s3
 
     return {
         selectedPages: pages,
+        detectedSections: classifierResult.detectedSections,
         classifierMeta: {
             ran: true,
             fell_back: false,

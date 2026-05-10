@@ -2236,7 +2236,11 @@ async function processFilesAsync(job, files, schema, schemaName, processingConfi
                     storage_type: fileRecord.storage_type || 's3',
                     job_id: job.id,
                 };
-                const { selectedPages, classifierMeta: visualClassifierMeta } = await deriveSelectedPagesAndMeta({
+                const {
+                    selectedPages,
+                    classifierMeta: visualClassifierMeta,
+                    detectedSections: visualDetectedSections,
+                } = await deriveSelectedPagesAndMeta({
                     file: fileForHelper,
                     jobProcessingConfig,
                     s3Service,
@@ -2484,7 +2488,108 @@ async function processFilesAsync(job, files, schema, schemaName, processingConfi
                         }
                     }
 
-                    // Step 5: Process with OpenAI using shared function
+                    // ─────────────────────────────────────────────────────────
+                    // Per-section path (v2 envelope)
+                    // ─────────────────────────────────────────────────────────
+                    // Mirrors worker.js: when the visual classifier produced
+                    // ≥1 section with extractable pages, fan out one AI call
+                    // per section using registry-resolved schemas, and store
+                    // the v2 envelope. Otherwise fall through to v1.
+                    // ─────────────────────────────────────────────────────────
+                    const useClassifierForExtraction = jobProcessingConfig?.useVisualClassifier === true;
+                    const hasExtractableSections = !!(
+                        visualDetectedSections &&
+                        Array.isArray(visualDetectedSections.sections) &&
+                        visualDetectedSections.sections.some(
+                            (s) => Array.isArray(s.extraction_pages) && s.extraction_pages.length > 0
+                        )
+                    );
+
+                    if (useClassifierForExtraction && hasExtractableSections && Array.isArray(pages)) {
+                        console.log(
+                            `🧩 Per-section extraction: ${visualDetectedSections.sections.length} section(s) ` +
+                            `for ${file.originalname} (envelope v2)`
+                        );
+
+                        // Lazy imports keep the per-section path fully optional
+                        // so the existing v1 path has no new module-load cost.
+                        const { extractAndProcessPerSection } = await import('./services/perSectionExtractor.js');
+
+                        // Adapter so perSectionExtractor (designed against the
+                        // ProcessingService class API) can drive this code path
+                        // which uses the slimmer processWithOpenAI utility.
+                        const processingServiceAdapter = {
+                            async processText(text, schemaInfo) {
+                                return processWithOpenAI(text, {
+                                    schemaName: schemaInfo?.schemaName || 'data_extraction',
+                                    schema: schemaInfo?.schema,
+                                });
+                            },
+                        };
+
+                        const perSection = await extractAndProcessPerSection({
+                            detectedSections: visualDetectedSections,
+                            pages,
+                            processingService: processingServiceAdapter,
+                            processingMethod: 'openai',
+                            processingOptions: {},
+                        });
+
+                        const failedCount = perSection.sectionResults.filter((r) => r.status === 'failed').length;
+                        const skippedCount = perSection.sectionResults.filter((r) => r.status?.startsWith('skipped_')).length;
+                        const successCount = perSection.sectionResults.filter((r) => r.status === 'success').length;
+
+                        console.log(
+                            `🧩 Per-section result: ${successCount} ok, ${failedCount} failed, ${skippedCount} skipped ` +
+                            `(envelope keys: ${Object.keys(perSection.resultEnvelope).join(', ') || '—'})`
+                        );
+
+                        if (!perSection.anySuccess) {
+                            const firstError = perSection.sectionResults.find((r) => r.error)?.error
+                                || 'No section produced an extractable result';
+                            throw new Error(`Per-section extraction failed: ${firstError}`);
+                        }
+
+                        const finalMetadata = {
+                            ...preProcessingMetadata,
+                            result_envelope: 'v2',
+                            section_results: perSection.sectionResults,
+                            schemas_used: perSection.schemasUsed,
+                            per_section_extraction: {
+                                section_count: perSection.sectionResults.length,
+                                success_count: successCount,
+                                failed_count: failedCount,
+                                skipped_count: skippedCount,
+                                total_ai_time_seconds: perSection.totalAiTimeSeconds,
+                            },
+                        };
+
+                        await updateFileProcessingStatus(
+                            fileRecord.id,
+                            'completed',
+                            perSection.resultEnvelope,
+                            null,
+                            finalMetadata,
+                            perSection.totalAiTimeSeconds || null
+                        );
+
+                        io.to(`job-${job.id}`).emit('file-status-update', {
+                            jobId: job.id,
+                            fileId: fileRecord.id,
+                            filename: file.originalname,
+                            extraction_status: 'completed',
+                            processing_status: 'completed',
+                            message: `Successfully processed ${file.originalname} (${successCount} section(s))`,
+                            result: perSection.resultEnvelope,
+                        });
+
+                        // Skip the v1 single-schema path below.
+                        continue;
+                    }
+
+                    // ─────────────────────────────────────────────────────────
+                    // v1 single-schema path (unchanged)
+                    // ─────────────────────────────────────────────────────────
                     console.log(`Step 5: Processing ${file.originalname} with OpenAI using shared processor...`);
 
                     const processingResult = await processWithOpenAI(contentForAI, {
