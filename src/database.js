@@ -37,7 +37,15 @@ export async function testConnection() {
 }
 
 // Create a new job
-export async function createJob(name, schema, schemaName, userId = null, organizationId = null, extractionMode = 'full_extraction', processingConfig = null) {
+//
+// `documentTypeSlug` is optional and points at document_types.slug in the
+// schema registry (Phase 0). It's used as the fallback document_type label on
+// field_corrections rows when an editor saves changes against a v1 (flat)
+// result blob whose json_path doesn't encode a section type. Defaulting to
+// `schemaName` makes existing call-sites correctly tag corrections without
+// requiring any caller change, since today's `schemaName` already matches the
+// intended type slug (e.g. 'mgs_well_log').
+export async function createJob(name, schema, schemaName, userId = null, organizationId = null, extractionMode = 'full_extraction', processingConfig = null, documentTypeSlug = null) {
     const client = await pool.connect();
     try {
         const jobId = uuidv4();
@@ -53,10 +61,12 @@ export async function createJob(name, schema, schemaName, userId = null, organiz
         // Create initial schema data object
         const initialSchemaData = { schema, schemaName: schemaName || 'data_extraction' };
 
+        const finalDocumentTypeSlug = documentTypeSlug || schemaName || null;
+
         const query = `
-            INSERT INTO jobs (id, name, schema_data, schema_data_array, status, user_id, organization_id, extraction_mode, processing_config, created_at, updated_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW(), NOW())
-            RETURNING id, name, status, extraction_mode, processing_config, created_at
+            INSERT INTO jobs (id, name, schema_data, schema_data_array, status, user_id, organization_id, extraction_mode, processing_config, document_type_slug, created_at, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW(), NOW())
+            RETURNING id, name, status, extraction_mode, processing_config, document_type_slug, created_at
         `;
 
         const values = [
@@ -68,11 +78,12 @@ export async function createJob(name, schema, schemaName, userId = null, organiz
             userId,
             organizationId,
             extractionMode,
-            JSON.stringify(finalProcessingConfig)
+            JSON.stringify(finalProcessingConfig),
+            finalDocumentTypeSlug
         ];
 
         const result = await client.query(query, values);
-        console.log(`✅ Job created: ${jobId}`);
+        console.log(`✅ Job created: ${jobId} (document_type_slug=${finalDocumentTypeSlug})`);
         return result.rows[0];
     } catch (error) {
         console.error('❌ Error creating job:', error.message);
@@ -928,7 +939,7 @@ export async function getFileResult(fileId) {
         const query = `
             SELECT jf.id, jf.filename, jf.result, jf.page_count, jf.markdown,
                    jf.extraction_status, jf.processing_status, jf.extraction_error, jf.processing_error, jf.processed_at,
-                   jf.job_id, j.name as job_name, j.schema_data, jf.upload_status, jf.upload_error, 
+                   jf.job_id, j.name as job_name, j.schema_data, j.document_type_slug, jf.upload_status, jf.upload_error, 
                    jf.storage_type, jf.retry_count, jf.last_retry_at, jf.extraction_time_seconds, jf.ai_processing_time_seconds,
                    jf.admin_verified, jf.customer_verified, jf.extraction_metadata,
                    jf.review_status, jf.reviewed_by, jf.reviewed_at, jf.review_notes

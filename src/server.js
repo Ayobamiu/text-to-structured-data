@@ -52,6 +52,7 @@ import logger from "./utils/logger.js";
 import { processWithOpenAI } from "./utils/openaiProcessor.js";
 import ExtractionService from "./services/extractionService.js";
 import groqService from "./services/groqService.js";
+import { recordCorrections } from "./services/correctionsService.js";
 import { getPdfPageCount } from "./utils/pdfUtils.js";
 import {
     PROCESSING_METHODS,
@@ -1017,6 +1018,44 @@ app.put("/files/:id/results", authenticateToken, async (req, res) => {
                 message: `File results updated for ${updatedFile.filename}`,
                 updated_at: new Date().toISOString()
             });
+
+            // Fire-and-forget: log this edit to field_corrections so we have
+            // a per-field audit trail (foundation for future few-shot pools,
+            // fine-tuning data, and per-doc-type accuracy metrics). Never
+            // block the response or fail the save on logging errors.
+            //
+            // Note: we diff against `file.result` (the pre-edit blob loaded
+            // above) and log the path-level changes. source_locations is
+            // stripped before persistence and is not part of the corrections
+            // diff.
+            const originalForDiff = file.result || null;
+            const correctedForDiff = resultWithoutSourceLocations;
+            const correctedBy = req.user?.id || null;
+            const orgId = Array.isArray(req.user?.organizationIds)
+                ? (req.user.organizationIds[0] || null)
+                : null;
+            Promise.resolve()
+                .then(() => recordCorrections({
+                    fileId: updatedFile.id,
+                    jobId: file.job_id || null,
+                    organizationId: orgId,
+                    correctedBy,
+                    originalResult: originalForDiff,
+                    correctedResult: correctedForDiff,
+                    // Fallback for v1 (flat) result paths, where the
+                    // json_path itself doesn't tell us which document_type
+                    // the field belongs to. v2 paths (sections.<slug>[i]....)
+                    // are auto-detected and override this.
+                    documentTypeSlugFallback: file.document_type_slug || null,
+                }))
+                .then((res) => {
+                    if (res && res.written > 0) {
+                        console.log(`📝 Logged ${res.written} field correction(s) for file ${updatedFile.id}`);
+                    }
+                })
+                .catch((err) => {
+                    console.warn(`⚠️ field_corrections logging failed (non-fatal) for file ${updatedFile.id}:`, err.message);
+                });
 
             // Create log entry for the update
             // await createLogAndEmit(file.job_id, updatedFile.id, 'info', `File results updated for ${updatedFile.filename}`, updatedFile.filename);
