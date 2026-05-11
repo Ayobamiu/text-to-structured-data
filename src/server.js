@@ -2683,7 +2683,8 @@ async function processFilesAsync(job, files, schema, schemaName, processingConfi
                 // run the visual classifier (if enabled), otherwise extract
                 // the whole file". Same helper that the worker uses, so both
                 // paths stay aligned.
-                const { deriveSelectedPagesAndMeta } = await import('./services/visualClassifierWiring.js');
+                const { deriveSelectedPagesAndMeta, resolveExtractionFlags } = await import('./services/visualClassifierWiring.js');
+                const { usePerSection } = resolveExtractionFlags(jobProcessingConfig);
                 const fileForHelper = {
                     id: fileRecord.id,
                     filename: file.originalname,
@@ -2700,6 +2701,7 @@ async function processFilesAsync(job, files, schema, schemaName, processingConfi
                     file: fileForHelper,
                     jobProcessingConfig,
                     s3Service,
+                    usePerSection,
                 });
 
                 // Extract text (with fallback if extendai fails)
@@ -2952,7 +2954,7 @@ async function processFilesAsync(job, files, schema, schemaName, processingConfi
                     // per section using registry-resolved schemas, and store
                     // the v2 envelope. Otherwise fall through to v1.
                     // ─────────────────────────────────────────────────────────
-                    const useClassifierForExtraction = jobProcessingConfig?.useVisualClassifier === true;
+                    const { usePerSection } = resolveExtractionFlags(jobProcessingConfig);
                     const hasExtractableSections = !!(
                         visualDetectedSections &&
                         Array.isArray(visualDetectedSections.sections) &&
@@ -2961,7 +2963,7 @@ async function processFilesAsync(job, files, schema, schemaName, processingConfi
                         )
                     );
 
-                    if (useClassifierForExtraction && hasExtractableSections && Array.isArray(pages)) {
+                    if (usePerSection && hasExtractableSections && Array.isArray(pages)) {
                         console.log(
                             `🧩 Per-section extraction: ${visualDetectedSections.sections.length} section(s) ` +
                             `for ${file.originalname} (envelope v2)`

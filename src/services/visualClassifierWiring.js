@@ -57,7 +57,7 @@ import { flattenExtractionPages } from './sectionGrouper.js';
  *       consumes this directly so the caller doesn't have to re-fetch from
  *       the DB.
  */
-export async function deriveSelectedPagesAndMeta({ file, jobProcessingConfig, s3Service }) {
+export async function deriveSelectedPagesAndMeta({ file, jobProcessingConfig, s3Service, usePerSection }) {
     // (1) Manual selection wins. Tolerate string-encoded JSON because some
     // file rows pass through with selected_pages as a TEXT column value.
     let manual = file?.selected_pages;
@@ -80,10 +80,17 @@ export async function deriveSelectedPagesAndMeta({ file, jobProcessingConfig, s3
     }
 
     const sections = classifierResult.detectedSections.sections || [];
-    // Routing-review gate is on (Phase 1 item #4): pending_review sections
-    // are held back and must be approved (or rerouted/split) by an operator
-    // in the routing panel before they're eligible for extraction.
-    const pages = flattenExtractionPages(sections);
+    // In VPC-only mode (per-section off), include all sections in the page
+    // set — there's no per-section review gate, so dropping pending_review
+    // sections would silently shrink the page set with no recovery path.
+    // When per-section IS on, honour the routing-review gate: pending_review
+    // sections are held back until approved by an operator.
+    const perSectionResolved = usePerSection !== undefined
+        ? usePerSection
+        : resolveExtractionFlags(jobProcessingConfig).usePerSection;
+    const pages = flattenExtractionPages(sections, {
+        includePendingReview: !perSectionResolved,
+    });
 
     if (pages.length === 0) {
         console.warn(
@@ -174,7 +181,28 @@ export async function runVisualClassifier({ file, jobProcessingConfig, s3Service
     }
 }
 
+/**
+ * Resolve the two extraction-mode flags from a job's processing_config,
+ * with backward compatibility: existing jobs that only have
+ * useVisualClassifier=true (set before the split) are treated as
+ * useVisualClassifier=true + usePerSectionExtraction=true so their
+ * v2-envelope behaviour is preserved.
+ *
+ * @param {Object|null} processingConfig  Parsed processing_config from the job.
+ * @returns {{ useClassifier: boolean, usePerSection: boolean }}
+ */
+export function resolveExtractionFlags(processingConfig) {
+    const cfg = processingConfig || {};
+    const useClassifier = cfg.useVisualClassifier === true;
+    const usePerSection =
+        cfg.usePerSectionExtraction !== undefined
+            ? cfg.usePerSectionExtraction === true
+            : useClassifier; // backward compat: old jobs implicitly had per-section on
+    return { useClassifier, usePerSection };
+}
+
 export default {
     deriveSelectedPagesAndMeta,
     runVisualClassifier,
+    resolveExtractionFlags,
 };

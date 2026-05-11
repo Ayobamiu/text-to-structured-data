@@ -26,6 +26,7 @@ import {
     countDuplicates,
 } from '../src/services/pageDeduplicator.js';
 import { extractAndProcessPerSection } from '../src/services/perSectionExtractor.js';
+import { resolveExtractionFlags } from '../src/services/visualClassifierWiring.js';
 
 let failures = 0;
 
@@ -604,6 +605,81 @@ function makePages(numPages) {
     assert(result.anySuccess === false, 'anySuccess false when nothing succeeded');
     assert(Object.keys(result.resultEnvelope).length === 0, 'envelope is empty');
     assert(result.sectionResults.every((r) => r.status === 'skipped_no_schema'), 'every section skipped');
+}
+
+// ─── Test 4: resolveExtractionFlags (two-flag split + backward compat) ─────
+console.log('\n[4] resolveExtractionFlags — flag combinations');
+
+{
+    // Both off (legacy).
+    const r = resolveExtractionFlags({});
+    assert(r.useClassifier === false, 'empty config → classifier off');
+    assert(r.usePerSection === false, 'empty config → per-section off');
+}
+
+{
+    // Null / undefined config.
+    const r = resolveExtractionFlags(null);
+    assert(r.useClassifier === false && r.usePerSection === false, 'null config → both off');
+}
+
+{
+    // Backward compat: old job with only useVisualClassifier=true (no usePerSectionExtraction key).
+    // Should be treated as both on.
+    const r = resolveExtractionFlags({ useVisualClassifier: true });
+    assert(r.useClassifier === true, 'backcompat: classifier on');
+    assert(r.usePerSection === true, 'backcompat: per-section on (inferred from useVisualClassifier)');
+}
+
+{
+    // Explicit VPC-only: useVisualClassifier=true, usePerSectionExtraction=false.
+    const r = resolveExtractionFlags({ useVisualClassifier: true, usePerSectionExtraction: false });
+    assert(r.useClassifier === true, 'VPC-only: classifier on');
+    assert(r.usePerSection === false, 'VPC-only: per-section explicitly off');
+}
+
+{
+    // Both on (explicit).
+    const r = resolveExtractionFlags({ useVisualClassifier: true, usePerSectionExtraction: true });
+    assert(r.useClassifier === true, 'both-on: classifier on');
+    assert(r.usePerSection === true, 'both-on: per-section on');
+}
+
+{
+    // Invalid combo: per-section on but VPC off. resolveExtractionFlags reports
+    // what it's told; the UI prevents this, but the backend is permissive.
+    const r = resolveExtractionFlags({ useVisualClassifier: false, usePerSectionExtraction: true });
+    assert(r.useClassifier === false, 'invalid combo: classifier off');
+    assert(r.usePerSection === true, 'invalid combo: per-section on (backend is permissive)');
+}
+
+// ─── Test 4.5: flattenExtractionPages VPC-only mode ───────────────────────
+console.log('\n[4.5] flattenExtractionPages — VPC-only mode (includePendingReview)');
+
+{
+    // In VPC-only mode, pending_review sections SHOULD be included because
+    // there's no per-section review gate to recover them.
+    const sections = [
+        { document_type_slug: 'a', extraction_pages: [1, 2], status: 'auto_approved' },
+        { document_type_slug: 'b', extraction_pages: [5, 6], status: 'pending_review' },
+        { document_type_slug: 'c', extraction_pages: [9],    status: 'approved' },
+    ];
+    // VPC-only mode: includePendingReview=true
+    assert(
+        deepEqualJSON(
+            flattenExtractionPages(sections, { includePendingReview: true }),
+            [1, 2, 5, 6, 9]
+        ),
+        'VPC-only mode includes pending_review sections in page set'
+    );
+    // Per-section mode: default (includePendingReview=false)
+    assert(
+        deepEqualJSON(
+            flattenExtractionPages(sections),
+            [1, 2, 9]
+        ),
+        'per-section mode excludes pending_review sections'
+    );
 }
 
 console.log('');

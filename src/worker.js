@@ -13,7 +13,7 @@ import {
 import S3Service from './s3Service.js';
 import ExtractionService from './services/extractionService.js';
 import ProcessingService from './services/processingService.js';
-import { deriveSelectedPagesAndMeta } from './services/visualClassifierWiring.js';
+import { deriveSelectedPagesAndMeta, resolveExtractionFlags } from './services/visualClassifierWiring.js';
 import { extractAndProcessPerSection } from './services/perSectionExtractor.js';
 
 dotenv.config();
@@ -795,7 +795,7 @@ class FileProcessorWorker {
             //
             // Otherwise we fall through to the v1 single-schema path below.
             // ─────────────────────────────────────────────────────────────
-            const useClassifierForExtraction = jobProcessingConfig?.useVisualClassifier === true;
+            const { usePerSection } = resolveExtractionFlags(jobProcessingConfig);
             const detectedSectionsForExtraction = this.lastDetectedSections;
             const hasExtractableSections = !!(
                 detectedSectionsForExtraction &&
@@ -805,7 +805,7 @@ class FileProcessorWorker {
                 )
             );
 
-            if (useClassifierForExtraction && hasExtractableSections && Array.isArray(extractionResult.pages)) {
+            if (usePerSection && hasExtractableSections && Array.isArray(extractionResult.pages)) {
                 console.log(
                     `🧩 Per-section extraction: ${detectedSectionsForExtraction.sections.length} section(s) ` +
                     `for ${file.filename} (envelope v2)`
@@ -1051,10 +1051,12 @@ class FileProcessorWorker {
      * pattern is safe.
      */
     async deriveSelectedPages(file, jobProcessingConfig) {
+        const { usePerSection } = resolveExtractionFlags(jobProcessingConfig);
         const { selectedPages, classifierMeta, detectedSections } = await deriveSelectedPagesAndMeta({
             file,
             jobProcessingConfig,
             s3Service: this.s3Service,
+            usePerSection,
         });
         this.lastClassifierMeta = classifierMeta;
         this.lastDetectedSections = detectedSections;
@@ -1193,7 +1195,16 @@ const worker = new FileProcessorWorker();
 // Lightweight HTTP server so platforms like Railway can health-check the
 // worker (it doesn't otherwise bind to a port and the dashboard would show
 // it as offline). Also gives us a real /health endpoint for monitoring.
-const HEALTH_PORT = parseInt(process.env.PORT || process.env.WORKER_HEALTH_PORT || '8080', 10);
+//
+// Local dev: `.env` often sets PORT=3000 for the HTTP API while both processes
+// load the same dotenv — binding worker health on PORT produced EADDRINUSE.
+// On Railway, WORKER_HEALTH_PORT is optional; `$PORT` there is worker-specific.
+const onRailway = Boolean(process.env.RAILWAY_ENVIRONMENT);
+let healthListenPort = process.env.WORKER_HEALTH_PORT;
+if (!healthListenPort && onRailway && process.env.PORT) {
+    healthListenPort = process.env.PORT;
+}
+const HEALTH_PORT = parseInt(healthListenPort || '8080', 10);
 const healthServer = http.createServer((req, res) => {
     if (req.url === '/health' || req.url === '/') {
         const uptimeSeconds = Math.floor((Date.now() - worker.startTime.getTime()) / 1000);
