@@ -15,8 +15,11 @@ import { flattenExtractionPages } from './sectionGrouper.js';
  *   4. Returns provenance metadata so callers can fold it into
  *      `extraction_metadata.visual_page_classifier` for visibility
  *
- * Failure semantics: every edge case falls back to "extract the whole file".
- * The classifier is optional — losing it should never fail a file.
+ * Failure semantics: when `useVisualClassifier` is on and the classifier
+ * fails, `classifierFailed: true` is returned so callers can abort rather
+ * than silently extracting every page of a large document.  Callers that
+ * want the old "fall back to full file" behaviour can check the flag and
+ * proceed anyway.
  */
 
 /**
@@ -31,7 +34,8 @@ import { flattenExtractionPages } from './sectionGrouper.js';
  * @returns {Promise<{
  *   selectedPages: number[]|null,
  *   classifierMeta: Object|null,
- *   detectedSections: Object|null
+ *   detectedSections: Object|null,
+ *   classifierFailed?: boolean
  * }>}
  *
  *   selectedPages
@@ -76,7 +80,27 @@ export async function deriveSelectedPagesAndMeta({ file, jobProcessingConfig, s3
 
     const classifierResult = await runVisualClassifier({ file, jobProcessingConfig, s3Service });
     if (!classifierResult || !classifierResult.detectedSections) {
-        return { selectedPages: null, classifierMeta: null, detectedSections: null };
+        // The visual classifier is explicitly enabled but produced nothing.
+        // Instead of silently extracting every page (dangerous for large
+        // documents — a 200-page PDF would be fully ingested into the LLM),
+        // surface a classifierMeta failure object AND return selectedPages=null
+        // so callers can decide whether to proceed or abort.
+        const failureMeta = classifierResult?.failureMeta || {
+            ran: false,
+            reason: 'unknown',
+        };
+        console.error(
+            `❌ Visual classifier FAILED for ${file.filename} — ` +
+            `reason: ${failureMeta.reason || 'unknown'}` +
+            (failureMeta.error ? ` — ${failureMeta.error}` : '') +
+            `. Returning empty page set to prevent full-document fallback.`
+        );
+        return {
+            selectedPages: null,
+            classifierMeta: failureMeta,
+            detectedSections: null,
+            classifierFailed: true,
+        };
     }
 
     const sections = classifierResult.detectedSections.sections || [];
@@ -144,6 +168,18 @@ export async function deriveSelectedPagesAndMeta({ file, jobProcessingConfig, s3
  *   success, or `null` when the stage chose not to run / failed silently.
  */
 export async function runVisualClassifier({ file, jobProcessingConfig, s3Service }) {
+    // Diagnostic logging — print every gating check so intermittent
+    // failures are diagnosable from the worker/server logs alone.
+    const hasS3Key = Boolean(file?.s3_key);
+    const hasS3Service = Boolean(s3Service);
+    const vpcFlag = jobProcessingConfig?.useVisualClassifier;
+    console.log(
+        `🔍 VPC gating for ${file?.filename}: ` +
+        `useVisualClassifier=${vpcFlag}, s3_key=${hasS3Key ? 'yes' : 'MISSING'}, ` +
+        `s3Service=${hasS3Service ? 'yes' : 'MISSING'}, ` +
+        `file.id=${file?.id || 'MISSING'}, job_id=${file?.job_id ?? 'null'}`
+    );
+
     const stage = new VisualPageClassifierStage({ s3Service });
     const stageContext = {
         fileId: file.id,
@@ -160,24 +196,31 @@ export async function runVisualClassifier({ file, jobProcessingConfig, s3Service
     };
 
     if (!stage.shouldRun(stageContext)) {
-        console.log(`ℹ️ Visual classifier did not run for ${file.filename} (gating conditions not met)`);
-        return null;
+        const reasons = [];
+        if (!stage.enabled) reasons.push('stage disabled');
+        if (vpcFlag !== true) reasons.push(`useVisualClassifier=${vpcFlag}`);
+        if (!hasS3Key) reasons.push('no s3_key');
+        if (!hasS3Service) reasons.push('no s3Service');
+        const reasonStr = reasons.join(', ') || 'unknown';
+        console.warn(`⚠️ Visual classifier gating FAILED for ${file.filename}: ${reasonStr}`);
+        return { failureMeta: { ran: false, reason: 'gating_conditions_not_met', detail: reasonStr } };
     }
+
+    console.log(`✅ VPC gating passed for ${file.filename} — running classifier...`);
 
     try {
         stage.validate(stageContext);
         const result = await stage.execute(stageContext);
         if (!result?.detectedSections) {
-            console.warn(`⚠️ Visual classifier returned no detected_sections for ${file.filename}`);
-            return null;
+            const reason = result?.visualPageClassifier?.reason || 'no_detected_sections';
+            console.warn(`⚠️ Visual classifier returned no detected_sections for ${file.filename} (${reason})`);
+            return { failureMeta: { ran: true, reason, detail: result?.visualPageClassifier } };
         }
         return result;
     } catch (error) {
-        // Stage's own handleError logs; we don't rethrow because the
-        // classifier is optional — falling back to full-document extraction
-        // is always preferable to failing the whole file.
+        console.error(`❌ Visual classifier threw for ${file.filename}: ${error.message}`);
         stage.handleError(error, stageContext);
-        return null;
+        return { failureMeta: { ran: true, reason: 'exception', error: error.message } };
     }
 }
 

@@ -2697,12 +2697,26 @@ async function processFilesAsync(job, files, schema, schemaName, processingConfi
                     selectedPages,
                     classifierMeta: visualClassifierMeta,
                     detectedSections: visualDetectedSections,
+                    classifierFailed,
                 } = await deriveSelectedPagesAndMeta({
                     file: fileForHelper,
                     jobProcessingConfig,
                     s3Service,
                     usePerSection,
                 });
+
+                // When the visual classifier is explicitly enabled but failed,
+                // abort rather than silently extracting every page.
+                if (classifierFailed) {
+                    const reason = visualClassifierMeta?.reason || 'unknown';
+                    const detail = visualClassifierMeta?.error || '';
+                    throw new Error(
+                        `Visual page classifier failed for ${file.originalname} ` +
+                        `(reason: ${reason}${detail ? ' — ' + detail : ''}). ` +
+                        `Aborting to prevent full-document extraction. ` +
+                        `Retry the file or disable the visual classifier on this job.`
+                    );
+                }
 
                 // Extract text (with fallback if extendai fails)
                 let extractionResult;
