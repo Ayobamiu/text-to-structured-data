@@ -15,16 +15,7 @@ import ExtractionService from './services/extractionService.js';
 import ProcessingService from './services/processingService.js';
 import { deriveSelectedPagesAndMeta, resolveExtractionFlags } from './services/visualClassifierWiring.js';
 import { extractAndProcessPerSection } from './services/perSectionExtractor.js';
-import os from 'os';
-import crypto from 'crypto';
-
 dotenv.config();
-
-// Unique identity for this worker instance — survives for the lifetime of the
-// process and gets stamped into every file's extraction_metadata so we can
-// distinguish which worker (local dev vs Railway prod vs another replica)
-// actually processed a given file.
-const WORKER_INSTANCE_ID = `${os.hostname()}-${process.pid}-${crypto.randomBytes(4).toString('hex')}`;
 
 
 const WORKER_INTERVAL_MS = parseInt(process.env.WORKER_INTERVAL_MS || '5000'); // Poll every 5 seconds
@@ -96,7 +87,7 @@ class FileProcessorWorker {
         }
 
         this.isRunning = true;
-        console.log(`🚀 Starting File Processor Worker [${WORKER_INSTANCE_ID}]...`);
+        console.log('🚀 Starting File Processor Worker...');
 
         // Test connections
         await this.testConnections();
@@ -154,7 +145,6 @@ class FileProcessorWorker {
     }
 
     async pollQueue() {
-        let pollCount = 0;
         while (this.isRunning) {
             try {
                 // Check if queue is paused
@@ -167,20 +157,13 @@ class FileProcessorWorker {
 
                 const queueItem = await queueService.getNextFile();
                 if (queueItem) {
-                    console.log(`📥 [poll #${++pollCount}] Claimed file ${queueItem.fileId} from queue`);
                     await this.processFile(queueItem);
-                    console.log(`📤 [poll #${pollCount}] Finished processing, resuming poll loop`);
                 } else {
-                    // Log every 12th empty poll (~1 min) to confirm worker is alive
-                    pollCount++;
-                    if (pollCount % 12 === 0) {
-                        console.log(`🔍 [poll #${pollCount}] Queue empty — worker alive, still polling [${WORKER_INSTANCE_ID}]`);
-                    }
                     // No files in queue, wait before checking again
                     await new Promise(resolve => setTimeout(resolve, WORKER_INTERVAL_MS));
                 }
             } catch (error) {
-                console.error(`❌ [poll #${++pollCount}] Error polling queue:`, error.message);
+                console.error('❌ Error polling queue:', error.message);
                 this.errorCount++;
 
                 // Wait before retrying
@@ -370,8 +353,6 @@ class FileProcessorWorker {
                     extractionMetadata.visual_page_classifier = this.lastClassifierMeta;
                     this.lastClassifierMeta = null;
                 }
-                // Stamp worker identity so we can tell which instance processed the file.
-                extractionMetadata.worker_instance_id = WORKER_INSTANCE_ID;
 
                 // Debug logging to check values
                 console.log('🔍 Extraction result debug (extraction-only mode):', {
@@ -506,8 +487,6 @@ class FileProcessorWorker {
                     extractionMetadata.visual_page_classifier = this.lastClassifierMeta;
                     this.lastClassifierMeta = null;
                 }
-                // Stamp worker identity so we can tell which instance processed the file.
-                extractionMetadata.worker_instance_id = WORKER_INSTANCE_ID;
 
                 // Update extraction status for both modes with all fields
                 await updateFileExtractionStatus(
@@ -635,8 +614,6 @@ class FileProcessorWorker {
                     extractionMetadata.visual_page_classifier = this.lastClassifierMeta;
                     this.lastClassifierMeta = null;
                 }
-                // Stamp worker identity so we can tell which instance processed the file.
-                extractionMetadata.worker_instance_id = WORKER_INSTANCE_ID;
 
                 // Debug logging to check values
                 console.log('🔍 Extraction result debug (full extraction mode):', {
@@ -1081,12 +1058,6 @@ class FileProcessorWorker {
      * pattern is safe.
      */
     async deriveSelectedPages(file, jobProcessingConfig) {
-        console.log(
-            `🔍 deriveSelectedPages called for ${file.filename}: ` +
-            `useVisualClassifier=${jobProcessingConfig?.useVisualClassifier}, ` +
-            `s3_key=${file.s3_key ? 'present' : 'MISSING'}, ` +
-            `file.id=${file.id}`
-        );
         const { usePerSection } = resolveExtractionFlags(jobProcessingConfig);
         const { selectedPages, classifierMeta, detectedSections, classifierFailed } = await deriveSelectedPagesAndMeta({
             file,
@@ -1096,13 +1067,6 @@ class FileProcessorWorker {
         });
         this.lastClassifierMeta = classifierMeta;
         this.lastDetectedSections = detectedSections;
-
-        console.log(
-            `🔍 deriveSelectedPages result for ${file.filename}: ` +
-            `selectedPages=${selectedPages ? `[${selectedPages.join(',')}]` : 'null'}, ` +
-            `classifierFailed=${!!classifierFailed}, ` +
-            `classifierMeta=${classifierMeta ? JSON.stringify(classifierMeta) : 'null'}`
-        );
 
         // When the visual classifier is explicitly enabled but failed,
         // abort rather than silently extracting every page.  A 200-page
