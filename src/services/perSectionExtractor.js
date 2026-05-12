@@ -1,0 +1,318 @@
+/**
+ * Per-section extractor (Phase 1, item #3 — the v2 envelope).
+ *
+ * Given the visual classifier's `detected_sections` and a single completed
+ * extraction (markdown + per-page text), this module fans out N AI processing
+ * calls — one per section — and assembles the results into the v2 envelope:
+ *
+ *     {
+ *       boring_log:    [ { ...section1_fields }, { ...section3_fields } ],
+ *       aquifer_test:  [ { ...section2_fields } ]
+ *     }
+ *
+ * Multi-instance handling: when one PDF has two sections of the same slug,
+ * the value is always an array (entry order = appearance order in the
+ * document). Per the design decision in the kickoff conversation, arrays
+ * are used uniformly — even for the single-instance case — so downstream
+ * consumers don't have to type-check.
+ *
+ * Schema source: `getActiveSchema(slug)` from the registry. The job-level
+ * `schema_data` is intentionally NOT consulted here — the registry is the
+ * single source of truth when the classifier is on.
+ *
+ * Failure semantics (per agreed spec):
+ *   - missing schema for a slug          → section status = 'skipped_no_schema'
+ *   - empty content (no extractable text) → section status = 'skipped_no_content'
+ *   - AI call throws / returns success=false → section status = 'failed'
+ *   - section had no extraction_pages    → section status = 'skipped_no_pages'
+ *   - any other section's success or failure does NOT affect this one
+ *
+ * The caller decides what to do with the file overall:
+ *   - ≥1 success                       → file = completed
+ *   - 0 successes, ≥1 failure          → file = failed
+ *   - 0 sections with any pages at all → file = completed (empty result)
+ *
+ * Concurrency: sections run in parallel (Promise.all). For a typical 3-section
+ * PDF the wall-clock cost is ~1× a single AI call instead of 3×. Tune via
+ * `maxConcurrency` if a doc explodes into many sections.
+ */
+
+import { getActiveSchema as defaultGetActiveSchema } from './schemaRegistry.js';
+
+const DEFAULT_MAX_CONCURRENCY = 6;
+
+/**
+ * @param {Object} args
+ * @param {Object} args.detectedSections     The classifier output blob (same
+ *                                            shape as `job_files.detected_sections`).
+ * @param {Array<{page_number:number, text?:string, markdown?:string}>} args.pages
+ *                                            Per-page extraction output.
+ * @param {Object} args.processingService    Live ProcessingService instance.
+ * @param {string} args.processingMethod     'openai' | 'qwen'.
+ * @param {Object} args.processingOptions    Options forwarded to processingService.
+ * @param {number} [args.maxConcurrency]     Parallelism cap, default 6.
+ * @param {(slug: string) => Promise<Object|null>} [args.getActiveSchema]
+ *                                            Schema resolver. Defaults to the
+ *                                            schemaRegistry export. Override
+ *                                            in tests so we can drive the
+ *                                            orchestrator without a DB.
+ *
+ * @returns {Promise<{
+ *   resultEnvelope: Record<string, Array<Object>>,
+ *   sectionResults: Array<{
+ *     section_index: number,
+ *     slug: string,
+ *     page_range: [number, number],
+ *     extraction_pages: number[],
+ *     status: 'success'|'failed'|'skipped_no_schema'|'skipped_no_content'|'skipped_no_pages',
+ *     error?: string,
+ *     duration_ms?: number,
+ *     ai_metadata?: Object
+ *   }>,
+ *   totalAiTimeSeconds: number,
+ *   anySuccess: boolean,
+ *   schemasUsed: Record<string, { version: number, schemaId: string }>
+ * }>}
+ */
+export async function extractAndProcessPerSection({
+    detectedSections,
+    pages,
+    processingService,
+    processingMethod = 'openai',
+    processingOptions = {},
+    maxConcurrency = DEFAULT_MAX_CONCURRENCY,
+    getActiveSchema = defaultGetActiveSchema,
+}) {
+    if (!detectedSections || !Array.isArray(detectedSections.sections)) {
+        throw new Error('extractAndProcessPerSection: detectedSections.sections must be an array');
+    }
+    if (!Array.isArray(pages)) {
+        throw new Error('extractAndProcessPerSection: pages must be an array');
+    }
+    if (!processingService || typeof processingService.processText !== 'function') {
+        throw new Error('extractAndProcessPerSection: processingService.processText is required');
+    }
+
+    const sections = detectedSections.sections;
+
+    // Build page_number -> text map. Prefer page.text (mineru/extendai
+    // primary content); fall back to page.markdown if a future extractor
+    // only supplies markdown.
+    const pageTextMap = new Map();
+    for (const page of pages) {
+        if (!page || typeof page.page_number !== 'number') continue;
+        const txt = (page.text ?? page.markdown ?? '').toString();
+        pageTextMap.set(page.page_number, txt);
+    }
+
+    // Resolve schemas in advance and only once per distinct slug. The
+    // registry caches internally too, but local memoization avoids
+    // duplicate cache lookups for multi-instance same-slug docs.
+    const distinctSlugs = [...new Set(sections.map((s) => s.document_type_slug).filter(Boolean))];
+    const schemasBySlug = new Map();
+    await Promise.all(
+        distinctSlugs.map(async (slug) => {
+            try {
+                const schema = await getActiveSchema(slug);
+                schemasBySlug.set(slug, schema || null);
+            } catch (err) {
+                console.warn(`⚠️ getActiveSchema('${slug}') threw — treating as no-schema: ${err.message}`);
+                schemasBySlug.set(slug, null);
+            }
+        })
+    );
+
+    // Run sections in parallel (bounded). Order of `tasks` follows section
+    // order, so when we collect results we keep document order.
+    const tasks = sections.map((section, index) =>
+        () => runSection({
+            section,
+            index,
+            pageTextMap,
+            schemasBySlug,
+            processingService,
+            processingMethod,
+            processingOptions,
+        })
+    );
+
+    const taskResults = await runWithConcurrency(tasks, maxConcurrency);
+
+    // Build envelope + section_results metadata.
+    const envelope = {};
+    const sectionResults = [];
+    const schemasUsed = {};
+    let totalAiTimeSeconds = 0;
+    let anySuccess = false;
+
+    for (const r of taskResults) {
+        sectionResults.push({
+            section_index: r.section_index,
+            slug: r.slug,
+            page_range: r.page_range,
+            extraction_pages: r.extraction_pages,
+            status: r.status,
+            error: r.error,
+            duration_ms: r.duration_ms,
+            ai_metadata: r.ai_metadata,
+        });
+
+        if (r.status === 'success' && r.data !== undefined) {
+            anySuccess = true;
+            if (!envelope[r.slug]) envelope[r.slug] = [];
+            envelope[r.slug].push(r.data);
+
+            if (r.schema_version != null) {
+                // Last writer wins — for multi-instance same-slug, all
+                // sections used the same active schema so it doesn't matter.
+                schemasUsed[r.slug] = {
+                    version: r.schema_version,
+                    schemaId: r.schema_id,
+                };
+            }
+
+            const aiSeconds = r.ai_metadata?.processing_time_seconds || 0;
+            totalAiTimeSeconds += aiSeconds;
+        }
+    }
+
+    return {
+        resultEnvelope: envelope,
+        sectionResults,
+        totalAiTimeSeconds,
+        anySuccess,
+        schemasUsed,
+    };
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+async function runSection({
+    section,
+    index,
+    pageTextMap,
+    schemasBySlug,
+    processingService,
+    processingMethod,
+    processingOptions,
+}) {
+    const slug = section.document_type_slug;
+    const pageRange = Array.isArray(section.page_range) && section.page_range.length === 2
+        ? section.page_range
+        : [section.extraction_pages?.[0] ?? null, section.extraction_pages?.at(-1) ?? null];
+
+    const baseMeta = {
+        section_index: index,
+        slug,
+        page_range: pageRange,
+        extraction_pages: Array.isArray(section.extraction_pages) ? section.extraction_pages : [],
+    };
+
+    if (!slug) {
+        return { ...baseMeta, status: 'skipped_no_pages', error: 'Section has no document_type_slug' };
+    }
+
+    if (!Array.isArray(section.extraction_pages) || section.extraction_pages.length === 0) {
+        return { ...baseMeta, status: 'skipped_no_pages' };
+    }
+
+    const schemaInfo = schemasBySlug.get(slug);
+    if (!schemaInfo) {
+        console.warn(`⚠️ Section ${index} (${slug}, pp ${pageRange.join('-')}): no active schema in registry — skipping`);
+        return {
+            ...baseMeta,
+            status: 'skipped_no_schema',
+            error: `No active schema registered for document type '${slug}'`,
+        };
+    }
+
+    const contentForAI = section.extraction_pages
+        .map((p) => pageTextMap.get(p) || '')
+        .filter((t) => t.trim().length > 0)
+        .join('\n\n');
+
+    if (!contentForAI.trim()) {
+        return {
+            ...baseMeta,
+            status: 'skipped_no_content',
+            error: 'Selected pages produced no extractable text',
+        };
+    }
+
+    const startMs = Date.now();
+    let aiResult;
+    try {
+        aiResult = await processingService.processText(
+            contentForAI,
+            schemaInfo, // { schemaName, schema, ... } — drop-in for processText's schemaData
+            processingMethod,
+            processingOptions
+        );
+    } catch (err) {
+        return {
+            ...baseMeta,
+            status: 'failed',
+            error: err?.message || String(err),
+            duration_ms: Date.now() - startMs,
+        };
+    }
+    const durationMs = Date.now() - startMs;
+
+    if (!aiResult || !aiResult.success) {
+        return {
+            ...baseMeta,
+            status: 'failed',
+            error: aiResult?.error || 'AI processing returned no data',
+            duration_ms: durationMs,
+        };
+    }
+
+    console.log(
+        `✅ Section ${index} (${slug}, pp ${pageRange.join('-')}, ${section.extraction_pages.length} pg): ` +
+        `extracted in ${(durationMs / 1000).toFixed(2)}s ` +
+        `(schema v${schemaInfo.version})`
+    );
+
+    return {
+        ...baseMeta,
+        status: 'success',
+        duration_ms: durationMs,
+        ai_metadata: aiResult.metadata,
+        data: aiResult.data,
+        schema_version: schemaInfo.version,
+        schema_id: schemaInfo.schemaId,
+    };
+}
+
+/**
+ * Run an array of zero-arg async task factories with bounded concurrency.
+ * Returns an array of results in the same order as `tasks`.
+ *
+ * Doesn't short-circuit on errors — each task is responsible for catching
+ * its own failures and returning a structured error result. This keeps the
+ * per-section semantics ("section A's failure must not abort section B")
+ * a property of the orchestrator, not each call site.
+ */
+async function runWithConcurrency(tasks, maxConcurrency) {
+    if (tasks.length === 0) return [];
+    const limit = Math.max(1, Math.min(maxConcurrency, tasks.length));
+    const results = new Array(tasks.length);
+    let cursor = 0;
+
+    async function worker() {
+        while (true) {
+            const i = cursor++;
+            if (i >= tasks.length) return;
+            results[i] = await tasks[i]();
+        }
+    }
+
+    await Promise.all(Array.from({ length: limit }, worker));
+    return results;
+}
+
+export default {
+    extractAndProcessPerSection,
+};

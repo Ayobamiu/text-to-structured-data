@@ -13,6 +13,15 @@ class QueueService {
         this.availableAtColumn = 'updated_at';
         this.processingStartedAtColumn = 'updated_at';
         this.hasQueueControl = false;
+        // Queue shard: isolates dev/staging/production workers sharing the
+        // same database. When QUEUE_SHARD is set (e.g. "dev", "production"),
+        // inserts tag items with that shard and getNextFile only claims items
+        // with the matching shard. When unset, shard filtering is disabled
+        // (backward compatible).
+        this.queueShard = process.env.QUEUE_SHARD || null;
+        if (this.queueShard) {
+            console.log(`🏷️  Queue shard: "${this.queueShard}" — only processing items tagged with this shard`);
+        }
     }
 
     async connect() {
@@ -84,7 +93,21 @@ class QueueService {
 
         const availableAtColumn = this.availableAtColumn;
         const hasDelay = delayMs > 0;
-        const delayExpr = hasDelay ? `NOW() + ($6 * INTERVAL '1 millisecond')` : 'NOW()';
+
+        // When QUEUE_SHARD is set, we set available_at to far-future so that
+        // OLD workers (without shard awareness) whose query includes
+        // "available_at <= NOW()" will never see these items. The local
+        // shard-aware worker skips the available_at check and uses
+        // queue_shard filtering instead.
+        let delayExpr;
+        if (this.queueShard) {
+            // Far-future: invisible to old workers' "available_at <= NOW()" filter
+            delayExpr = `'2099-12-31T00:00:00Z'::timestamptz`;
+        } else if (hasDelay) {
+            delayExpr = `NOW() + ($6 * INTERVAL '1 millisecond')`;
+        } else {
+            delayExpr = 'NOW()';
+        }
 
         const availableAtInsert = availableAtColumn !== 'updated_at'
             ? `, ${availableAtColumn}`
@@ -94,15 +117,28 @@ class QueueService {
             : '';
         const updatedAtValue = availableAtColumn === 'updated_at' ? delayExpr : 'NOW()';
 
+        // Tag with queue_shard when QUEUE_SHARD env var is set.
+        const shardInsert = this.queueShard ? ', queue_shard' : '';
+        // Shard param index depends on whether we still need delayMs param
+        const shardParamIdx = hasDelay && !this.queueShard ? 7 : 6;
+        const shardValue = this.queueShard ? `, $${shardParamIdx}` : '';
+
         const query = `
-            INSERT INTO file_processing_queue (file_id, job_id, priority, status, mode, retries, created_at, updated_at${availableAtInsert})
-            VALUES ($1, $2, $3, 'queued', $4, $5, NOW(), ${updatedAtValue}${availableAtValues})
+            INSERT INTO file_processing_queue (file_id, job_id, priority, status, mode, retries, created_at, updated_at${availableAtInsert}${shardInsert})
+            VALUES ($1, $2, $3, 'queued', $4, $5, NOW(), ${updatedAtValue}${availableAtValues}${shardValue})
             RETURNING id, file_id, job_id, priority, status, mode, retries, created_at, updated_at
         `;
 
-        const params = hasDelay
-            ? [fileId, jobId, priority, mode, retries, delayMs]
-            : [fileId, jobId, priority, mode, retries];
+        // When shard is set, delayMs is irrelevant (available_at is always far-future)
+        const baseParams = [fileId, jobId, priority, mode, retries];
+        let params;
+        if (this.queueShard) {
+            params = [...baseParams, this.queueShard];
+        } else if (hasDelay) {
+            params = [...baseParams, delayMs];
+        } else {
+            params = baseParams;
+        }
 
         const client = await pool.connect();
         try {
@@ -141,17 +177,29 @@ class QueueService {
             try {
                 await client.query('BEGIN');
 
+                // When QUEUE_SHARD is set, filter by shard instead of
+                // available_at (items are inserted with far-future available_at
+                // to hide them from old unsharded workers).
+                let whereExtra, queryParams;
+                if (this.queueShard) {
+                    whereExtra = `AND queue_shard = $1`;
+                    queryParams = [this.queueShard];
+                } else {
+                    whereExtra = `AND ${this.availableAtColumn} <= NOW()`;
+                    queryParams = [];
+                }
+
                 const nextQuery = `
                     SELECT id, file_id, job_id, priority, status, mode, retries, created_at, updated_at
                     FROM file_processing_queue
                     WHERE status = 'queued'
-                      AND ${this.availableAtColumn} <= NOW()
+                      ${whereExtra}
                     ORDER BY priority ASC, created_at ASC
                     LIMIT 1
                     FOR UPDATE SKIP LOCKED
                 `;
 
-                const nextResult = await client.query(nextQuery);
+                const nextResult = await client.query(nextQuery, queryParams);
                 if (nextResult.rows.length === 0) {
                     await client.query('ROLLBACK');
                     return null;
@@ -263,6 +311,59 @@ class QueueService {
         } catch (error) {
             console.error('❌ Error clearing processing files:', error.message);
             throw error;
+        }
+    }
+
+    // Requeue files stuck in 'processing' (e.g. after a worker crash / restart).
+    // Unlike clearAllProcessingFiles (which deletes them), this resets them
+    // back to 'queued' so the worker picks them up on the next poll.
+    async requeueStaleProcessingFiles() {
+        try {
+            const client = await pool.connect();
+            try {
+                // Reset queue items stuck in 'processing' back to 'queued'.
+                // When QUEUE_SHARD is set, only requeue items from this shard.
+                const shardFilter = this.queueShard
+                    ? `AND queue_shard = $1`
+                    : '';
+                const shardParams = this.queueShard ? [this.queueShard] : [];
+                const result = await client.query(
+                    `UPDATE file_processing_queue
+                     SET status = 'queued', updated_at = NOW()
+                     WHERE status = 'processing'
+                     ${shardFilter}
+                     RETURNING file_id, job_id`,
+                    shardParams
+                );
+                if (result.rows.length === 0) {
+                    console.log('✅ No stale processing files to requeue');
+                    return [];
+                }
+                const requeued = result.rows;
+                console.log(
+                    `🔄 Requeued ${requeued.length} stale processing file(s): ` +
+                    requeued.map(r => r.file_id).join(', ')
+                );
+
+                // Also reset the job_files extraction_status so the file
+                // doesn't appear "stuck in processing" in the UI / API.
+                const fileIds = requeued.map(r => r.file_id);
+                await client.query(
+                    `UPDATE job_files
+                     SET extraction_status = 'pending', updated_at = NOW()
+                     WHERE id = ANY($1::uuid[])
+                       AND extraction_status = 'processing'`,
+                    [fileIds]
+                );
+
+                return requeued;
+            } finally {
+                client.release();
+            }
+        } catch (error) {
+            console.error('❌ Error requeuing stale processing files:', error.message);
+            // Non-fatal — worker can still process new files
+            return [];
         }
     }
 

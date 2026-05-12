@@ -34,6 +34,7 @@ import pool, {
     updateFileReviewStatus,
     bulkUpdateFileReviewStatus,
     bulkUpdateFileVerification,
+    updateFileDetectedSections,
     userHasJobAccess
 } from "./database.js";
 import { getUserById } from "./database/users.js";
@@ -52,6 +53,7 @@ import logger from "./utils/logger.js";
 import { processWithOpenAI } from "./utils/openaiProcessor.js";
 import ExtractionService from "./services/extractionService.js";
 import groqService from "./services/groqService.js";
+import { recordCorrections } from "./services/correctionsService.js";
 import { getPdfPageCount } from "./utils/pdfUtils.js";
 import {
     PROCESSING_METHODS,
@@ -101,7 +103,8 @@ app.set('trust proxy', 1);
 app.use(cors({
     origin: corsOrigins,
     credentials: true,
-    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    // PATCH required for registry admin (document type updates) from browser preflight.
+    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization'],
     optionsSuccessStatus: 200 // Some legacy browsers (IE11, various SmartTVs) choke on 204
 }));
@@ -180,6 +183,7 @@ io.on('connection', (socket) => {
 // Apply JSON parsing only to specific routes (not multipart routes)
 app.use('/jobs', express.json());
 app.use('/queue', express.json());
+app.use('/registry', express.json());
 app.use('/system-stats', express.json());
 app.use('/test-db', express.json());
 app.use('/test-redis', express.json());
@@ -931,6 +935,415 @@ app.get("/files/:id/download", authenticateToken, async (req, res) => {
     }
 });
 
+// ──────────────────────────────────────────────────────────────────────────
+// Visual Page Classifier endpoints
+// ──────────────────────────────────────────────────────────────────────────
+//
+// GET  /document-types
+//   Lists active document types from the schema registry. Used by the
+//   frontend to populate the "restrict classifier to" multi-select on
+//   job creation / job config.
+//
+// GET  /files/:id/pages/:n/thumbnail.jpg
+//   Renders a single PDF page from S3 to a JPEG on demand. Used by the
+//   "Document routing" panel on the file detail page so each per-page row
+//   can show a small preview alongside the classifier's decision.
+//   Cached aggressively because output is deterministic for a given
+//   file+page (same PDF bytes, same renderer, same options).
+
+app.get("/document-types", authenticateToken, async (req, res) => {
+    try {
+        const { listDocumentTypes } = await import("./services/schemaRegistry.js");
+        const includeDeprecated = req.query.includeDeprecated === 'true';
+        const types = await listDocumentTypes({ includeDeprecated });
+        res.json({
+            status: "success",
+            documentTypes: types.map((t) => ({
+                id: t.id,
+                slug: t.slug,
+                display_name: t.display_name,
+                description: t.description,
+                default_extractor: t.default_extractor,
+                routing_confidence_threshold: t.routing_confidence_threshold,
+                status: t.status,
+                has_classifier_hints: t.classifier_hints != null,
+            })),
+        });
+    } catch (error) {
+        console.error('❌ Error listing document types:', error.message);
+        res.status(500).json({
+            status: "error",
+            message: error.message,
+        });
+    }
+});
+
+const REGISTRY_SLUG_PARAM = /^[a-z][a-z0-9_]{0,99}$/;
+
+/** Admin-only middleware pair for registry CRUD. */
+function registryAdmin(req, res, next) {
+    authenticateToken(req, res, () => requireRole('admin')(req, res, next));
+}
+
+function validateRegistrySlug(slug, res) {
+    if (!slug || typeof slug !== 'string' || !REGISTRY_SLUG_PARAM.test(slug)) {
+        res.status(400).json({
+            status: 'error',
+            message: 'Invalid slug. Use lowercase letters, digits, underscore; max 100 chars.',
+        });
+        return false;
+    }
+    return true;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Schema registry admin API (Phase 2 UI). Admin JWT only (`role === admin`).
+// Powers the Document types & schemas CRUD screen in the web app.
+// ─────────────────────────────────────────────────────────────────────────────
+
+app.get("/registry/document-types/:slug/detail", registryAdmin, async (req, res) => {
+    try {
+        const { slug } = req.params;
+        if (!validateRegistrySlug(slug, res)) return;
+
+        const {
+            getDocumentTypeDetail,
+            listSchemaVersionsForSlug,
+        } = await import('./services/schemaRegistry.js');
+
+        const detail = await getDocumentTypeDetail(slug);
+        if (!detail) {
+            return res.status(404).json({ status: 'error', message: `Unknown document type '${slug}'` });
+        }
+        const versions = await listSchemaVersionsForSlug(slug);
+
+        res.json({
+            status: 'success',
+            documentType: {
+                slug: detail.slug,
+                display_name: detail.display_name,
+                description: detail.description,
+                default_extractor: detail.default_extractor,
+                routing_confidence_threshold: detail.routing_confidence_threshold,
+                status: detail.status,
+                classifier_hints: detail.classifier_hints,
+                created_at: detail.created_at,
+                updated_at: detail.updated_at,
+                current_schema_version_id: detail.current_schema_version_id,
+                current_schema_version: detail.current_schema_version,
+                current_schema_name: detail.current_schema_name,
+                current_schema_row_status: detail.current_schema_row_status,
+                version_count: Array.isArray(versions) ? versions.length : 0,
+            },
+            schemaVersions: versions || [],
+        });
+    } catch (error) {
+        console.error('❌ registry detail:', error.message);
+        res.status(500).json({ status: 'error', message: error.message });
+    }
+});
+
+app.get("/registry/document-types/:slug/schemas/:version", registryAdmin, async (req, res) => {
+    try {
+        const { slug, version } = req.params;
+        if (!validateRegistrySlug(slug, res)) return;
+        const v = parseInt(version, 10);
+        if (!Number.isInteger(v) || v < 1) {
+            return res.status(400).json({ status: 'error', message: 'Invalid version number' });
+        }
+
+        const { getSchemaVersion } = await import('./services/schemaRegistry.js');
+        const row = await getSchemaVersion(slug, v);
+        if (!row) {
+            return res.status(404).json({ status: 'error', message: `No schema v${v} for '${slug}'` });
+        }
+
+        res.json({
+            status: 'success',
+            schema: {
+                schemaId: row.schemaId,
+                version: row.version,
+                schemaName: row.schemaName,
+                status: row.status,
+                schema: row.schema,
+                promptHints: row.promptHints,
+                documentTypeSlug: row.documentTypeSlug,
+                defaultExtractor: row.defaultExtractor,
+            },
+        });
+    } catch (error) {
+        console.error('❌ registry get schema version:', error.message);
+        res.status(500).json({ status: 'error', message: error.message });
+    }
+});
+
+app.post("/registry/document-types", registryAdmin, async (req, res) => {
+    try {
+        const {
+            slug,
+            displayName,
+            description = null,
+            defaultExtractor = 'extendai',
+            routingConfidenceThreshold = 0.75,
+            initialSchema = null,
+        } = req.body || {};
+
+        console.log({ slug, displayName, description, defaultExtractor, routingConfidenceThreshold, initialSchema });
+
+        if (!slug || !displayName) {
+            return res.status(400).json({ status: 'error', message: 'slug and displayName are required' });
+        }
+        if (!validateRegistrySlug(slug, res)) return;
+
+        const svc = await import('./services/schemaRegistry.js');
+        const existing = await svc.getDocumentTypeBySlug(slug);
+        if (existing) {
+            return res.status(409).json({
+                status: 'error',
+                message: `Document type '${slug}' already exists`,
+            });
+        }
+
+        await svc.registerDocumentType({
+            slug,
+            displayName,
+            description,
+            defaultExtractor,
+            routingConfidenceThreshold: Number(routingConfidenceThreshold),
+        });
+
+        let schemaRegistered = null;
+        if (initialSchema && typeof initialSchema.jsonSchema === 'object') {
+            const { unwrapSchemaPayload, extractHintsAndClean } = await import('./utils/schemaHintsExtract.js');
+            const wrapped = unwrapSchemaPayload({ jsonSchema: initialSchema.jsonSchema, schemaName: initialSchema.schemaName });
+            const schemaName =
+                wrapped.schemaName || initialSchema.schemaName || `${slug}_extraction`;
+            const { cleanedSchema, promptHints } = extractHintsAndClean(wrapped.rawSchema);
+
+            schemaRegistered = await svc.registerSchema({
+                documentTypeSlug: slug,
+                jsonSchema: cleanedSchema,
+                promptHints,
+                schemaName,
+                notes: initialSchema.notes || 'Created via registry UI',
+                setActive: initialSchema.setActive !== false,
+            });
+        }
+
+        const detail = await svc.getDocumentTypeDetail(slug);
+        res.status(201).json({
+            status: 'success',
+            documentType: detail,
+            initialSchemaRegistered: schemaRegistered,
+        });
+    } catch (error) {
+        console.error('❌ registry create document type:', error.message);
+        res.status(400).json({ status: 'error', message: error.message });
+    }
+});
+
+app.patch("/registry/document-types/:slug", registryAdmin, async (req, res) => {
+    try {
+        const { slug } = req.params;
+        if (!validateRegistrySlug(slug, res)) return;
+
+        const b = req.body || {};
+        const patch = {};
+        if (b.displayName !== undefined) patch.displayName = b.displayName;
+        if (b.description !== undefined) patch.description = b.description;
+        if (b.defaultExtractor !== undefined) patch.defaultExtractor = b.defaultExtractor;
+        if (b.routingConfidenceThreshold !== undefined) {
+            patch.routingConfidenceThreshold = Number(b.routingConfidenceThreshold);
+        }
+        if (b.status !== undefined) {
+            if (!['active', 'deprecated'].includes(b.status)) {
+                return res.status(400).json({
+                    status: 'error',
+                    message: 'status must be active or deprecated',
+                });
+            }
+            patch.status = b.status;
+        }
+
+        const { updateDocumentType } = await import('./services/schemaRegistry.js');
+        const row = await updateDocumentType(slug, patch);
+
+        res.json({ status: 'success', documentType: row });
+    } catch (error) {
+        console.error('❌ registry patch document type:', error.message);
+        res.status(400).json({ status: 'error', message: error.message });
+    }
+});
+
+app.delete("/registry/document-types/:slug", registryAdmin, async (req, res) => {
+    try {
+        const { slug } = req.params;
+        if (!validateRegistrySlug(slug, res)) return;
+
+        const { deleteDocumentTypeBySlug } = await import('./services/schemaRegistry.js');
+        const deleted = await deleteDocumentTypeBySlug(slug);
+        if (!deleted) {
+            return res.status(404).json({ status: 'error', message: `Unknown document type '${slug}'` });
+        }
+
+        res.json({ status: 'success', deleted: { slug: deleted.slug, id: deleted.id } });
+    } catch (error) {
+        console.error('❌ registry delete document type:', error.message);
+        res.status(500).json({ status: 'error', message: error.message });
+    }
+});
+
+app.put("/registry/document-types/:slug/classifier-hints", registryAdmin, async (req, res) => {
+    try {
+        const { slug } = req.params;
+        if (!validateRegistrySlug(slug, res)) return;
+
+        const hints = req.body?.hints;
+        const svc = await import('./services/schemaRegistry.js');
+
+        let row;
+        if (hints === null || hints === undefined) {
+            row = await svc.clearClassifierHints(slug);
+        } else if (hints && typeof hints === 'object' && !Array.isArray(hints)) {
+            row = await svc.setClassifierHints(slug, hints);
+        } else {
+            return res.status(400).json({
+                status: 'error',
+                message: 'body.hints must be a JSON object, or omit / null to clear',
+            });
+        }
+
+        res.json({ status: 'success', classifier_hints: row.classifier_hints, updated_at: row.updated_at });
+    } catch (error) {
+        console.error('❌ registry classifier-hints:', error.message);
+        res.status(400).json({ status: 'error', message: error.message });
+    }
+});
+
+app.post("/registry/document-types/:slug/schemas", registryAdmin, async (req, res) => {
+    try {
+        const { slug } = req.params;
+        if (!validateRegistrySlug(slug, res)) return;
+
+        const body = req.body || {};
+        if (!body.jsonSchema || typeof body.jsonSchema !== 'object') {
+            return res.status(400).json({ status: 'error', message: 'jsonSchema object is required' });
+        }
+
+        const { unwrapSchemaPayload, extractHintsAndClean } = await import('./utils/schemaHintsExtract.js');
+        const { registerSchema } = await import('./services/schemaRegistry.js');
+
+        const wrapped = unwrapSchemaPayload({
+            jsonSchema: body.jsonSchema,
+            schemaName: body.schemaName,
+        });
+        const schemaName = wrapped.schemaName || body.schemaName || `${slug}_extraction`;
+        const { cleanedSchema, promptHints } = extractHintsAndClean(wrapped.rawSchema);
+
+        const result = await registerSchema({
+            documentTypeSlug: slug,
+            jsonSchema: cleanedSchema,
+            promptHints,
+            schemaName,
+            notes: body.notes || null,
+            setActive: body.setActive !== false,
+        });
+
+        res.status(201).json({ status: 'success', schema: result });
+    } catch (error) {
+        console.error('❌ registry register schema:', error.message);
+        res.status(400).json({ status: 'error', message: error.message });
+    }
+});
+
+app.post("/registry/document-types/:slug/schemas/:version/promote", registryAdmin, async (req, res) => {
+    try {
+        const { slug, version } = req.params;
+        if (!validateRegistrySlug(slug, res)) return;
+        const v = parseInt(version, 10);
+        if (!Number.isInteger(v) || v < 1) {
+            return res.status(400).json({ status: 'error', message: 'Invalid version' });
+        }
+
+        const { setCurrentSchemaVersion } = await import('./services/schemaRegistry.js');
+        const out = await setCurrentSchemaVersion(slug, v);
+
+        res.json({ status: 'success', promoted: out });
+    } catch (error) {
+        console.error('❌ registry promote schema:', error.message);
+        res.status(400).json({ status: 'error', message: error.message });
+    }
+});
+
+app.get("/files/:id/pages/:n/thumbnail.jpg", authenticateToken, async (req, res) => {
+    try {
+        const { id, n } = req.params;
+        const pageNumber = parseInt(n, 10);
+
+        if (!Number.isInteger(pageNumber) || pageNumber < 1) {
+            return res.status(400).json({ status: "error", message: "Invalid page number" });
+        }
+
+        // Width clamped to a sane range (the classifier itself uses 768).
+        const widthPx = Math.max(128, Math.min(2048, parseInt(req.query.width, 10) || 480));
+        const jpegQuality = Math.max(40, Math.min(95, parseInt(req.query.q, 10) || 75));
+
+        // Look up the file row (need s3_key + access check).
+        const client = await pool.connect();
+        let file;
+        try {
+            const { rows } = await client.query(
+                `SELECT id, filename, s3_key, job_id, storage_type
+                 FROM job_files WHERE id = $1`,
+                [id]
+            );
+            file = rows[0];
+        } finally {
+            client.release();
+        }
+
+        if (!file) {
+            return res.status(404).json({ status: "error", message: "File not found" });
+        }
+
+        const hasAccess = await checkFileAccess(id, req.user, res);
+        if (!hasAccess) return; // checkFileAccess already wrote a response
+
+        if (!file.s3_key) {
+            return res.status(400).json({ status: "error", message: "File has no S3 key — thumbnails require S3 storage" });
+        }
+
+        const s3 = new S3Service();
+        if (!s3.isCloudStorageEnabled()) {
+            return res.status(503).json({ status: "error", message: "S3 storage disabled on this server" });
+        }
+
+        const pdfBuffer = await s3.downloadFile(file.s3_key);
+
+        const { rasterizePdf } = await import("./services/pdfRasterizer.js");
+        const pages = await rasterizePdf(pdfBuffer, {
+            widthPx,
+            jpegQuality,
+            firstPage: pageNumber,
+            lastPage: pageNumber,
+        });
+
+        if (pages.length === 0) {
+            return res.status(404).json({ status: "error", message: `Page ${pageNumber} not found in PDF` });
+        }
+
+        const jpeg = pages[0].jpeg;
+        // Browser cache: thumbnails are deterministic for a given file+page+options.
+        res.set('Content-Type', 'image/jpeg');
+        res.set('Cache-Control', 'private, max-age=86400, immutable');
+        res.set('Content-Length', String(jpeg.length));
+        res.send(jpeg);
+    } catch (error) {
+        console.error(`❌ Error rendering page thumbnail:`, error.message);
+        res.status(500).json({ status: "error", message: error.message });
+    }
+});
+
 // Update file results endpoint
 app.put("/files/:id/results", authenticateToken, async (req, res) => {
     try {
@@ -1017,6 +1430,44 @@ app.put("/files/:id/results", authenticateToken, async (req, res) => {
                 message: `File results updated for ${updatedFile.filename}`,
                 updated_at: new Date().toISOString()
             });
+
+            // Fire-and-forget: log this edit to field_corrections so we have
+            // a per-field audit trail (foundation for future few-shot pools,
+            // fine-tuning data, and per-doc-type accuracy metrics). Never
+            // block the response or fail the save on logging errors.
+            //
+            // Note: we diff against `file.result` (the pre-edit blob loaded
+            // above) and log the path-level changes. source_locations is
+            // stripped before persistence and is not part of the corrections
+            // diff.
+            const originalForDiff = file.result || null;
+            const correctedForDiff = resultWithoutSourceLocations;
+            const correctedBy = req.user?.id || null;
+            const orgId = Array.isArray(req.user?.organizationIds)
+                ? (req.user.organizationIds[0] || null)
+                : null;
+            Promise.resolve()
+                .then(() => recordCorrections({
+                    fileId: updatedFile.id,
+                    jobId: file.job_id || null,
+                    organizationId: orgId,
+                    correctedBy,
+                    originalResult: originalForDiff,
+                    correctedResult: correctedForDiff,
+                    // Fallback for v1 (flat) result paths, where the
+                    // json_path itself doesn't tell us which document_type
+                    // the field belongs to. v2 paths (sections.<slug>[i]....)
+                    // are auto-detected and override this.
+                    documentTypeSlugFallback: file.document_type_slug || null,
+                }))
+                .then((res) => {
+                    if (res && res.written > 0) {
+                        console.log(`📝 Logged ${res.written} field correction(s) for file ${updatedFile.id}`);
+                    }
+                })
+                .catch((err) => {
+                    console.warn(`⚠️ field_corrections logging failed (non-fatal) for file ${updatedFile.id}:`, err.message);
+                });
 
             // Create log entry for the update
             // await createLogAndEmit(file.job_id, updatedFile.id, 'info', `File results updated for ${updatedFile.filename}`, updatedFile.filename);
@@ -1621,6 +2072,162 @@ app.put("/files/:id/review", authenticateToken, async (req, res) => {
     }
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Routing-review write endpoints (Phase 1, item #4)
+//
+// The visual classifier marks each section 'auto_approved' or 'pending_review'.
+// These endpoints let an operator:
+//   - approve a pending_review section,
+//   - re-route it to a different document type,
+//   - split it into two at a chosen page boundary.
+//
+// All three persist the new `detected_sections` blob on job_files and emit a
+// `file-status-update` event so any open routing panel refreshes. Per-section
+// extraction (worker side) gates on `flattenExtractionPages({
+// includePendingReview: false })`, so flipping a section to 'approved' is what
+// makes its pages eligible for the next reprocess pass.
+// ─────────────────────────────────────────────────────────────────────────────
+
+function parseSectionIndex(value, res) {
+    const idx = parseInt(value, 10);
+    if (!Number.isInteger(idx) || idx < 0) {
+        res.status(400).json({ status: 'error', message: 'Invalid section index' });
+        return null;
+    }
+    return idx;
+}
+
+async function loadFileWithSections(fileId, res) {
+    const file = await getFileResult(fileId);
+    if (!file) {
+        res.status(404).json({ status: 'error', message: 'File not found' });
+        return null;
+    }
+    if (!file.detected_sections || !Array.isArray(file.detected_sections.sections)) {
+        res.status(400).json({
+            status: 'error',
+            message: 'File has no detected_sections (visual classifier did not run on it)',
+        });
+        return null;
+    }
+    return file;
+}
+
+function emitDetectedSectionsUpdate(file, detectedSections) {
+    io.to(`job-${file.job_id}`).emit('file-status-update', {
+        jobId: file.job_id,
+        fileId: file.id,
+        filename: file.filename,
+        detected_sections: detectedSections,
+        message: `Routing updated for ${file.filename}`,
+        timestamp: new Date().toISOString(),
+    });
+}
+
+app.post("/files/:id/sections/:index/approve", authenticateToken, async (req, res) => {
+    try {
+        const fileId = req.params.id;
+        const index = parseSectionIndex(req.params.index, res);
+        if (index === null) return;
+
+        const hasAccess = await checkFileAccess(fileId, req.user, res);
+        if (!hasAccess) return;
+
+        const file = await loadFileWithSections(fileId, res);
+        if (!file) return;
+
+        const { applyApproveSection } = await import('./services/sectionRoutingEdits.js');
+        const updated = applyApproveSection(file.detected_sections, { index });
+
+        await updateFileDetectedSections(fileId, updated);
+        emitDetectedSectionsUpdate(file, updated);
+
+        res.json({ status: 'success', detected_sections: updated });
+    } catch (error) {
+        console.error('❌ section approve:', error.message);
+        res.status(400).json({ status: 'error', message: error.message });
+    }
+});
+
+app.post("/files/:id/sections/:index/change-slug", authenticateToken, async (req, res) => {
+    try {
+        const fileId = req.params.id;
+        const index = parseSectionIndex(req.params.index, res);
+        if (index === null) return;
+
+        const slug = req.body?.slug;
+        if (!slug || typeof slug !== 'string') {
+            return res.status(400).json({ status: 'error', message: 'slug is required (string)' });
+        }
+
+        const hasAccess = await checkFileAccess(fileId, req.user, res);
+        if (!hasAccess) return;
+
+        const file = await loadFileWithSections(fileId, res);
+        if (!file) return;
+
+        // Validate slug exists in registry. We don't restrict to active-only
+        // here — the operator may need to route to a deprecated type for
+        // historical consistency; the registry is the source of truth.
+        const { getDocumentTypeBySlug } = await import('./services/schemaRegistry.js');
+        const dt = await getDocumentTypeBySlug(slug);
+        if (!dt) {
+            return res.status(400).json({
+                status: 'error',
+                message: `Unknown document type '${slug}'`,
+            });
+        }
+
+        const { applyChangeSectionSlug } = await import('./services/sectionRoutingEdits.js');
+        const updated = applyChangeSectionSlug(file.detected_sections, {
+            index,
+            slug,
+            threshold: dt.routing_confidence_threshold,
+        });
+
+        await updateFileDetectedSections(fileId, updated);
+        emitDetectedSectionsUpdate(file, updated);
+
+        res.json({ status: 'success', detected_sections: updated });
+    } catch (error) {
+        console.error('❌ section change-slug:', error.message);
+        res.status(400).json({ status: 'error', message: error.message });
+    }
+});
+
+app.post("/files/:id/sections/:index/split", authenticateToken, async (req, res) => {
+    try {
+        const fileId = req.params.id;
+        const index = parseSectionIndex(req.params.index, res);
+        if (index === null) return;
+
+        const atPage = parseInt(req.body?.atPage, 10);
+        if (!Number.isInteger(atPage) || atPage < 1) {
+            return res.status(400).json({
+                status: 'error',
+                message: 'atPage must be a positive page number',
+            });
+        }
+
+        const hasAccess = await checkFileAccess(fileId, req.user, res);
+        if (!hasAccess) return;
+
+        const file = await loadFileWithSections(fileId, res);
+        if (!file) return;
+
+        const { applySplitSection } = await import('./services/sectionRoutingEdits.js');
+        const updated = applySplitSection(file.detected_sections, { index, atPage });
+
+        await updateFileDetectedSections(fileId, updated);
+        emitDetectedSectionsUpdate(file, updated);
+
+        res.json({ status: 'success', detected_sections: updated });
+    } catch (error) {
+        console.error('❌ section split:', error.message);
+        res.status(400).json({ status: 'error', message: error.message });
+    }
+});
+
 // Update file verification status
 app.put("/files/:id/verify", authenticateToken, requireRole('admin'), async (req, res) => {
     try {
@@ -2071,19 +2678,44 @@ async function processFilesAsync(job, files, schema, schemaName, processingConfi
                 // Get S3 key from file record if available
                 const s3Key = fileRecord.s3_key || null;
 
-                // Get selected_pages from file record if available
-                let selectedPages = null;
-                if (fileRecord.selected_pages) {
-                    try {
-                        selectedPages = typeof fileRecord.selected_pages === 'string'
-                            ? JSON.parse(fileRecord.selected_pages)
-                            : fileRecord.selected_pages;
-                        if (selectedPages && Array.isArray(selectedPages) && selectedPages.length > 0) {
-                            console.log(`📄 Using selected pages for ${file.originalname}: ${selectedPages.join(', ')}`);
-                        }
-                    } catch (e) {
-                        console.warn(`⚠️ Failed to parse selected_pages for ${file.originalname}:`, e.message);
-                    }
+                // Resolve which pages the extractor should see. This is the
+                // single source of truth for "manual selection wins, otherwise
+                // run the visual classifier (if enabled), otherwise extract
+                // the whole file". Same helper that the worker uses, so both
+                // paths stay aligned.
+                const { deriveSelectedPagesAndMeta, resolveExtractionFlags } = await import('./services/visualClassifierWiring.js');
+                const { usePerSection } = resolveExtractionFlags(jobProcessingConfig);
+                const fileForHelper = {
+                    id: fileRecord.id,
+                    filename: file.originalname,
+                    s3_key: s3Key,
+                    selected_pages: fileRecord.selected_pages ?? null,
+                    storage_type: fileRecord.storage_type || 's3',
+                    job_id: job.id,
+                };
+                const {
+                    selectedPages,
+                    classifierMeta: visualClassifierMeta,
+                    detectedSections: visualDetectedSections,
+                    classifierFailed,
+                } = await deriveSelectedPagesAndMeta({
+                    file: fileForHelper,
+                    jobProcessingConfig,
+                    s3Service,
+                    usePerSection,
+                });
+
+                // When the visual classifier is explicitly enabled but failed,
+                // abort rather than silently extracting every page.
+                if (classifierFailed) {
+                    const reason = visualClassifierMeta?.reason || 'unknown';
+                    const detail = visualClassifierMeta?.error || '';
+                    throw new Error(
+                        `Visual page classifier failed for ${file.originalname} ` +
+                        `(reason: ${reason}${detail ? ' — ' + detail : ''}). ` +
+                        `Aborting to prevent full-document extraction. ` +
+                        `Retry the file or disable the visual classifier on this job.`
+                    );
                 }
 
                 // Extract text (with fallback if extendai fails)
@@ -2145,6 +2777,13 @@ async function processFilesAsync(job, files, schema, schemaName, processingConfi
                 }
                 if (openaiFeedUnblocked) {
                     extractionMetadata.openai_feed_unblocked_length = openaiFeedUnblocked.length;
+                }
+
+                // Surface visual classifier provenance so the routing panel
+                // (and any debugging) can see what the classifier decided
+                // and whether the extractor honoured it or fell back.
+                if (visualClassifierMeta) {
+                    extractionMetadata.visual_page_classifier = visualClassifierMeta;
                 }
 
                 // Extract page count (pages could be array or number)
@@ -2321,7 +2960,108 @@ async function processFilesAsync(job, files, schema, schemaName, processingConfi
                         }
                     }
 
-                    // Step 5: Process with OpenAI using shared function
+                    // ─────────────────────────────────────────────────────────
+                    // Per-section path (v2 envelope)
+                    // ─────────────────────────────────────────────────────────
+                    // Mirrors worker.js: when the visual classifier produced
+                    // ≥1 section with extractable pages, fan out one AI call
+                    // per section using registry-resolved schemas, and store
+                    // the v2 envelope. Otherwise fall through to v1.
+                    // ─────────────────────────────────────────────────────────
+                    const { usePerSection } = resolveExtractionFlags(jobProcessingConfig);
+                    const hasExtractableSections = !!(
+                        visualDetectedSections &&
+                        Array.isArray(visualDetectedSections.sections) &&
+                        visualDetectedSections.sections.some(
+                            (s) => Array.isArray(s.extraction_pages) && s.extraction_pages.length > 0
+                        )
+                    );
+
+                    if (usePerSection && hasExtractableSections && Array.isArray(pages)) {
+                        console.log(
+                            `🧩 Per-section extraction: ${visualDetectedSections.sections.length} section(s) ` +
+                            `for ${file.originalname} (envelope v2)`
+                        );
+
+                        // Lazy imports keep the per-section path fully optional
+                        // so the existing v1 path has no new module-load cost.
+                        const { extractAndProcessPerSection } = await import('./services/perSectionExtractor.js');
+
+                        // Adapter so perSectionExtractor (designed against the
+                        // ProcessingService class API) can drive this code path
+                        // which uses the slimmer processWithOpenAI utility.
+                        const processingServiceAdapter = {
+                            async processText(text, schemaInfo) {
+                                return processWithOpenAI(text, {
+                                    schemaName: schemaInfo?.schemaName || 'data_extraction',
+                                    schema: schemaInfo?.schema,
+                                });
+                            },
+                        };
+
+                        const perSection = await extractAndProcessPerSection({
+                            detectedSections: visualDetectedSections,
+                            pages,
+                            processingService: processingServiceAdapter,
+                            processingMethod: 'openai',
+                            processingOptions: {},
+                        });
+
+                        const failedCount = perSection.sectionResults.filter((r) => r.status === 'failed').length;
+                        const skippedCount = perSection.sectionResults.filter((r) => r.status?.startsWith('skipped_')).length;
+                        const successCount = perSection.sectionResults.filter((r) => r.status === 'success').length;
+
+                        console.log(
+                            `🧩 Per-section result: ${successCount} ok, ${failedCount} failed, ${skippedCount} skipped ` +
+                            `(envelope keys: ${Object.keys(perSection.resultEnvelope).join(', ') || '—'})`
+                        );
+
+                        if (!perSection.anySuccess) {
+                            const firstError = perSection.sectionResults.find((r) => r.error)?.error
+                                || 'No section produced an extractable result';
+                            throw new Error(`Per-section extraction failed: ${firstError}`);
+                        }
+
+                        const finalMetadata = {
+                            ...preProcessingMetadata,
+                            result_envelope: 'v2',
+                            section_results: perSection.sectionResults,
+                            schemas_used: perSection.schemasUsed,
+                            per_section_extraction: {
+                                section_count: perSection.sectionResults.length,
+                                success_count: successCount,
+                                failed_count: failedCount,
+                                skipped_count: skippedCount,
+                                total_ai_time_seconds: perSection.totalAiTimeSeconds,
+                            },
+                        };
+
+                        await updateFileProcessingStatus(
+                            fileRecord.id,
+                            'completed',
+                            perSection.resultEnvelope,
+                            null,
+                            finalMetadata,
+                            perSection.totalAiTimeSeconds || null
+                        );
+
+                        io.to(`job-${job.id}`).emit('file-status-update', {
+                            jobId: job.id,
+                            fileId: fileRecord.id,
+                            filename: file.originalname,
+                            extraction_status: 'completed',
+                            processing_status: 'completed',
+                            message: `Successfully processed ${file.originalname} (${successCount} section(s))`,
+                            result: perSection.resultEnvelope,
+                        });
+
+                        // Skip the v1 single-schema path below.
+                        continue;
+                    }
+
+                    // ─────────────────────────────────────────────────────────
+                    // v1 single-schema path (unchanged)
+                    // ─────────────────────────────────────────────────────────
                     console.log(`Step 5: Processing ${file.originalname} with OpenAI using shared processor...`);
 
                     const processingResult = await processWithOpenAI(contentForAI, {

@@ -13,7 +13,8 @@ import {
 import S3Service from './s3Service.js';
 import ExtractionService from './services/extractionService.js';
 import ProcessingService from './services/processingService.js';
-
+import { deriveSelectedPagesAndMeta, resolveExtractionFlags } from './services/visualClassifierWiring.js';
+import { extractAndProcessPerSection } from './services/perSectionExtractor.js';
 dotenv.config();
 
 
@@ -30,6 +31,12 @@ class FileProcessorWorker {
         this.s3Service = new S3Service();
         this.extractionService = new ExtractionService(this.s3Service);
         this.processingService = new ProcessingService();
+        // Per-file scratch space populated by deriveSelectedPages() and
+        // consumed when assembling extraction_metadata + when deciding
+        // whether to use per-section extraction. Worker is single-threaded
+        // over files (see pollQueue) so the stash pattern is safe.
+        this.lastClassifierMeta = null;
+        this.lastDetectedSections = null;
 
         // Initialize Socket.IO client for WebSocket events
         this.socket = io(SERVER_URL, {
@@ -84,6 +91,14 @@ class FileProcessorWorker {
 
         // Test connections
         await this.testConnections();
+
+        // Recover any files stuck in 'processing' status from a previous
+        // worker crash / restart (e.g. nodemon, deploy, Ctrl-C).
+        // Must run AFTER connections are verified, BEFORE polling begins.
+        const requeued = await queueService.requeueStaleProcessingFiles();
+        if (requeued.length > 0) {
+            console.log(`🔄 Recovered ${requeued.length} file(s) from previous worker crash — they will be picked up on the next poll cycle`);
+        }
 
         console.log('✅ Worker started successfully');
         this.pollQueue();
@@ -262,8 +277,9 @@ class FileProcessorWorker {
 
                 console.log(`📋 Using extraction method: ${extractionMethod} (from job processing config)`);
 
-                // Get selected_pages from file if available
-                const selectedPages = file.selected_pages || null;
+                // Resolve selected_pages: manual file-level selection wins, otherwise
+                // the visual classifier (when enabled) narrows the page set.
+                const selectedPages = await this.deriveSelectedPages(file, jobProcessingConfig);
 
                 // Handle ExtendAI with fallback to mineru
                 if (extractionMethod === 'extendai') {
@@ -332,6 +348,12 @@ class FileProcessorWorker {
                     extractionMetadata.openai_feed_unblocked_length = openaiFeedUnblocked.length;
                 }
 
+                // Surface classifier provenance in extraction metadata.
+                if (this.lastClassifierMeta) {
+                    extractionMetadata.visual_page_classifier = this.lastClassifierMeta;
+                    this.lastClassifierMeta = null;
+                }
+
                 // Debug logging to check values
                 console.log('🔍 Extraction result debug (extraction-only mode):', {
                     filename: file.filename,
@@ -395,8 +417,9 @@ class FileProcessorWorker {
 
                 console.log(`📋 Using extraction method: ${extractionMethod} (from job processing config)`);
 
-                // Get selected_pages from file if available
-                const selectedPages = file.selected_pages || null;
+                // Resolve selected_pages: manual file-level selection wins, otherwise
+                // the visual classifier (when enabled) narrows the page set.
+                const selectedPages = await this.deriveSelectedPages(file, jobProcessingConfig);
 
                 // Handle ExtendAI with fallback to mineru
                 if (extractionMethod === 'extendai') {
@@ -459,6 +482,12 @@ class FileProcessorWorker {
                     extractionMetadata.openai_feed_unblocked_length = openaiFeedUnblocked.length;
                 }
 
+                // Surface classifier provenance in extraction metadata.
+                if (this.lastClassifierMeta) {
+                    extractionMetadata.visual_page_classifier = this.lastClassifierMeta;
+                    this.lastClassifierMeta = null;
+                }
+
                 // Update extraction status for both modes with all fields
                 await updateFileExtractionStatus(
                     file.id,
@@ -509,8 +538,9 @@ class FileProcessorWorker {
 
                 console.log(`📋 Using extraction method: ${extractionMethod} (from job processing config)`);
 
-                // Get selected_pages from file if available
-                const selectedPages = file.selected_pages || null;
+                // Resolve selected_pages: manual file-level selection wins, otherwise
+                // the visual classifier (when enabled) narrows the page set.
+                const selectedPages = await this.deriveSelectedPages(file, jobProcessingConfig);
 
                 // Handle ExtendAI with fallback to mineru
                 if (extractionMethod === 'extendai') {
@@ -575,6 +605,14 @@ class FileProcessorWorker {
                 }
                 if (openaiFeedUnblocked) {
                     extractionMetadata.openai_feed_unblocked_length = openaiFeedUnblocked.length;
+                }
+
+                // Surface classifier provenance in extraction metadata so we can
+                // tell at a glance whether a given file was page-narrowed by the
+                // visual classifier and what it decided.
+                if (this.lastClassifierMeta) {
+                    extractionMetadata.visual_page_classifier = this.lastClassifierMeta;
+                    this.lastClassifierMeta = null;
                 }
 
                 // Debug logging to check values
@@ -738,6 +776,118 @@ class FileProcessorWorker {
                 'processing',
                 `Starting AI processing for ${file.filename} (${modeDescription})`
             );
+
+            // Get processing method and model from job processing config
+            const processingMethod = job.processing_config?.processing?.method || 'openai';
+            const processingModel = job.processing_config?.processing?.model || 'gpt-4o';
+            const processingOptions = job.processing_config?.processing?.options || {};
+
+            // Merge model into options
+            const finalProcessingOptions = {
+                model: processingModel,
+                ...processingOptions
+            };
+
+            // ─────────────────────────────────────────────────────────────
+            // Per-section path (v2 envelope)
+            // ─────────────────────────────────────────────────────────────
+            // When the visual classifier produced ≥1 section with extractable
+            // pages, fan out N AI calls (one per section, each with its own
+            // registry-resolved schema) and store the assembled v2 envelope.
+            //
+            // We only enter this branch when:
+            //   - useVisualClassifier is on AND
+            //   - the classifier returned a sections array AND
+            //   - at least one section has extraction_pages
+            //
+            // Otherwise we fall through to the v1 single-schema path below.
+            // ─────────────────────────────────────────────────────────────
+            const { usePerSection } = resolveExtractionFlags(jobProcessingConfig);
+            const detectedSectionsForExtraction = this.lastDetectedSections;
+            const hasExtractableSections = !!(
+                detectedSectionsForExtraction &&
+                Array.isArray(detectedSectionsForExtraction.sections) &&
+                detectedSectionsForExtraction.sections.some(
+                    (s) => Array.isArray(s.extraction_pages) && s.extraction_pages.length > 0
+                )
+            );
+
+            if (usePerSection && hasExtractableSections && Array.isArray(extractionResult.pages)) {
+                console.log(
+                    `🧩 Per-section extraction: ${detectedSectionsForExtraction.sections.length} section(s) ` +
+                    `for ${file.filename} (envelope v2)`
+                );
+
+                const perSection = await extractAndProcessPerSection({
+                    detectedSections: detectedSectionsForExtraction,
+                    pages: extractionResult.pages,
+                    processingService: this.processingService,
+                    processingMethod,
+                    processingOptions: finalProcessingOptions,
+                });
+
+                this.lastDetectedSections = null;
+
+                const failedCount = perSection.sectionResults.filter((r) => r.status === 'failed').length;
+                const skippedCount = perSection.sectionResults.filter((r) => r.status?.startsWith('skipped_')).length;
+                const successCount = perSection.sectionResults.filter((r) => r.status === 'success').length;
+
+                console.log(
+                    `🧩 Per-section result: ${successCount} ok, ${failedCount} failed, ${skippedCount} skipped ` +
+                    `(envelope keys: ${Object.keys(perSection.resultEnvelope).join(', ') || '—'})`
+                );
+
+                if (!perSection.anySuccess) {
+                    // Every section failed or was skipped. Bubble up the
+                    // first concrete error so the file shows a useful message.
+                    const firstError = perSection.sectionResults.find((r) => r.error)?.error
+                        || 'No section produced an extractable result';
+                    throw new Error(`Per-section extraction failed: ${firstError}`);
+                }
+
+                const finalMetadata = {
+                    ...preProcessingMetadata,
+                    result_envelope: 'v2',
+                    section_results: perSection.sectionResults,
+                    schemas_used: perSection.schemasUsed,
+                    per_section_extraction: {
+                        section_count: perSection.sectionResults.length,
+                        success_count: successCount,
+                        failed_count: failedCount,
+                        skipped_count: skippedCount,
+                        total_ai_time_seconds: perSection.totalAiTimeSeconds,
+                    },
+                };
+
+                await updateFileProcessingStatus(
+                    file.id,
+                    'completed',
+                    perSection.resultEnvelope,
+                    null,
+                    finalMetadata,
+                    perSection.totalAiTimeSeconds || null
+                );
+                console.log(`✅ File ${file.filename} per-section processing completed (v2 envelope)`);
+
+                this.emitFileStatusUpdate(
+                    jobId,
+                    file.id,
+                    'completed',
+                    'completed',
+                    `AI processing completed for ${file.filename} (${successCount} section(s))`
+                );
+
+                this.processedCount++;
+                await queueService.removeFileFromProcessing(file.id);
+                console.log(`🗑️ File ${file.id} processing completed`);
+                return;
+            }
+
+            // ─────────────────────────────────────────────────────────────
+            // v1 single-schema path (unchanged from before)
+            // ─────────────────────────────────────────────────────────────
+            this.lastDetectedSections = null;
+
             // Parse schema data if it's a string
             let schemaData = job.schema_data;
             if (typeof schemaData === 'string') {
@@ -757,23 +907,10 @@ class FileProcessorWorker {
                 }
             }
 
-            // console.log('🔍 Processed schemaData:', schemaData);
-
             // Validate schema structure
             if (!schemaData || !schemaData.schema) {
                 throw new Error(`Missing schema in job data. Got: ${JSON.stringify(schemaData)}`);
             }
-
-            // Get processing method and model from job processing config
-            const processingMethod = job.processing_config?.processing?.method || 'openai';
-            const processingModel = job.processing_config?.processing?.model || 'gpt-4o';
-            const processingOptions = job.processing_config?.processing?.options || {};
-
-            // Merge model into options
-            const finalProcessingOptions = {
-                model: processingModel,
-                ...processingOptions
-            };
 
             // Use filtered markdown from confidentHits if page detection is enabled and hits are available, otherwise use full content
             let contentForAI = extractionResult.markdown;
@@ -910,6 +1047,45 @@ class FileProcessorWorker {
     }
 
     /**
+     * Thin wrapper around the shared visualClassifierWiring helper.
+     *
+     * Kept as an instance method for backwards compatibility with the
+     * existing call sites (which already do `await this.deriveSelectedPages(...)`)
+     * and so the metadata-surfacing code below can read
+     * `this.lastClassifierMeta` after the call.
+     *
+     * Worker is single-threaded over files (see pollQueue), so the stash
+     * pattern is safe.
+     */
+    async deriveSelectedPages(file, jobProcessingConfig) {
+        const { usePerSection } = resolveExtractionFlags(jobProcessingConfig);
+        const { selectedPages, classifierMeta, detectedSections, classifierFailed } = await deriveSelectedPagesAndMeta({
+            file,
+            jobProcessingConfig,
+            s3Service: this.s3Service,
+            usePerSection,
+        });
+        this.lastClassifierMeta = classifierMeta;
+        this.lastDetectedSections = detectedSections;
+
+        // When the visual classifier is explicitly enabled but failed,
+        // abort rather than silently extracting every page.  A 200-page
+        // PDF falling through to full extraction is a costly surprise.
+        if (classifierFailed) {
+            const reason = classifierMeta?.reason || 'unknown';
+            const detail = classifierMeta?.error || '';
+            throw new Error(
+                `Visual page classifier failed for ${file.filename} ` +
+                `(reason: ${reason}${detail ? ' — ' + detail : ''}). ` +
+                `Aborting to prevent full-document extraction. ` +
+                `Retry the file or disable the visual classifier on this job.`
+            );
+        }
+
+        return selectedPages;
+    }
+
+    /**
      * Extract with ExtendAI (requires S3 file)
      * @param {Object} file - File record with s3_key
      * @param {Object} options - Extraction options
@@ -1041,7 +1217,16 @@ const worker = new FileProcessorWorker();
 // Lightweight HTTP server so platforms like Railway can health-check the
 // worker (it doesn't otherwise bind to a port and the dashboard would show
 // it as offline). Also gives us a real /health endpoint for monitoring.
-const HEALTH_PORT = parseInt(process.env.PORT || process.env.WORKER_HEALTH_PORT || '8080', 10);
+//
+// Local dev: `.env` often sets PORT=3000 for the HTTP API while both processes
+// load the same dotenv — binding worker health on PORT produced EADDRINUSE.
+// On Railway, WORKER_HEALTH_PORT is optional; `$PORT` there is worker-specific.
+const onRailway = Boolean(process.env.RAILWAY_ENVIRONMENT);
+let healthListenPort = process.env.WORKER_HEALTH_PORT;
+if (!healthListenPort && onRailway && process.env.PORT) {
+    healthListenPort = process.env.PORT;
+}
+const HEALTH_PORT = parseInt(healthListenPort || '8080', 10);
 const healthServer = http.createServer((req, res) => {
     if (req.url === '/health' || req.url === '/') {
         const uptimeSeconds = Math.floor((Date.now() - worker.startTime.getTime()) / 1000);
