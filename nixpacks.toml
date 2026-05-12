@@ -1,5 +1,0 @@
-# System packages required at runtime.
-# poppler_utils provides pdftoppm, which the visual page classifier uses
-# to rasterize PDF pages into images before sending them to OpenAI Vision.
-[phases.setup]
-nixPkgs = ["poppler_utils"]
