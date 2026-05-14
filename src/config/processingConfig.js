@@ -13,8 +13,18 @@ export const PROCESSING_METHODS = {
 };
 
 export const OPENAI_MODELS = {
+    // gpt-4.1 family — 32,768 output token cap, supports json_schema strict.
+    // This is the default for structured extraction because dense schemas
+    // (e.g. analytical_results) overflow gpt-4o's 16,384 output cap on
+    // some pages.
+    GPT_4_1: 'gpt-4.1',
+    GPT_4_1_MINI: 'gpt-4.1-mini',
+    GPT_4_1_NANO: 'gpt-4.1-nano',
+    // gpt-4o family — 16,384 output token cap. Kept for backwards
+    // compatibility and as the auto-retry source when these truncate.
     GPT_4O: 'gpt-4o',
     GPT_4O_2024_08_06: 'gpt-4o-2024-08-06',
+    GPT_4O_MINI: 'gpt-4o-mini',
     GPT_4: 'gpt-4',
     GPT_3_5_TURBO: 'gpt-3.5-turbo'
 };
@@ -54,31 +64,88 @@ export const OPENAI_MODELS_LIST = Object.values(OPENAI_MODELS);
 export const QWEN_MODELS_LIST = Object.values(QWEN_MODELS);
 export const ALL_PROCESSING_METHODS = Object.values(PROCESSING_METHODS);
 
-// Default models for each method
+// Default models for each method.
+//
+// OpenAI default switched from gpt-4o (16k output cap) to gpt-4.1 (32k
+// output cap) on 2026-05-13 after analytical_results table extractions
+// were consistently hitting gpt-4o's hard output cap, producing truncated
+// JSON and `Unexpected end of JSON input` failures. gpt-4.1 also supports
+// the same json_schema strict response_format and is cheaper per token.
 export const DEFAULT_MODELS = {
-    [PROCESSING_METHODS.OPENAI]: OPENAI_MODELS.GPT_4O,
+    [PROCESSING_METHODS.OPENAI]: OPENAI_MODELS.GPT_4_1,
     [PROCESSING_METHODS.QWEN]: QWEN_MODELS.QWEN3_MAX
 };
 
-// Default options for OpenAI models
+// Default options for OpenAI models.
+//
+// `max_tokens` here MUST match the model's actual max output cap. Previously
+// the gpt-4o entries set 4000 — but that value was never forwarded to the
+// API call (silent option drop), so the runtime was using OpenAI's model
+// default (16384). Raising the configured value to each model's true cap
+// makes the config truthful AND ensures we don't accidentally tighten the
+// cap for dense outputs like table extractions.
+//
+// `temperature` is intentionally low (0.1) for structured extraction —
+// reduces output-length variance and the risk of hitting the output cap.
 export const OPENAI_DEFAULT_OPTIONS = {
+    [OPENAI_MODELS.GPT_4_1]: {
+        temperature: 0.1,
+        max_tokens: 32768
+    },
+    [OPENAI_MODELS.GPT_4_1_MINI]: {
+        temperature: 0.1,
+        max_tokens: 32768
+    },
+    [OPENAI_MODELS.GPT_4_1_NANO]: {
+        temperature: 0.1,
+        max_tokens: 32768
+    },
     [OPENAI_MODELS.GPT_4O]: {
         temperature: 0.1,
-        max_tokens: 4000
+        max_tokens: 16384
     },
     [OPENAI_MODELS.GPT_4O_2024_08_06]: {
         temperature: 0.1,
-        max_tokens: 4000
+        max_tokens: 16384
+    },
+    [OPENAI_MODELS.GPT_4O_MINI]: {
+        temperature: 0.1,
+        max_tokens: 16384
     },
     [OPENAI_MODELS.GPT_4]: {
         temperature: 0.1,
-        max_tokens: 4000
+        max_tokens: 8192
     },
     [OPENAI_MODELS.GPT_3_5_TURBO]: {
         temperature: 0.2,
-        max_tokens: 3000
+        max_tokens: 4096
     }
 };
+
+/**
+ * For automatic truncation recovery: when a 16k-cap model emits
+ * finish_reason='length' the processor retries the same prompt against
+ * a model with a larger output cap (32k). Map the source model to its
+ * upgrade target. Returns null if no upgrade is available (e.g. we're
+ * already on a 32k model).
+ *
+ * Tier-preserving where possible: gpt-4o-mini upgrades to gpt-4.1-mini
+ * so cost characteristics stay similar.
+ */
+export function getOpenAIUpgradeModel(model) {
+    switch (model) {
+        case OPENAI_MODELS.GPT_4O:
+        case OPENAI_MODELS.GPT_4O_2024_08_06:
+        case OPENAI_MODELS.GPT_4:
+            return OPENAI_MODELS.GPT_4_1;
+        case OPENAI_MODELS.GPT_4O_MINI:
+            return OPENAI_MODELS.GPT_4_1_MINI;
+        case OPENAI_MODELS.GPT_3_5_TURBO:
+            return OPENAI_MODELS.GPT_4_1;
+        default:
+            return null;
+    }
+}
 
 // Default options for Qwen models
 export const QWEN_DEFAULT_OPTIONS = {
@@ -157,7 +224,18 @@ export function getDefaultModel(method) {
  */
 export function getDefaultOptions(method, model) {
     if (method === PROCESSING_METHODS.OPENAI) {
-        return OPENAI_DEFAULT_OPTIONS[model] || OPENAI_DEFAULT_OPTIONS[DEFAULT_MODELS[PROCESSING_METHODS.OPENAI]];
+        if (OPENAI_DEFAULT_OPTIONS[model]) return OPENAI_DEFAULT_OPTIONS[model];
+        // Prefix fallback so future dated snapshots (e.g. gpt-4.1-2025-04-14)
+        // pick up the family's defaults instead of falling back to the
+        // global default (which would be wrong for a small/mini model).
+        if (typeof model === 'string') {
+            if (model.startsWith('gpt-4.1-mini')) return OPENAI_DEFAULT_OPTIONS[OPENAI_MODELS.GPT_4_1_MINI];
+            if (model.startsWith('gpt-4.1-nano')) return OPENAI_DEFAULT_OPTIONS[OPENAI_MODELS.GPT_4_1_NANO];
+            if (model.startsWith('gpt-4.1')) return OPENAI_DEFAULT_OPTIONS[OPENAI_MODELS.GPT_4_1];
+            if (model.startsWith('gpt-4o-mini')) return OPENAI_DEFAULT_OPTIONS[OPENAI_MODELS.GPT_4O_MINI];
+            if (model.startsWith('gpt-4o')) return OPENAI_DEFAULT_OPTIONS[OPENAI_MODELS.GPT_4O];
+        }
+        return OPENAI_DEFAULT_OPTIONS[DEFAULT_MODELS[PROCESSING_METHODS.OPENAI]];
     } else if (method === PROCESSING_METHODS.QWEN) {
         // Try exact match first
         if (QWEN_DEFAULT_OPTIONS[model]) {
@@ -274,6 +352,7 @@ export default {
     getModelsForMethod,
     getDefaultModel,
     getDefaultOptions,
+    getOpenAIUpgradeModel,
     isValidModel,
     getExtendAIConfig
 };
