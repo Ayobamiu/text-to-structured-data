@@ -5,8 +5,10 @@ import {
     OPENAI_MODELS_LIST,
     QWEN_MODELS_LIST,
     getDefaultModel as getConfigDefaultModel,
-    getDefaultOptions as getConfigDefaultOptions
+    getDefaultOptions as getConfigDefaultOptions,
+    getOpenAIUpgradeModel
 } from '../config/processingConfig.js';
+import { parseOpenAiStructuredResponse, OpenAiTruncationError } from '../utils/openaiResponse.js';
 
 class ProcessingService {
     constructor() {
@@ -93,28 +95,92 @@ class ProcessingService {
 
             const systemPrompt = "You are an expert at structured data extraction from documents. Extract data accurately according to the provided schema, paying attention to document structure, tables, and contextual relationships."
             const userPrompt = `Extract structured data from this document according to the provided schema:\n\n${text}`;
-            const response = await this.openai.chat.completions.create({
-                model: defaultOptions.model,
-                messages: [
-                    { role: "system", content: systemPrompt },
-                    { role: "user", content: userPrompt }
-                ],
-                response_format: {
-                    type: "json_schema",
-                    json_schema: {
-                        name: schemaData.schemaName || "data_extraction",
-                        "strict": true,
-                        schema: schema.schema,
+
+            // Single-attempt helper. We retry the same call body with a
+            // larger-cap model on truncation; see the catch block below.
+            const callOpenAI = async (modelToUse) => {
+                const modelOpts = getConfigDefaultOptions(PROCESSING_METHODS.OPENAI, modelToUse) || {};
+                // Caller-supplied options win, then the per-model defaults
+                // (temperature, max_tokens), then the model name.
+                const effective = { ...modelOpts, ...options, model: modelToUse };
+
+                // Forward temperature/max_tokens explicitly. Historically
+                // these were computed but never passed to the API call,
+                // so the model ran at temperature=1.0 (high output length
+                // variance) and the model's hard cap. That caused
+                // intermittent finish_reason='length' truncations on
+                // dense table pages.
+                const apiParams = {
+                    model: modelToUse,
+                    messages: [
+                        { role: "system", content: systemPrompt },
+                        { role: "user", content: userPrompt }
+                    ],
+                    response_format: {
+                        type: "json_schema",
+                        json_schema: {
+                            name: schemaData.schemaName || "data_extraction",
+                            "strict": true,
+                            schema: schema.schema,
+                        },
                     },
-                },
-            });
+                };
+                if (typeof effective.temperature === 'number') {
+                    apiParams.temperature = effective.temperature;
+                }
+                if (typeof effective.max_tokens === 'number') {
+                    apiParams.max_tokens = effective.max_tokens;
+                }
 
-            const extractedData = JSON.parse(response.choices[0].message.content);
+                const response = await this.openai.chat.completions.create(apiParams);
+                const data = parseOpenAiStructuredResponse(response, modelToUse);
+                return { response, data, effective };
+            };
 
+            // First attempt with the requested model.
+            let attempt;
+            let modelUsed = defaultOptions.model;
+            let upgradeInfo = null;
+            try {
+                attempt = await callOpenAI(modelUsed);
+            } catch (firstErr) {
+                if (firstErr instanceof OpenAiTruncationError) {
+                    // Auto-recover: try once with a model that has a
+                    // larger output cap. We only upgrade if there's a
+                    // bigger-cap target — gpt-4.1 is currently the
+                    // ceiling at 32k. If we're already on it, surface
+                    // the truncation error so the operator knows the
+                    // schema has outgrown even gpt-4.1 (next move is
+                    // schema chunking).
+                    const upgradeModel = getOpenAIUpgradeModel(modelUsed);
+                    if (!upgradeModel) {
+                        throw firstErr;
+                    }
+                    console.warn(
+                        `⚠️ ${modelUsed} truncated (completion=${firstErr.completion_tokens} tokens, ` +
+                        `total=${firstErr.total_tokens} tokens). Auto-retrying with ${upgradeModel} (larger output cap).`
+                    );
+                    upgradeInfo = {
+                        retried_due_to: 'truncation',
+                        original_model: modelUsed,
+                        original_completion_tokens: firstErr.completion_tokens,
+                        original_total_tokens: firstErr.total_tokens,
+                    };
+                    modelUsed = upgradeModel;
+                    attempt = await callOpenAI(modelUsed);
+                } else {
+                    throw firstErr;
+                }
+            }
+
+            const { response, data: extractedData, effective } = attempt;
             const endTime = Date.now();
             const processingTimeSeconds = (endTime - startTime) / 1000;
 
-            console.log(`✅ OpenAI processing completed with ${defaultOptions.model} in ${processingTimeSeconds.toFixed(2)}s`);
+            console.log(
+                `✅ OpenAI processing completed with ${modelUsed} in ${processingTimeSeconds.toFixed(2)}s` +
+                (upgradeInfo ? ` (auto-upgraded from ${upgradeInfo.original_model} after truncation)` : '')
+            );
 
             return {
                 success: true,
@@ -123,15 +189,16 @@ class ProcessingService {
                 ai_processing_time_seconds: processingTimeSeconds,
                 metadata: {
                     processing_method: 'openai',
-                    model: defaultOptions.model,
-                    temperature: defaultOptions.temperature,
-                    max_tokens: defaultOptions.max_tokens,
+                    model: modelUsed,
+                    temperature: effective.temperature,
+                    max_tokens: effective.max_tokens,
                     tokens_used: response.usage?.total_tokens || 0,
-                    prompt_tokens: response.usage?.prompt_tokens || 0,  // Input tokens
-                    completion_tokens: response.usage?.completion_tokens || 0,  // Output tokens
+                    prompt_tokens: response.usage?.prompt_tokens || 0,
+                    completion_tokens: response.usage?.completion_tokens || 0,
                     processing_time: new Date().toISOString(),
                     processing_time_seconds: processingTimeSeconds,
-                    ai_processing_time_seconds: processingTimeSeconds
+                    ai_processing_time_seconds: processingTimeSeconds,
+                    ...(upgradeInfo ? { upgrade: upgradeInfo } : {})
                 }
             };
 
