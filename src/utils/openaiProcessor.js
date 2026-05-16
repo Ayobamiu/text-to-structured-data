@@ -65,12 +65,29 @@ export async function processWithOpenAI(text, schemaData, options = {}) {
                 model: modelToUse,
                 messages: [
                     {
+                        // Keep this prompt in sync with services/processingService.js —
+                        // both paths share the same OpenAI structured-output
+                        // completeness failure mode (model stops early on
+                        // long tables despite ample max_tokens headroom).
                         role: 'system',
-                        content: 'You are an expert at structured data extraction from documents. Extract data accurately according to the provided schema, paying attention to document structure, tables, and contextual relationships.',
+                        content:
+                            'You are an expert at structured data extraction from documents. ' +
+                            'Extract data ACCURATELY and EXHAUSTIVELY according to the provided JSON schema. ' +
+                            'When the source contains repeating structures (tables, lists, rows, line items), ' +
+                            'you MUST emit one schema item per source row — do not summarise, sample, truncate, ' +
+                            'or stop early. Iterate through every row top-to-bottom before closing the array. ' +
+                            'Never invent rows that are not present in the source; if a cell is missing, omit it ' +
+                            "or use the schema's null-equivalent. Counts in metadata (e.g. total_rows, " +
+                            'total_items) must match the actual number of items you emitted.',
                     },
                     {
                         role: 'user',
-                        content: `Extract structured data from this document according to the provided schema:\n\n${text}`,
+                        content:
+                            'Extract structured data from this document according to the provided schema. ' +
+                            'Repeat the same emission pattern for EVERY row/item that appears in the source — ' +
+                            'do not stop after the first few. ' +
+                            'When in doubt about how many rows the source contains, count <tr>, list items, ' +
+                            `or line breaks before answering.\n\nDOCUMENT:\n\n${text}`,
                     },
                 ],
                 response_format: {
