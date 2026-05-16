@@ -9,6 +9,11 @@ import {
     getOpenAIUpgradeModel
 } from '../config/processingConfig.js';
 import { parseOpenAiStructuredResponse, OpenAiTruncationError } from '../utils/openaiResponse.js';
+import {
+    buildDocumentExtractionMessages,
+    buildDocumentExtractionResponseFormat,
+    normalizeExtractionSchemaData,
+} from '../config/openaiPrompts.ts';
 
 class ProcessingService {
     constructor() {
@@ -69,53 +74,8 @@ class ProcessingService {
 
             console.log(`🤖 Processing with OpenAI ${defaultOptions.model}`);
 
-            // Parse schema data if it's a string
-            let schema = schemaData;
-            if (typeof schemaData === 'string') {
-                try {
-                    schema = JSON.parse(schemaData);
-                } catch (parseError) {
-                    throw new Error(`Invalid schema data: ${parseError.message}`);
-                }
-            }
-
-            // Parse the nested schema string if it exists
-            if (schema && schema.schema && typeof schema.schema === 'string') {
-                try {
-                    schema.schema = JSON.parse(schema.schema);
-                } catch (parseError) {
-                    throw new Error(`Invalid nested schema: ${parseError.message}`);
-                }
-            }
-
-            // Validate schema structure
-            if (!schema || !schema.schema) {
-                throw new Error(`Missing schema in processing data. Got: ${JSON.stringify(schema)}`);
-            }
-
-            // Completeness is the dominant failure mode for this pipeline.
-            // With `strict: true` + low temperature + open-ended arrays, the
-            // model frequently emits a schema-valid response containing only
-            // the first few rows of a long table and stops — even when there
-            // is plenty of `max_tokens` headroom. The prompt below explicitly
-            // forces row-by-row exhaustion of every repeating structure in
-            // the source. See note above OpenAI structured-output partial
-            // emission. Do not soften without re-running KCSI Table A-1.
-            const systemPrompt =
-                "You are an expert at structured data extraction from documents. " +
-                "Extract data ACCURATELY and EXHAUSTIVELY according to the provided JSON schema. " +
-                "When the source contains repeating structures (tables, lists, rows, line items), " +
-                "you MUST emit one schema item per source row — do not summarise, sample, truncate, " +
-                "or stop early. Iterate through every row top-to-bottom before closing the array. " +
-                "Never invent rows that are not present in the source; if a cell is missing, omit it " +
-                "or use the schema's null-equivalent. Counts in metadata (e.g. total_rows, " +
-                "total_items) must match the actual number of items you emitted.";
-            const userPrompt =
-                `Extract structured data from this document according to the provided schema. ` +
-                `Repeat the same emission pattern for EVERY row/item that appears in the source — ` +
-                `do not stop after the first few. ` +
-                `When in doubt about how many rows the source contains, count <tr>, list items, ` +
-                `or line breaks before answering.\n\nDOCUMENT:\n\n${text}`;
+            // Validates + normalises schema (throws if missing/invalid).
+            normalizeExtractionSchemaData(schemaData);
 
             // Single-attempt helper. We retry the same call body with a
             // larger-cap model on truncation; see the catch block below.
@@ -133,18 +93,8 @@ class ProcessingService {
                 // dense table pages.
                 const apiParams = {
                     model: modelToUse,
-                    messages: [
-                        { role: "system", content: systemPrompt },
-                        { role: "user", content: userPrompt }
-                    ],
-                    response_format: {
-                        type: "json_schema",
-                        json_schema: {
-                            name: schemaData.schemaName || "data_extraction",
-                            "strict": true,
-                            schema: schema.schema,
-                        },
-                    },
+                    messages: buildDocumentExtractionMessages(text),
+                    response_format: buildDocumentExtractionResponseFormat(schemaData),
                 };
                 if (typeof effective.temperature === 'number') {
                     apiParams.temperature = effective.temperature;
