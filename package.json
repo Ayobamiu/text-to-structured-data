@@ -41,13 +41,16 @@
   "devDependencies": {
     "jest": "^29.7.0",
     "nodemon": "^3.0.2",
-    "supertest": "^6.3.3"
+    "supertest": "^6.3.3",
+    "tsx": "^4.19.4",
+    "typescript": "^5.8.3"
   },
   "scripts": {
-    "start": "node src/server.js",
-    "dev": "nodemon src/server.js",
-    "worker": "node src/worker.js",
-    "worker:dev": "nodemon src/worker.js",
+    "start": "tsx src/server.js",
+    "dev": "nodemon --exec tsx src/server.js",
+    "worker": "tsx src/worker.js",
+    "worker:dev": "nodemon --exec tsx src/worker.js",
+    "typecheck": "tsc --noEmit",
     "test": "jest",
     "test:watch": "jest --watch",
     "lint": "echo 'Linting not configured yet'",

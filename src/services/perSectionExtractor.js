@@ -275,6 +275,24 @@ async function runSection({
         `(schema v${schemaInfo.version})`
     );
 
+    // Cheap completeness signal — log when the model produced a tiny array
+    // from a clearly tabular page. Catches OpenAI structured-output partial
+    // emission (KCSI Table A-1 returned 3 of 35 analytes with 30k tokens of
+    // unused max_tokens budget). Counts source <tr>/ug/L hits as a proxy
+    // for how many rows the model should have produced.
+    try {
+        const completenessWarning = buildCompletenessWarning(aiResult.data, contentForAI);
+        if (completenessWarning) {
+            console.warn(
+                `⚠️ Section ${index} (${slug}): ${completenessWarning} — ` +
+                `model may have stopped extracting early despite token headroom`
+            );
+        }
+    } catch (warnErr) {
+        // Don't let a logging helper break a successful extraction.
+        console.warn(`⚠️ completeness check failed: ${warnErr.message}`);
+    }
+
     return {
         ...baseMeta,
         status: 'success',
@@ -284,6 +302,57 @@ async function runSection({
         schema_version: schemaInfo.version,
         schema_id: schemaInfo.schemaId,
     };
+}
+
+/**
+ * Return a human-readable warning if the emitted data looks suspiciously
+ * sparse compared to repeating structure visible in the source text.
+ *
+ * Heuristic only — we do NOT mutate or reject the result. The point is to
+ * surface the partial-emission failure mode in logs so the operator (or a
+ * future per-job alarm) can spot it before users notice.
+ *
+ * @returns {string|null} warning message, or null when nothing looks off
+ */
+function buildCompletenessWarning(data, sourceText) {
+    if (!data || typeof data !== 'object' || !sourceText) return null;
+
+    // Source-side row signals. <tr> is the strongest because the extractor
+    // emits HTML tables; ug/L / mg/L cells back it up; bullet/numbered lines
+    // catch non-table layouts. We subtract 1 from <tr> to discount the
+    // header row when the table is present.
+    const trMatches = sourceText.match(/<tr[ >]/gi);
+    const trRowCount = trMatches ? Math.max(0, trMatches.length - 1) : 0;
+    const unitMatches = sourceText.match(/\b(?:ug\/L|mg\/L|mg\/kg|ug\/kg|ppm|ppb)\b/gi);
+    const unitRowCount = unitMatches ? unitMatches.length : 0;
+    const sourceRowSignal = Math.max(trRowCount, unitRowCount);
+
+    if (sourceRowSignal < 10) return null; // not obviously tabular
+
+    // Find the largest array in the emitted data (any depth). For the v2
+    // envelope each section is a single object so a shallow scan is enough.
+    let biggestArrayLen = 0;
+    const visit = (node, depth = 0) => {
+        if (depth > 4 || node == null) return;
+        if (Array.isArray(node)) {
+            if (node.length > biggestArrayLen) biggestArrayLen = node.length;
+            for (const v of node) visit(v, depth + 1);
+        } else if (typeof node === 'object') {
+            for (const v of Object.values(node)) visit(v, depth + 1);
+        }
+    };
+    visit(data);
+
+    // Soft threshold: model produced <33% of what the source suggests. The
+    // ratio is intentionally conservative — extraction page mixes (header
+    // rows, legend rows, blank spacers) make 1:1 impossible to guarantee.
+    if (biggestArrayLen > 0 && biggestArrayLen * 3 < sourceRowSignal) {
+        return (
+            `extracted ${biggestArrayLen} items but source has ~${sourceRowSignal} repeating rows`
+        );
+    }
+
+    return null;
 }
 
 /**

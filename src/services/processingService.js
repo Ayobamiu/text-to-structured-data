@@ -9,6 +9,11 @@ import {
     getOpenAIUpgradeModel
 } from '../config/processingConfig.js';
 import { parseOpenAiStructuredResponse, OpenAiTruncationError } from '../utils/openaiResponse.js';
+import {
+    buildDocumentExtractionMessages,
+    buildDocumentExtractionResponseFormat,
+    normalizeExtractionSchemaData,
+} from '../config/openaiPrompts.ts';
 
 class ProcessingService {
     constructor() {
@@ -69,32 +74,8 @@ class ProcessingService {
 
             console.log(`🤖 Processing with OpenAI ${defaultOptions.model}`);
 
-            // Parse schema data if it's a string
-            let schema = schemaData;
-            if (typeof schemaData === 'string') {
-                try {
-                    schema = JSON.parse(schemaData);
-                } catch (parseError) {
-                    throw new Error(`Invalid schema data: ${parseError.message}`);
-                }
-            }
-
-            // Parse the nested schema string if it exists
-            if (schema && schema.schema && typeof schema.schema === 'string') {
-                try {
-                    schema.schema = JSON.parse(schema.schema);
-                } catch (parseError) {
-                    throw new Error(`Invalid nested schema: ${parseError.message}`);
-                }
-            }
-
-            // Validate schema structure
-            if (!schema || !schema.schema) {
-                throw new Error(`Missing schema in processing data. Got: ${JSON.stringify(schema)}`);
-            }
-
-            const systemPrompt = "You are an expert at structured data extraction from documents. Extract data accurately according to the provided schema, paying attention to document structure, tables, and contextual relationships."
-            const userPrompt = `Extract structured data from this document according to the provided schema:\n\n${text}`;
+            // Validates + normalises schema (throws if missing/invalid).
+            normalizeExtractionSchemaData(schemaData);
 
             // Single-attempt helper. We retry the same call body with a
             // larger-cap model on truncation; see the catch block below.
@@ -112,18 +93,8 @@ class ProcessingService {
                 // dense table pages.
                 const apiParams = {
                     model: modelToUse,
-                    messages: [
-                        { role: "system", content: systemPrompt },
-                        { role: "user", content: userPrompt }
-                    ],
-                    response_format: {
-                        type: "json_schema",
-                        json_schema: {
-                            name: schemaData.schemaName || "data_extraction",
-                            "strict": true,
-                            schema: schema.schema,
-                        },
-                    },
+                    messages: buildDocumentExtractionMessages(text),
+                    response_format: buildDocumentExtractionResponseFormat(schemaData),
                 };
                 if (typeof effective.temperature === 'number') {
                     apiParams.temperature = effective.temperature;

@@ -207,7 +207,6 @@ docs/
 .eslintrc*
 .prettierrc*
 jest.config.js
-tsconfig.json
 
 # Production specific
 *.pem
