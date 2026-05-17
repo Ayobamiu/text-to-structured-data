@@ -120,7 +120,7 @@ const openai = new OpenAI({
 });
 
 // Flask service URL
-const FLASK_URL = process.env.FLASK_URL || "http://localhost:5001";
+const PADDLEOCR_FLASK_URL = process.env.PADDLEOCR_FLASK_URL || "http://localhost:5002";
 
 // Initialize S3 service
 const s3Service = new S3Service();
@@ -724,10 +724,10 @@ app.put("/jobs/:id/config", authenticateToken, async (req, res) => {
 
             // Validate extraction method if provided
             if (processing_config.extraction?.method &&
-                !['mineru', 'documentai', 'extendai', 'paddleocr'].includes(processing_config.extraction.method)) {
+                !['extendai', 'paddleocr'].includes(processing_config.extraction.method)) {
                 return res.status(400).json({
                     status: "error",
-                    message: "Invalid extraction.method. Must be one of: mineru, documentai, extendai, paddleocr"
+                    message: "Invalid extraction.method. Must be one of: extendai, paddleocr"
                 });
             }
 
@@ -2672,7 +2672,7 @@ async function processFilesAsync(job, files, schema, schemaName, processingConfi
                 // Add extraction method from processing config
                 const eToJSON = typeof processingConfig === 'string' ? JSON.parse(processingConfig) : processingConfig;
                 const jobProcessingConfig = typeof job.processing_config === 'string' ? JSON.parse(job.processing_config) : job.processing_config;
-                const extractionMethod = eToJSON?.extraction?.method || jobProcessingConfig?.extraction?.method || 'mineru';
+                const extractionMethod = eToJSON?.extraction?.method || jobProcessingConfig?.extraction?.method || 'paddleocr';
                 const extractionOptions = eToJSON?.extraction?.options || jobProcessingConfig?.extraction?.options || {};
 
                 // Get S3 key from file record if available
@@ -2721,24 +2721,22 @@ async function processFilesAsync(job, files, schema, schemaName, processingConfi
                 // Extract text (with fallback if extendai fails)
                 let extractionResult;
                 if (extractionMethod === 'extendai') {
-                    // Try ExtendAI with fallback to mineru
+                    // Try ExtendAI with fallback to paddleocr
                     console.log(`🚀 Attempting ExtendAI extraction for ${file.originalname}`);
                     extractionResult = await extractionService.extractWithExtendAI(file.originalname, s3Key, extractionOptions, selectedPages);
 
-                    // If ExtendAI fails, fallback to mineru
                     if (!extractionResult.success) {
                         console.log(`⚠️ ExtendAI failed: ${extractionResult.error}`);
-                        console.log(`🔄 Falling back to mineru for ${file.originalname}`);
-                        extractionResult = await extractionService.extractText(file.path, file.originalname, 'mineru', extractionOptions, s3Key, selectedPages);
+                        console.log(`🔄 Falling back to paddleocr for ${file.originalname}`);
+                        extractionResult = await extractionService.extractText(file.path, file.originalname, 'paddleocr', extractionOptions, s3Key, selectedPages);
 
-                        // Ensure fallback result has proper structure
                         if (!extractionResult.success) {
                             throw new Error(`Extraction failed after fallback: ${extractionResult.error}`);
                         }
-                        console.log(`✅ MinerU fallback extraction successful for ${file.originalname}`);
+                        console.log(`✅ PaddleOCR fallback extraction successful for ${file.originalname}`);
                     }
                 } else {
-                    // Use specified method (mineru/documentai/paddleocr) via Flask
+                    // paddleocr (default) or other supported method
                     extractionResult = await extractionService.extractText(file.path, file.originalname, extractionMethod, extractionOptions, s3Key, selectedPages);
                 }
 
@@ -3207,7 +3205,7 @@ async function processFilesAsync(job, files, schema, schemaName, processingConfi
  *                                    Optional, defaults provided below
  *                                    Structure: {
  *                                      extraction: {
- *                                        method: string,  // 'mineru' | 'documentai' | 'paddleocr' | 'extendai'
+ *                                        method: string,  // 'paddleocr' | 'extendai'
  *                                        options: Object  // Method-specific options
  *                                      },
  *                                      processing: {
@@ -4017,7 +4015,7 @@ async function startServer() {
         // Start the server
         server.listen(PORT, () => {
             logger.info(`AI Extractor server running on port ${PORT}`);
-            logger.info(`Flask service URL: ${FLASK_URL}`);
+            logger.info(`PaddleOCR service URL: ${PADDLEOCR_FLASK_URL}`);
             logger.info(`Socket.IO server ready for connections`);
         });
     } catch (error) {

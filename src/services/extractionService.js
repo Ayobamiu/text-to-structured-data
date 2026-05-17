@@ -6,12 +6,12 @@ import { PutObjectCommand } from '@aws-sdk/client-s3';
 import ExtendAIService from './extendAIService.js';
 import { extractPagesFromPdf } from './formationPageDetectionService.js';
 
-const FLASK_URL = process.env.FLASK_URL || "http://localhost:5001";
 const PADDLEOCR_FLASK_URL = process.env.PADDLEOCR_FLASK_URL || "http://localhost:5002";
+const DEFAULT_EXTRACTION_METHOD = 'paddleocr';
+const RETIRED_EXTRACTION_METHODS = new Set(['mineru', 'documentai']);
 
 class ExtractionService {
     constructor(s3Service = null) {
-        this.flaskUrl = FLASK_URL;
         this.paddleocrFlaskUrl = PADDLEOCR_FLASK_URL;
         this.extendAIService = new ExtendAIService();
         this.s3Service = s3Service; // Will be injected for S3 operations
@@ -21,84 +21,33 @@ class ExtractionService {
      * Extract text from PDF using the specified method
      * @param {string} filePath - Path to the PDF file
      * @param {string} filename - Original filename
-     * @param {string} method - Extraction method ('mineru', 'documentai', 'paddleocr', or 'extendai')
+     * @param {string} method - Extraction method ('paddleocr' or 'extendai')
      * @param {Object} options - Method-specific options
      * @param {string} s3Key - Optional S3 key if file is in S3 (required for extendai)
      * @param {number[]} selectedPages - Optional array of page numbers to extract (1-indexed, for paddleocr and extendai)
      * @returns {Promise<Object>} Extraction result
      */
-    async extractText(filePath, filename, method = 'mineru', options = {}, s3Key = null, selectedPages = null) {
+    async extractText(filePath, filename, method = DEFAULT_EXTRACTION_METHOD, options = {}, s3Key = null, selectedPages = null) {
         try {
             console.log(`📄 Extracting text using ${method} method for ${filename}`);
+
+            if (RETIRED_EXTRACTION_METHODS.has(method)) {
+                throw new Error(
+                    `Extraction method "${method}" is retired (legacy FLASK_URL service). Use "paddleocr" or "extendai".`
+                );
+            }
 
             // Handle ExtendAI extraction (requires S3 signed URL)
             if (method === 'extendai') {
                 return await this.extractWithExtendAI(filename, s3Key, options, selectedPages);
             }
 
-            // Handle PaddleOCR extraction (separate Flask service)
+            // Default: PaddleOCR (extract-paddle)
             if (method === 'paddleocr') {
                 return await this.extractWithPaddleOCR(filePath, filename, options, selectedPages);
             }
 
-            // Fall through to Flask service for mineru/documentai
-
-            const FormData = (await import('form-data')).default;
-            const formData = new FormData();
-            // Determine content type based on file extension
-            const isImage = /\.(png|jpg|jpeg|gif|bmp|tiff|tif|webp)$/i.test(filename);
-            const contentType = isImage ? "image/*" : "application/pdf";
-            formData.append("file", fs.createReadStream(filePath), {
-                filename: filename,
-                contentType: contentType,
-            });
-
-            // Add extraction method parameter
-            formData.append("extraction_method", method);
-
-            // Add any method-specific options
-            if (Object.keys(options).length > 0) {
-                formData.append("extraction_options", JSON.stringify(options));
-            }
-
-            console.log(`🌐 Calling Flask service: ${this.flaskUrl}/extract`);
-            const response = await axios.post(`${this.flaskUrl}/extract`, formData, {
-                headers: {
-                    ...formData.getHeaders(),
-                },
-                timeout: 2 * 1200000, // 40 minutes timeout for large files
-            });
-
-            if (!response.data.success) {
-                throw new Error(`Flask extraction failed: ${response.data.error}`);
-            }
-
-            const documentData = response.data.data;
-            const markdown = documentData.markdown || "";
-            const rawText = documentData.full_text || "";
-            const pages = documentData.pages || [];
-            const tables = documentData.tables || [];
-            const extraction_time_seconds = response.data.extraction_time_seconds || 0;
-
-            console.log(`✅ Extraction completed using ${method}: ${pages.length} pages, ${tables.length} tables, ${rawText.length} chars raw text, ${markdown.length} chars markdown`);
-
-            return {
-                success: true,
-                text: rawText,
-                tables: tables,
-                markdown: markdown,
-                pages: pages,
-                method: method,
-                extraction_time_seconds: extraction_time_seconds,
-                metadata: {
-                    extraction_method: method,
-                    extraction_options: options,
-                    total_pages: pages.length,
-                    total_tables: tables.length,
-                    text_length: rawText.length,
-                    markdown_length: markdown.length
-                }
-            };
+            throw new Error(`Unknown extraction method: ${method}`);
 
         } catch (error) {
             console.error(`❌ Extraction error with ${method}:`, error.message);
@@ -360,7 +309,7 @@ class ExtractionService {
     }
 
     /**
-     * Extract text using ExtendAI with fallback to mineru
+     * Extract text using ExtendAI with fallback to paddleocr (handled by caller)
      * @param {string} filename - Original filename
      * @param {string} s3Key - S3 key of the file
      * @param {Object} options - Extraction options
@@ -375,7 +324,7 @@ class ExtractionService {
             }
 
             if (!this.extendAIService.isConfigured()) {
-                console.warn('⚠️ ExtendAI not configured, falling back to mineru');
+                console.warn('⚠️ ExtendAI not configured, caller should fall back to paddleocr');
                 throw new Error('ExtendAI not configured');
             }
 
@@ -459,25 +408,21 @@ class ExtractionService {
             }
 
             console.warn(`⚠️ ExtendAI extraction failed: ${extendAIError.message}`);
-            console.log(`🔄 Falling back to mineru for ${filename}`);
+            console.log(`🔄 ExtendAI failed; caller may fall back to paddleocr for ${filename}`);
 
-            // Fallback to mineru
-            // Note: For fallback, we'd need the file path
-            // Since we only have S3 key, we need to download it first
-            // Or handle this in the calling code
             return {
                 success: false,
-                error: `ExtendAI failed: ${extendAIError.message}. Please retry with mineru method.`,
+                error: `ExtendAI failed: ${extendAIError.message}. Caller may retry with paddleocr.`,
                 method: 'extendai',
                 fallback_available: true,
-                fallback_method: 'mineru'
+                fallback_method: 'paddleocr'
             };
         }
     }
 
     /**
-     * Extract with fallback: try extendai, fallback to mineru
-     * @param {string} filePath - Path to local file (for mineru fallback)
+     * Extract with fallback: try extendai, fallback to paddleocr
+     * @param {string} filePath - Path to local file (for paddleocr fallback)
      * @param {string} filename - Original filename
      * @param {string} s3Key - S3 key (for extendai)
      * @param {Object} options - Extraction options
@@ -491,9 +436,8 @@ class ExtractionService {
             return extendAIResult;
         }
 
-        // Fallback to mineru
-        console.log(`📄 Falling back to mineru extraction for ${filename}`);
-        return await this.extractText(filePath, filename, 'mineru', options);
+        console.log(`📄 Falling back to paddleocr extraction for ${filename}`);
+        return await this.extractText(filePath, filename, 'paddleocr', options);
     }
 
     /**
@@ -501,7 +445,7 @@ class ExtractionService {
      * @returns {Array<string>} List of available methods
      */
     getAvailableMethods() {
-        const methods = ['mineru', 'documentai', 'paddleocr'];
+        const methods = ['paddleocr'];
         if (this.extendAIService.isConfigured()) {
             methods.push('extendai');
         }
@@ -515,16 +459,6 @@ class ExtractionService {
      */
     getDefaultOptions(method) {
         const defaultOptions = {
-            mineru: {
-                preserveFormatting: true,
-                extractTables: true,
-                extractImages: false
-            },
-            documentai: {
-                extractTables: true,
-                extractImages: false,
-                confidenceThreshold: 0.8
-            },
             extendai: {
                 extractTables: true,
                 extractImages: false

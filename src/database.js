@@ -52,7 +52,7 @@ export async function createJob(name, schema, schemaName, userId = null, organiz
 
         // Set default processing config if not provided
         const defaultProcessingConfig = {
-            extraction: { method: 'mineru', options: {} },
+            extraction: { method: 'paddleocr', options: {} },
             processing: { method: 'openai', model: 'gpt-4o', options: {} }
         };
 
