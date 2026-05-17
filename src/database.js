@@ -873,6 +873,7 @@ export async function getFileById(fileId, includeLargeColumns = false) {
                    jf.extraction_time_seconds, jf.ai_processing_time_seconds, 
                    jf.admin_verified, jf.customer_verified, jf.page_count,
                    jf.extraction_metadata, jf.job_id, jf.selected_pages,
+                   jf.detected_sections,
                    jf.review_status, jf.reviewed_by, jf.reviewed_at, jf.review_notes,
                    j.id as job_id, j.name as job_name, j.schema_data, j.processing_config
             FROM job_files jf
@@ -920,6 +921,43 @@ export async function getFileById(fileId, includeLargeColumns = false) {
             } catch (e) {
                 console.warn('⚠️ Failed to parse selected_pages in getFileById:', e.message);
                 file.selected_pages = null;
+            }
+        }
+
+        // detected_sections is small JSON — always selected so reprocess / worker
+        // can restore per-section routing without re-running the classifier.
+        if (file.detected_sections && typeof file.detected_sections === 'string') {
+            try {
+                file.detected_sections = JSON.parse(file.detected_sections);
+            } catch (e) {
+                console.warn('⚠️ Failed to parse detected_sections in getFileById:', e.message);
+                file.detected_sections = null;
+            }
+        }
+
+        // Defensive: large JSONB columns (pages, extracted_tables) usually
+        // come back as parsed objects/arrays from node-postgres, but in some
+        // pgbouncer / Supabase configurations they arrive as strings.
+        // Reprocess feeds these straight to the per-section extractor, which
+        // requires Array.isArray(pages) === true. Without this parse,
+        // reprocess silently falls through to the v1 single-schema path and
+        // returns a flat result keyed by the legacy job.schema_data.
+        if (includeLargeColumns) {
+            if (file.pages && typeof file.pages === 'string') {
+                try {
+                    file.pages = JSON.parse(file.pages);
+                } catch (e) {
+                    console.warn('⚠️ Failed to parse pages in getFileById:', e.message);
+                    file.pages = null;
+                }
+            }
+            if (file.extracted_tables && typeof file.extracted_tables === 'string') {
+                try {
+                    file.extracted_tables = JSON.parse(file.extracted_tables);
+                } catch (e) {
+                    console.warn('⚠️ Failed to parse extracted_tables in getFileById:', e.message);
+                    file.extracted_tables = null;
+                }
             }
         }
 

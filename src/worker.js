@@ -176,6 +176,11 @@ class FileProcessorWorker {
         const { fileId, jobId, retries, mode = 'normal' } = queueItem;
         console.log(`🔄 Processing file: ${fileId} (attempt ${retries + 1}, mode: ${mode})`);
 
+        // Clear per-file classifier stash so a previous job cannot leak
+        // detected_sections into this run (worker is single-threaded per poll).
+        this.lastClassifierMeta = null;
+        this.lastDetectedSections = null;
+
         // Declare confidentHits, preProcessingMetadata, usePageDetection, and jobProcessingConfig at function scope so they're accessible in all code paths
         let confidentHits = [];
         let preProcessingMetadata = {};
@@ -186,9 +191,10 @@ class FileProcessorWorker {
             // Mark file as processing
             await queueService.markFileAsProcessing(fileId);
 
-            // Get file details directly (lightweight - no large columns needed for processing)
-            // Include selected_pages which is small, so we can use it for extraction
-            const file = await getFileById(fileId, false);
+            // Get file details. Reprocess mode must load pages + text + markdown
+            // from DB (large columns); otherwise AI runs on empty input and
+            // per-section routing cannot see page-level text.
+            const file = await getFileById(fileId, mode === 'reprocess');
             if (!file) {
                 throw new Error(`File ${fileId} not found`);
             }
@@ -230,11 +236,57 @@ class FileProcessorWorker {
                 client.release();
             }
 
+            // Parsed processing_config — required for Stage 2 in every mode.
+            // Reprocess previously never assigned this (only extraction branches did),
+            // so resolveExtractionFlags(null) disabled per-section and forced v1.
+            jobProcessingConfig =
+                typeof job.processing_config === 'string'
+                    ? JSON.parse(job.processing_config)
+                    : job.processing_config || null;
+
             let extractionResult;
 
             if (mode === 'reprocess') {
                 // Reprocessing mode: Skip extraction, use existing text/markdown
                 console.log(`🔄 Reprocessing mode: Using existing extracted data for ${file.filename}`);
+
+                // Restore per-section routing from the persisted classifier
+                // output. This is what makes "Re-run AI Processing" alone
+                // (without re-extracting text) take the v2 envelope path
+                // instead of silently collapsing back to v1 — which is what
+                // produced flat results keyed by the legacy job.schema_data
+                // after a registry schema update.
+                const { usePerSection } = resolveExtractionFlags(jobProcessingConfig);
+                const reprocessSections =
+                    file.detected_sections &&
+                        Array.isArray(file.detected_sections.sections) &&
+                        file.detected_sections.sections.some(
+                            (s) => Array.isArray(s.extraction_pages) && s.extraction_pages.length > 0
+                        )
+                        ? file.detected_sections
+                        : null;
+
+                if (usePerSection && reprocessSections) {
+                    this.lastDetectedSections = reprocessSections;
+                    console.log(
+                        `🧩 Reprocess: reusing persisted detected_sections ` +
+                        `(${reprocessSections.sections.length} section(s)) for per-section AI`
+                    );
+                } else if (usePerSection && !reprocessSections) {
+                    // Per-section was requested but the file has no usable
+                    // classifier output. Falling back to v1 here would write
+                    // a flat result keyed by the stale job.schema_data,
+                    // which is exactly the original bug. Fail loudly so the
+                    // caller knows to re-run text extraction (which re-runs
+                    // the visual classifier and re-populates detected_sections).
+                    throw new Error(
+                        `Reprocess (AI-only) requested with per-section extraction enabled, ` +
+                        `but no detected_sections are stored for ${file.filename}. ` +
+                        `Re-run text extraction first so the visual classifier can populate routing.`
+                    );
+                } else {
+                    this.lastDetectedSections = null;
+                }
 
                 // Emit WebSocket event for reprocessing start
                 this.emitFileStatusUpdate(
@@ -245,16 +297,26 @@ class FileProcessorWorker {
                     `Starting reprocessing for ${file.filename}`
                 );
 
-                // Use existing extracted data
+                // Use existing extracted data. file.pages is normalised to
+                // an array by getFileById (handles JSONB-as-string edge case);
+                // the per-section extractor needs Array.isArray(pages) === true,
+                // so guard once more here.
+                const reprocessPages = Array.isArray(file.pages) ? file.pages : [];
                 extractionResult = {
                     success: true,
                     text: file.extracted_text || '',
-                    tables: file.extracted_tables || [],
+                    tables: Array.isArray(file.extracted_tables) ? file.extracted_tables : [],
                     markdown: file.markdown || '',
-                    pages: file.pages || []
+                    pages: reprocessPages,
                 };
 
-                console.log(`✅ Using existing extracted data for ${file.filename}`);
+                console.log(
+                    `✅ Using existing extracted data for ${file.filename} ` +
+                    `(text: ${(extractionResult.text || '').length} chars, ` +
+                    `markdown: ${(extractionResult.markdown || '').length} chars, ` +
+                    `pages: ${reprocessPages.length}, ` +
+                    `per-section: ${this.lastDetectedSections ? 'yes' : 'no'})`
+                );
 
             } else if (mode === 'extraction-only') {
                 // Extraction-only mode: Extract text but skip AI processing
@@ -811,6 +873,20 @@ class FileProcessorWorker {
                     (s) => Array.isArray(s.extraction_pages) && s.extraction_pages.length > 0
                 )
             );
+
+            if (usePerSection && !hasExtractableSections) {
+                console.warn(
+                    `⚠️ Per-section extraction requested but no extractable sections were ` +
+                    `found for ${file.filename}; falling through to v1 single-schema path. ` +
+                    `This usually means the visual classifier did not run or its output is missing.`
+                );
+            } else if (usePerSection && hasExtractableSections && !Array.isArray(extractionResult.pages)) {
+                console.warn(
+                    `⚠️ Per-section extraction requested with ${detectedSectionsForExtraction.sections.length} section(s) ` +
+                    `but extractionResult.pages is ${typeof extractionResult.pages}, not an array. ` +
+                    `Falling through to v1 single-schema path (this is a bug — pages should always be an array here).`
+                );
+            }
 
             if (usePerSection && hasExtractableSections && Array.isArray(extractionResult.pages)) {
                 console.log(
