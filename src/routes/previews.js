@@ -23,6 +23,13 @@ import {
     getPreviewStatistics
 } from '../database/previewDataTable.js';
 import mgsDataService from '../services/mgsDataService.js';
+import { authenticateToken, requireRole } from '../middleware/auth.js';
+import {
+    extractPreviewClientMeta,
+    upsertPreviewSession,
+    insertPreviewAnalyticsEvents,
+    getPreviewAnalyticsReport,
+} from '../database/previewAnalytics.js';
 
 const router = express.Router();
 
@@ -772,5 +779,117 @@ router.post('/files/bulk/enrich-with-mgs', async (req, res) => {
         });
     }
 });
+
+/**
+ * POST /previews/:id/analytics/events
+ * Public — record preview visitor activity (no auth on preview links).
+ */
+router.post('/:id/analytics/events', async (req, res) => {
+    try {
+        const { id: previewId } = req.params;
+        const { clientSessionId, events } = req.body || {};
+
+        if (!clientSessionId || typeof clientSessionId !== 'string') {
+            return res.status(400).json({
+                success: false,
+                message: 'clientSessionId is required',
+            });
+        }
+
+        if (!Array.isArray(events) || events.length === 0) {
+            return res.status(400).json({
+                success: false,
+                message: 'events must be a non-empty array',
+            });
+        }
+
+        if (events.length > 25) {
+            return res.status(400).json({
+                success: false,
+                message: 'Maximum 25 events per request',
+            });
+        }
+
+        const preview = await getPreviewDataTableById(previewId);
+        if (!preview) {
+            return res.status(404).json({
+                success: false,
+                message: 'Preview not found',
+            });
+        }
+
+        const meta = extractPreviewClientMeta(req);
+        const sessionId = await upsertPreviewSession(
+            previewId,
+            clientSessionId.slice(0, 64),
+            meta,
+        );
+
+        const inserted = await insertPreviewAnalyticsEvents({
+            previewId,
+            sessionId,
+            events,
+        });
+
+        res.status(201).json({
+            success: true,
+            data: { sessionId, inserted },
+        });
+    } catch (error) {
+        console.error('Error recording preview analytics:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Failed to record analytics',
+            error: error.message,
+        });
+    }
+});
+
+/**
+ * GET /previews/:id/analytics
+ * Admin — monitoring dashboard data for a preview link.
+ */
+router.get(
+    '/:id/analytics',
+    authenticateToken,
+    requireRole('admin'),
+    async (req, res) => {
+        try {
+            const { id: previewId } = req.params;
+            const preview = await getPreviewDataTableById(previewId);
+
+            if (!preview) {
+                return res.status(404).json({
+                    success: false,
+                    message: 'Preview not found',
+                });
+            }
+
+            const report = await getPreviewAnalyticsReport(previewId, {
+                days: req.query.days,
+                sessionLimit: req.query.sessionLimit,
+                eventLimit: req.query.eventLimit,
+            });
+
+            res.json({
+                success: true,
+                data: {
+                    preview: {
+                        id: preview.id,
+                        name: preview.name,
+                    },
+                    ...report,
+                },
+            });
+        } catch (error) {
+            console.error('Error fetching preview analytics:', error);
+            res.status(500).json({
+                success: false,
+                message: 'Failed to fetch preview analytics',
+                error: error.message,
+            });
+        }
+    },
+);
 
 export default router;
