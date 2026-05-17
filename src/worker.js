@@ -334,7 +334,7 @@ class FileProcessorWorker {
                 // Get extraction method from job processing config
                 // Parse processing_config if it's a string (JSON stored as text)
                 jobProcessingConfig = typeof job.processing_config === 'string' ? JSON.parse(job.processing_config) : job.processing_config;
-                const extractionMethod = jobProcessingConfig?.extraction?.method || 'mineru';
+                const extractionMethod = jobProcessingConfig?.extraction?.method || 'paddleocr';
                 const extractionOptions = jobProcessingConfig?.extraction?.options || {};
 
                 console.log(`📋 Using extraction method: ${extractionMethod} (from job processing config)`);
@@ -343,14 +343,13 @@ class FileProcessorWorker {
                 // the visual classifier (when enabled) narrows the page set.
                 const selectedPages = await this.deriveSelectedPages(file, jobProcessingConfig);
 
-                // Handle ExtendAI with fallback to mineru
+                // Handle ExtendAI with fallback to paddleocr
                 if (extractionMethod === 'extendai') {
                     extractionResult = await this.extractWithExtendAI(file, extractionOptions, selectedPages);
                     if (!extractionResult.success) {
                         console.log(`⚠️ ExtendAI failed: ${extractionResult.error}`);
-                        console.log(`🔄 Falling back to mineru for ${file.filename}`);
-                        // Fallback to mineru - extractFromS3File will download and process
-                        extractionResult = await this.extractFromS3File(file, 'mineru', extractionOptions, selectedPages);
+                        console.log(`🔄 Falling back to paddleocr for ${file.filename}`);
+                        extractionResult = await this.extractFromS3File(file, 'paddleocr', extractionOptions, selectedPages);
 
                         // Ensure fallback result has proper structure
                         if (!extractionResult.success) {
@@ -474,7 +473,7 @@ class FileProcessorWorker {
                 // Get extraction method from job processing config
                 // Parse processing_config if it's a string (JSON stored as text)
                 jobProcessingConfig = typeof job.processing_config === 'string' ? JSON.parse(job.processing_config) : job.processing_config;
-                const extractionMethod = jobProcessingConfig?.extraction?.method || 'mineru';
+                const extractionMethod = jobProcessingConfig?.extraction?.method || 'paddleocr';
                 const extractionOptions = jobProcessingConfig?.extraction?.options || {};
 
                 console.log(`📋 Using extraction method: ${extractionMethod} (from job processing config)`);
@@ -483,14 +482,13 @@ class FileProcessorWorker {
                 // the visual classifier (when enabled) narrows the page set.
                 const selectedPages = await this.deriveSelectedPages(file, jobProcessingConfig);
 
-                // Handle ExtendAI with fallback to mineru
+                // Handle ExtendAI with fallback to paddleocr
                 if (extractionMethod === 'extendai') {
                     extractionResult = await this.extractWithExtendAI(file, extractionOptions, selectedPages);
                     if (!extractionResult.success) {
                         console.log(`⚠️ ExtendAI failed: ${extractionResult.error}`);
-                        console.log(`🔄 Falling back to mineru for ${file.filename}`);
-                        // Fallback to mineru - extractFromS3File will download and process
-                        extractionResult = await this.extractFromS3File(file, 'mineru', extractionOptions, selectedPages);
+                        console.log(`🔄 Falling back to paddleocr for ${file.filename}`);
+                        extractionResult = await this.extractFromS3File(file, 'paddleocr', extractionOptions, selectedPages);
                     }
                 } else {
                     extractionResult = await this.extractTextFromFile(file, extractionMethod, extractionOptions, selectedPages);
@@ -595,7 +593,7 @@ class FileProcessorWorker {
                 // Get extraction method from job processing config
                 // Parse processing_config if it's a string (JSON stored as text)
                 jobProcessingConfig = typeof job.processing_config === 'string' ? JSON.parse(job.processing_config) : job.processing_config;
-                const extractionMethod = jobProcessingConfig?.extraction?.method || 'mineru';
+                const extractionMethod = jobProcessingConfig?.extraction?.method || 'paddleocr';
                 const extractionOptions = jobProcessingConfig?.extraction?.options || {};
 
                 console.log(`📋 Using extraction method: ${extractionMethod} (from job processing config)`);
@@ -604,14 +602,13 @@ class FileProcessorWorker {
                 // the visual classifier (when enabled) narrows the page set.
                 const selectedPages = await this.deriveSelectedPages(file, jobProcessingConfig);
 
-                // Handle ExtendAI with fallback to mineru
+                // Handle ExtendAI with fallback to paddleocr
                 if (extractionMethod === 'extendai') {
                     extractionResult = await this.extractWithExtendAI(file, extractionOptions, selectedPages);
                     if (!extractionResult.success) {
                         console.log(`⚠️ ExtendAI failed: ${extractionResult.error}`);
-                        console.log(`🔄 Falling back to mineru for ${file.filename}`);
-                        // Fallback to mineru - extractFromS3File will download and process
-                        extractionResult = await this.extractFromS3File(file, 'mineru', extractionOptions, selectedPages);
+                        console.log(`🔄 Falling back to paddleocr for ${file.filename}`);
+                        extractionResult = await this.extractFromS3File(file, 'paddleocr', extractionOptions, selectedPages);
 
                         // Ensure fallback result has proper structure
                         if (!extractionResult.success) {
@@ -1191,7 +1188,7 @@ class FileProcessorWorker {
         }
     }
 
-    async extractTextFromFile(file, method = 'mineru', options = {}, selectedPages = null) {
+    async extractTextFromFile(file, method = 'paddleocr', options = {}, selectedPages = null) {
         try {
             console.log(`📄 Extracting text from: ${file.filename} using ${method}`);
 
@@ -1217,7 +1214,7 @@ class FileProcessorWorker {
         }
     }
 
-    async extractFromS3File(file, method = 'mineru', options = {}, selectedPages = null) {
+    async extractFromS3File(file, method = 'paddleocr', options = {}, selectedPages = null) {
         try {
             console.log(`📄 Processing S3 file: ${file.s3_key} with ${method}`);
 

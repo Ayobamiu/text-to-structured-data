@@ -13,7 +13,7 @@ router.get('/health', async (req, res) => {
         services: {
             database: 'unknown',
             queue: 'unknown',
-            flask: 'unknown'
+            paddleocr: 'unknown'
         }
     };
 
@@ -42,28 +42,26 @@ router.get('/health', async (req, res) => {
     }
 
     try {
-        // Check Flask service (optional - only if FLASK_URL is set)
-        if (process.env.FLASK_URL) {
+        const paddleUrl = process.env.PADDLEOCR_FLASK_URL;
+        if (paddleUrl) {
             const axios = (await import('axios')).default;
-            const response = await axios.get(`${process.env.FLASK_URL}/health`, {
+            const response = await axios.get(`${paddleUrl}/health`, {
                 timeout: 5000
             });
 
             if (response.status === 200) {
-                healthCheck.services.flask = 'healthy';
+                healthCheck.services.paddleocr = 'healthy';
             } else {
-                healthCheck.services.flask = 'unhealthy';
+                healthCheck.services.paddleocr = 'unhealthy';
                 healthCheck.status = 'unhealthy';
             }
         } else {
-            healthCheck.services.flask = 'not configured';
-            logger.info('Flask service not configured (FLASK_URL not set)');
+            healthCheck.services.paddleocr = 'not configured';
         }
     } catch (error) {
-        logger.error('Flask service health check failed:', error);
-        healthCheck.services.flask = 'unhealthy';
-        // Don't fail the overall health check for Flask service
-        logger.warn('Flask service unavailable, but continuing with other health checks');
+        logger.error('PaddleOCR service health check failed:', error);
+        healthCheck.services.paddleocr = 'unhealthy';
+        logger.warn('PaddleOCR service unavailable, but continuing with other health checks');
     }
 
     const statusCode = healthCheck.status === 'healthy' ? 200 : 503;
