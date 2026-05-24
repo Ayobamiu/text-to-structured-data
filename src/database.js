@@ -1001,9 +1001,9 @@ export async function getFileResult(fileId) {
         const query = `
             SELECT jf.id, jf.filename, jf.result, jf.page_count, jf.markdown,
                    jf.extraction_status, jf.processing_status, jf.extraction_error, jf.processing_error, jf.processed_at,
-                   jf.job_id, j.name as job_name, j.schema_data, j.document_type_slug, jf.upload_status, jf.upload_error, 
+                   jf.job_id, j.name as job_name, j.schema_data, j.document_type_slug, jf.upload_status, jf.upload_error,
                    jf.storage_type, jf.retry_count, jf.last_retry_at, jf.extraction_time_seconds, jf.ai_processing_time_seconds,
-                   jf.admin_verified, jf.customer_verified, jf.extraction_metadata,
+                   jf.admin_verified, jf.customer_verified, jf.extraction_metadata, jf.processing_metadata,
                    jf.review_status, jf.reviewed_by, jf.reviewed_at, jf.review_notes,
                    jf.detected_sections, jf.s3_key, jf.selected_pages
             FROM job_files jf
