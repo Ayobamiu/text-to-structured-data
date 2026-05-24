@@ -3,6 +3,7 @@ import { v4 as uuidv4 } from 'uuid';
 import dotenv from 'dotenv';
 import { FileProcessingPipeline } from './pipeline/FileProcessingPipeline.js';
 import { resolvePgPoolConfig } from './utils/pgConnection.js';
+import { computeFlags } from './services/constraintsService.js';
 
 // Only load .env file in development
 if (process.env.NODE_ENV !== 'production') {
@@ -599,6 +600,27 @@ export async function updateFileProcessingStatus(fileId, status, result = null, 
             }
         }
 
+        // Compute constraint flags (server-side, stored in DB)
+        let flags = [];
+        if (status === 'completed' && finalResult) {
+            try {
+                const flagsInfoQuery = `SELECT job_id, filename FROM job_files WHERE id = $1`;
+                const flagsInfoResult = await client.query(flagsInfoQuery, [fileId]);
+                if (flagsInfoResult.rows.length > 0) {
+                    flags = computeFlags({
+                        jobId: flagsInfoResult.rows[0].job_id,
+                        filename: flagsInfoResult.rows[0].filename,
+                        processingStatus: status,
+                        result: finalResult,
+                        processingMetadata: finalMetadata,
+                    });
+                }
+            } catch (flagsError) {
+                console.error(`⚠️ Flags computation failed for file ${fileId}:`, flagsError.message);
+                // Continue with empty flags
+            }
+        }
+
         // Build update query - include actual_result if we need to set it
         let query;
         let values;
@@ -606,11 +628,11 @@ export async function updateFileProcessingStatus(fileId, status, result = null, 
         if (actualResultToSave !== null) {
             // First time saving - set both actual_result and result, plus source_locations
             query = `
-                UPDATE job_files 
-                SET processing_status = $1, result = $2, actual_result = $3, processing_error = $4, 
-                    processed_at = $5, processing_metadata = $6, ai_processing_time_seconds = $7, 
-                    source_locations = $8, updated_at = NOW()
-                WHERE id = $9
+                UPDATE job_files
+                SET processing_status = $1, result = $2, actual_result = $3, processing_error = $4,
+                    processed_at = $5, processing_metadata = $6, ai_processing_time_seconds = $7,
+                    source_locations = $8, flags = $9, updated_at = NOW()
+                WHERE id = $10
                 RETURNING id, job_id, filename
             `;
             const processedAt = status === 'completed' || status === 'failed' ? new Date() : null;
@@ -623,16 +645,17 @@ export async function updateFileProcessingStatus(fileId, status, result = null, 
                 finalMetadata ? JSON.stringify(finalMetadata) : null,
                 aiProcessingTimeSeconds,
                 sourceLocations ? JSON.stringify(sourceLocations) : null,
+                JSON.stringify(flags),
                 fileId
             ];
         } else {
             // Not first time - only update result and source_locations (actual_result stays unchanged)
             query = `
-                UPDATE job_files 
-                SET processing_status = $1, result = $2, processing_error = $3, 
-                    processed_at = $4, processing_metadata = $5, ai_processing_time_seconds = $6, 
-                    source_locations = $7, updated_at = NOW()
-                WHERE id = $8
+                UPDATE job_files
+                SET processing_status = $1, result = $2, processing_error = $3,
+                    processed_at = $4, processing_metadata = $5, ai_processing_time_seconds = $6,
+                    source_locations = $7, flags = $8, updated_at = NOW()
+                WHERE id = $9
                 RETURNING id, job_id, filename
             `;
             const processedAt = status === 'completed' || status === 'failed' ? new Date() : null;
@@ -644,6 +667,7 @@ export async function updateFileProcessingStatus(fileId, status, result = null, 
                 finalMetadata ? JSON.stringify(finalMetadata) : null,
                 aiProcessingTimeSeconds,
                 sourceLocations ? JSON.stringify(sourceLocations) : null,
+                JSON.stringify(flags),
                 fileId
             ];
         }
@@ -977,9 +1001,9 @@ export async function getFileResult(fileId) {
         const query = `
             SELECT jf.id, jf.filename, jf.result, jf.page_count, jf.markdown,
                    jf.extraction_status, jf.processing_status, jf.extraction_error, jf.processing_error, jf.processed_at,
-                   jf.job_id, j.name as job_name, j.schema_data, j.document_type_slug, jf.upload_status, jf.upload_error, 
+                   jf.job_id, j.name as job_name, j.schema_data, j.document_type_slug, jf.upload_status, jf.upload_error,
                    jf.storage_type, jf.retry_count, jf.last_retry_at, jf.extraction_time_seconds, jf.ai_processing_time_seconds,
-                   jf.admin_verified, jf.customer_verified, jf.extraction_metadata,
+                   jf.admin_verified, jf.customer_verified, jf.extraction_metadata, jf.processing_metadata,
                    jf.review_status, jf.reviewed_by, jf.reviewed_at, jf.review_notes,
                    jf.detected_sections, jf.s3_key, jf.selected_pages
             FROM job_files jf
@@ -1388,8 +1412,15 @@ export async function getAllFiles(limit = 50, offset = 0, status = null, jobId =
                 jf.review_notes,
                 (jf.result IS NOT NULL) as has_result,
                 (jf.extraction_metadata->>'extraction_method') as extraction_method,
-                '[]'::jsonb as flags,
-                (SELECT COUNT(*)::int FROM preview_data_table pdt WHERE jf.id = ANY(pdt.items_ids)) as previews_count
+                jf.flags,
+                (
+                    SELECT COALESCE(jsonb_agg(jsonb_build_object(
+                        'id', pdt.id,
+                        'name', pdt.name
+                    )), '[]'::jsonb)
+                    FROM preview_data_table pdt
+                    WHERE jf.id = ANY(pdt.items_ids)
+                ) as previews
             FROM job_files jf
             LEFT JOIN jobs j ON jf.job_id = j.id
             ${whereConditions}

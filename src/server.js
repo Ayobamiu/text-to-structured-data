@@ -56,6 +56,7 @@ import ExtractionService from "./services/extractionService.js";
 import groqService from "./services/groqService.js";
 import { recordCorrections } from "./services/correctionsService.js";
 import { getPdfPageCount } from "./utils/pdfUtils.js";
+import { computeFlags } from "./services/constraintsService.js";
 import {
     PROCESSING_METHODS,
     DEFAULT_MODELS,
@@ -1403,16 +1404,26 @@ app.put("/files/:id/results", authenticateToken, async (req, res) => {
         // Update file results in database
         const client = await pool.connect();
         try {
+            // Recompute flags based on updated result
+            const flags = computeFlags({
+                jobId: file.job_id,
+                filename: file.filename,
+                processingStatus: file.processing_status || 'completed',
+                result: resultWithoutSourceLocations,
+                processingMetadata: file.processing_metadata || null,
+            });
+
             const updateQuery = `
-                UPDATE job_files 
-                SET result = $1, source_locations = $2, updated_at = NOW()
-                WHERE id = $3
+                UPDATE job_files
+                SET result = $1, source_locations = $2, flags = $3, updated_at = NOW()
+                WHERE id = $4
                 RETURNING id, filename, result
             `;
 
             const updateResult = await client.query(updateQuery, [
                 JSON.stringify(resultWithoutSourceLocations),
                 sourceLocations ? JSON.stringify(sourceLocations) : null,
+                JSON.stringify(flags),
                 id
             ]);
 
