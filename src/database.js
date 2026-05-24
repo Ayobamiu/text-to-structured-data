@@ -1416,8 +1416,7 @@ export async function getAllFiles(limit = 50, offset = 0, status = null, jobId =
                 (
                     SELECT COALESCE(jsonb_agg(jsonb_build_object(
                         'id', pdt.id,
-                        'name', pdt.name,
-                        'slug', pdt.slug
+                        'name', pdt.name
                     )), '[]'::jsonb)
                     FROM preview_data_table pdt
                     WHERE jf.id = ANY(pdt.items_ids)
