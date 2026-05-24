@@ -4,6 +4,7 @@ import dotenv from 'dotenv';
 import { FileProcessingPipeline } from './pipeline/FileProcessingPipeline.js';
 import { resolvePgPoolConfig } from './utils/pgConnection.js';
 import { computeFlags } from './services/constraintsService.js';
+import { incrementTotal, adjustExtractionStatus, adjustProcessingStatus, decrementTotal, getStats } from './database/jobFileStats.js';
 
 // Only load .env file in development
 if (process.env.NODE_ENV !== 'production') {
@@ -137,6 +138,14 @@ export async function addFileToJob(jobId, filename, size, s3Key, fileHash, uploa
         ];
 
         const result = await client.query(query, values);
+
+        // Phase 4: Increment stats counters (same connection, best-effort)
+        try {
+            await incrementTotal(client, jobId);
+        } catch (statsError) {
+            console.warn(`⚠️ Stats increment failed for job ${jobId}:`, statsError.message);
+        }
+
         console.log(`✅ File added to job: ${fileId}`);
         return result.rows[0];
     } catch (error) {
@@ -222,35 +231,22 @@ export async function updateFileS3Info(fileId, s3Key, fileHash) {
 }
 
 // Get job details with summary (combined - single connection, parallel queries)
+// Phase 4: Uses job_file_stats O(1) lookup with fallback to COUNT(*) for jobs without stats rows.
 export async function getJobDetailsWithSummary(jobId) {
     const client = await pool.connect();
     try {
         // Set statement timeout for this connection (30 seconds)
         await client.query('SET statement_timeout = 30000');
 
-        // Run both queries in parallel on the same connection
-        const [jobResult, summaryResult] = await Promise.all([
+        // Run job query + stats table lookup in parallel
+        const [jobResult, statsResult] = await Promise.all([
             client.query(`
-                SELECT id, name, status, schema_data, user_id, organization_id, 
+                SELECT id, name, status, schema_data, user_id, organization_id,
                        created_at, updated_at, extraction_mode, processing_config
                 FROM jobs WHERE id = $1
             `, [jobId]),
             client.query(`
-                SELECT 
-                    COUNT(*) as total,
-                    COUNT(*) FILTER (WHERE extraction_status = 'pending') as extraction_pending,
-                    COUNT(*) FILTER (WHERE extraction_status = 'processing') as extraction_processing,
-                    COUNT(*) FILTER (WHERE extraction_status = 'completed') as extraction_completed,
-                    COUNT(*) FILTER (WHERE extraction_status = 'failed') as extraction_failed,
-                    COUNT(*) FILTER (WHERE processing_status = 'pending') as processing_pending,
-                    COUNT(*) FILTER (WHERE processing_status = 'processing') as processing_processing,
-                    COUNT(*) FILTER (WHERE processing_status = 'completed') as processing_completed,
-                    COUNT(*) FILTER (WHERE processing_status = 'failed') as processing_failed,
-                    -- Combined counts for summary display
-                    COUNT(*) FILTER (WHERE extraction_status = 'processing' OR processing_status = 'processing') as processing,
-                    COUNT(*) FILTER (WHERE extraction_status = 'pending' AND processing_status = 'pending') as pending
-                FROM job_files
-                WHERE job_id = $1
+                SELECT * FROM job_file_stats WHERE job_id = $1
             `, [jobId])
         ]);
 
@@ -276,38 +272,78 @@ export async function getJobDetailsWithSummary(jobId) {
             processing_config: processingConfig
         };
 
-        // Parse summary
+        // Parse summary — prefer O(1) stats table, fall back to COUNT(*) for un-migrated jobs
         let summary;
-        if (summaryResult.rows.length === 0) {
+        if (statsResult.rows.length > 0) {
+            // O(1) path: read from pre-computed stats row
+            const row = statsResult.rows[0];
+            const ep = row.extraction_pending;
+            const epr = row.extraction_processing;
+            const pp = row.processing_pending;
+            const ppr = row.processing_processing;
             summary = {
-                total: 0,
-                extraction_pending: 0,
-                extraction_processing: 0,
-                extraction_completed: 0,
-                extraction_failed: 0,
-                processing_pending: 0,
-                processing_processing: 0,
-                processing_completed: 0,
-                processing_failed: 0,
-                processing: 0,
-                pending: 0
+                total: row.total,
+                extraction_pending: ep,
+                extraction_processing: epr,
+                extraction_completed: row.extraction_completed,
+                extraction_failed: row.extraction_failed,
+                processing_pending: pp,
+                processing_processing: ppr,
+                processing_completed: row.processing_completed,
+                processing_failed: row.processing_failed,
+                // Combined counts for summary display
+                processing: epr + ppr,
+                pending: Math.min(ep, pp) // both extraction & processing pending
             };
         } else {
-            const row = summaryResult.rows[0];
-            summary = {
-                total: parseInt(row.total, 10),
-                extraction_pending: parseInt(row.extraction_pending, 10),
-                extraction_processing: parseInt(row.extraction_processing, 10),
-                extraction_completed: parseInt(row.extraction_completed, 10),
-                extraction_failed: parseInt(row.extraction_failed, 10),
-                processing_pending: parseInt(row.processing_pending, 10),
-                processing_processing: parseInt(row.processing_processing, 10),
-                processing_completed: parseInt(row.processing_completed, 10),
-                processing_failed: parseInt(row.processing_failed, 10),
-                // Combined counts for summary display
-                processing: parseInt(row.processing || 0, 10),
-                pending: parseInt(row.pending || 0, 10)
-            };
+            // Fallback: COUNT(*) for jobs that existed before stats table
+            const summaryResult = await client.query(`
+                SELECT
+                    COUNT(*) as total,
+                    COUNT(*) FILTER (WHERE extraction_status = 'pending') as extraction_pending,
+                    COUNT(*) FILTER (WHERE extraction_status = 'processing') as extraction_processing,
+                    COUNT(*) FILTER (WHERE extraction_status = 'completed') as extraction_completed,
+                    COUNT(*) FILTER (WHERE extraction_status = 'failed') as extraction_failed,
+                    COUNT(*) FILTER (WHERE processing_status = 'pending') as processing_pending,
+                    COUNT(*) FILTER (WHERE processing_status = 'processing') as processing_processing,
+                    COUNT(*) FILTER (WHERE processing_status = 'completed') as processing_completed,
+                    COUNT(*) FILTER (WHERE processing_status = 'failed') as processing_failed,
+                    COUNT(*) FILTER (WHERE extraction_status = 'processing' OR processing_status = 'processing') as processing,
+                    COUNT(*) FILTER (WHERE extraction_status = 'pending' AND processing_status = 'pending') as pending
+                FROM job_files
+                WHERE job_id = $1
+            `, [jobId]);
+
+            if (summaryResult.rows.length === 0) {
+                summary = {
+                    total: 0,
+                    extraction_pending: 0,
+                    extraction_processing: 0,
+                    extraction_completed: 0,
+                    extraction_failed: 0,
+                    processing_pending: 0,
+                    processing_processing: 0,
+                    processing_completed: 0,
+                    processing_failed: 0,
+                    processing: 0,
+                    pending: 0
+                };
+            } else {
+                const row = summaryResult.rows[0];
+                summary = {
+                    total: parseInt(row.total, 10),
+                    extraction_pending: parseInt(row.extraction_pending, 10),
+                    extraction_processing: parseInt(row.extraction_processing, 10),
+                    extraction_completed: parseInt(row.extraction_completed, 10),
+                    extraction_failed: parseInt(row.extraction_failed, 10),
+                    processing_pending: parseInt(row.processing_pending, 10),
+                    processing_processing: parseInt(row.processing_processing, 10),
+                    processing_completed: parseInt(row.processing_completed, 10),
+                    processing_failed: parseInt(row.processing_failed, 10),
+                    processing: parseInt(row.processing || 0, 10),
+                    pending: parseInt(row.pending || 0, 10)
+                };
+            }
         }
 
         return {
@@ -442,6 +478,22 @@ export async function updateFileExtractionStatus(
 ) {
     const client = await pool.connect();
     try {
+        // Phase 4: Get old status for counter adjustment
+        let oldExtractionStatus = null;
+        let jobIdForStats = null;
+        try {
+            const oldStatusResult = await client.query(
+                `SELECT extraction_status, job_id FROM job_files WHERE id = $1`,
+                [fileId]
+            );
+            if (oldStatusResult.rows.length > 0) {
+                oldExtractionStatus = oldStatusResult.rows[0].extraction_status;
+                jobIdForStats = oldStatusResult.rows[0].job_id;
+            }
+        } catch (statsLookupError) {
+            console.warn(`⚠️ Stats lookup failed for file ${fileId}:`, statsLookupError.message);
+        }
+
         // Query does NOT include page_count - we preserve the original value
         const query = `
             UPDATE job_files 
@@ -494,6 +546,15 @@ export async function updateFileExtractionStatus(
             throw new Error('File not found');
         }
 
+        // Phase 4: Adjust extraction stats counter (best-effort)
+        if (jobIdForStats && oldExtractionStatus && oldExtractionStatus !== status) {
+            try {
+                await adjustExtractionStatus(client, jobIdForStats, oldExtractionStatus, status);
+            } catch (statsError) {
+                console.warn(`⚠️ Stats extraction adjustment failed for job ${jobIdForStats}:`, statsError.message);
+            }
+        }
+
         console.log(`✅ File extraction status updated: ${fileId} -> ${status}${extractionTimeSeconds ? ` (${extractionTimeSeconds}s)` : ''}`);
         return result.rows[0];
     } catch (error) {
@@ -508,6 +569,22 @@ export async function updateFileExtractionStatus(
 export async function updateFileProcessingStatus(fileId, status, result = null, error = null, metadata = null, aiProcessingTimeSeconds = null) {
     const client = await pool.connect();
     try {
+        // Phase 4: Get old processing status for counter adjustment
+        let oldProcessingStatus = null;
+        let jobIdForStats = null;
+        try {
+            const oldStatusResult = await client.query(
+                `SELECT processing_status, job_id FROM job_files WHERE id = $1`,
+                [fileId]
+            );
+            if (oldStatusResult.rows.length > 0) {
+                oldProcessingStatus = oldStatusResult.rows[0].processing_status;
+                jobIdForStats = oldStatusResult.rows[0].job_id;
+            }
+        } catch (statsLookupError) {
+            console.warn(`⚠️ Stats lookup failed for file ${fileId}:`, statsLookupError.message);
+        }
+
         // Extract source_locations from result if present, and remove it from result
         let sourceLocations = null;
         let resultWithoutSourceLocations = result;
@@ -675,6 +752,15 @@ export async function updateFileProcessingStatus(fileId, status, result = null, 
 
         if (queryResult.rows.length === 0) {
             throw new Error('File not found');
+        }
+
+        // Phase 4: Adjust processing stats counter (best-effort)
+        if (jobIdForStats && oldProcessingStatus && oldProcessingStatus !== status) {
+            try {
+                await adjustProcessingStatus(client, jobIdForStats, oldProcessingStatus, status);
+            } catch (statsError) {
+                console.warn(`⚠️ Stats processing adjustment failed for job ${jobIdForStats}:`, statsError.message);
+            }
         }
 
         console.log(`✅ File processing status updated: ${fileId} -> ${status}${aiProcessingTimeSeconds ? ` (${aiProcessingTimeSeconds}s)` : ''}`);
