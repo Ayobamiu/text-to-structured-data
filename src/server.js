@@ -168,12 +168,12 @@ io.on('connection', (socket) => {
         logger.info(`Client disconnected: ${socket.id}`);
     });
 
-    // Handle events from worker process
+    // Handle events from worker process — convert to standardized patch format
     socket.on('file-status-update', (data) => {
         logger.info(`Received file-status-update from worker:`, data);
-        // Broadcast to all clients in the job room
-        io.to(`job-${data.jobId}`).emit('file-status-update', data);
-        logger.info(`Broadcasted file-status-update to job-${data.jobId}`);
+        const { jobId, fileId, message, timestamp, error, ...patch } = data;
+        emitFilePatch(jobId, fileId, patch);
+        logger.info(`Broadcasted file-status-update to job-${jobId}`);
     });
 
     socket.on('job-status-update', (data) => {
@@ -184,6 +184,24 @@ io.on('connection', (socket) => {
     });
 });
 
+
+/**
+ * Phase 2: Standardized file-status-update emitter.
+ * Every emit now uses this helper so the client receives a consistent shape:
+ *   { jobId, fileId, patch: { ...changedColumns }, version: ISO string }
+ *
+ * `patch` contains only the columns that actually changed — the client
+ * merges them into its local row without refetching.
+ */
+function emitFilePatch(jobId, fileId, patch) {
+    const version = new Date().toISOString();
+    io.to(`job-${jobId}`).emit('file-status-update', {
+        jobId,
+        fileId,
+        patch,
+        version,
+    });
+}
 
 // Apply JSON parsing only to specific routes (not multipart routes)
 app.use('/jobs', express.json());
@@ -1437,13 +1455,9 @@ app.put("/files/:id/results", authenticateToken, async (req, res) => {
             const updatedFile = updateResult.rows[0];
 
             // Emit file update event via WebSocket
-            io.to(`job-${file.job_id}`).emit('file-status-update', {
-                jobId: file.job_id,
-                fileId: updatedFile.id,
-                filename: updatedFile.filename,
-                result: parsedResults,
-                message: `File results updated for ${updatedFile.filename}`,
-                updated_at: new Date().toISOString()
+            emitFilePatch(file.job_id, updatedFile.id, {
+                has_result: true,
+                flags,
             });
 
             // Fire-and-forget: log this edit to field_corrections so we have
@@ -1748,17 +1762,11 @@ app.put("/files/bulk/review", authenticateToken, async (req, res) => {
         const jobIds = new Set();
         for (const file of updatedFiles) {
             jobIds.add(file.job_id);
-            const updateEvent = {
-                jobId: file.job_id,
-                fileId: file.id,
-                filename: file.filename,
+            emitFilePatch(file.job_id, file.id, {
                 review_status: file.review_status,
                 reviewed_by: file.reviewed_by,
                 reviewed_at: file.reviewed_at,
-                message: `File review status updated to ${reviewStatus} for ${file.filename}`,
-                timestamp: new Date().toISOString()
-            };
-            io.to(`job-${file.job_id}`).emit('file-status-update', updateEvent);
+            });
         }
 
         res.json({
@@ -1858,16 +1866,10 @@ app.put("/files/bulk/verify", authenticateToken, requireRole('admin'), async (re
 
         // Emit WebSocket events for each updated file
         for (const file of updatedFiles) {
-            const updateEvent = {
-                jobId: file.job_id,
-                fileId: file.id,
-                filename: file.filename,
+            emitFilePatch(file.job_id, file.id, {
                 admin_verified: file.admin_verified,
                 customer_verified: file.customer_verified,
-                message: `File verification updated for ${file.filename}`,
-                timestamp: new Date().toISOString()
-            };
-            io.to(`job-${file.job_id}`).emit('file-status-update', updateEvent);
+            });
         }
 
         res.json({
@@ -1984,20 +1986,13 @@ app.put("/files/bulk/review-and-verify", authenticateToken, requireRole('admin')
 
         // Emit WebSocket events for each updated file
         for (const file of updatedFiles) {
-            const updateEvent = {
-                jobId: file.job_id,
-                fileId: file.id,
-                filename: file.filename,
+            emitFilePatch(file.job_id, file.id, {
                 review_status: file.review_status,
                 reviewed_by: file.reviewed_by,
                 reviewed_at: file.reviewed_at,
                 admin_verified: file.admin_verified,
                 customer_verified: file.customer_verified,
-                message: `File review and verification updated for ${file.filename}`,
-                timestamp: new Date().toISOString()
-            };
-            console.log(`📡 Emitting file-status-update for review-and-verify:`, updateEvent);
-            io.to(`job-${file.job_id}`).emit('file-status-update', updateEvent);
+            });
         }
 
         res.json({
@@ -2058,18 +2053,11 @@ app.put("/files/:id/review", authenticateToken, async (req, res) => {
         );
 
         // Emit file update event via WebSocket
-        const updateEvent = {
-            jobId: file.job_id,
-            fileId: result.id,
-            filename: result.filename,
+        emitFilePatch(file.job_id, result.id, {
             review_status: result.review_status,
             reviewed_by: result.reviewed_by,
             reviewed_at: result.reviewed_at,
-            message: `File review status updated to ${reviewStatus} for ${result.filename}`,
-            timestamp: new Date().toISOString()
-        };
-        console.log(`📡 Emitting file-status-update for review:`, updateEvent);
-        io.to(`job-${file.job_id}`).emit('file-status-update', updateEvent);
+        });
 
         res.json({
             status: "success",
@@ -2129,13 +2117,8 @@ async function loadFileWithSections(fileId, res) {
 }
 
 function emitDetectedSectionsUpdate(file, detectedSections) {
-    io.to(`job-${file.job_id}`).emit('file-status-update', {
-        jobId: file.job_id,
-        fileId: file.id,
-        filename: file.filename,
+    emitFilePatch(file.job_id, file.id, {
         detected_sections: detectedSections,
-        message: `Routing updated for ${file.filename}`,
-        timestamp: new Date().toISOString(),
     });
 }
 
@@ -2282,17 +2265,10 @@ app.put("/files/:id/verify", authenticateToken, requireRole('admin'), async (req
         );
 
         // Emit file update event via WebSocket
-        const updateEvent = {
-            jobId: file.job_id,
-            fileId: result.id,
-            filename: result.filename,
+        emitFilePatch(file.job_id, result.id, {
             admin_verified: result.admin_verified,
             customer_verified: result.customer_verified,
-            message: `File verification updated for ${result.filename}`,
-            timestamp: new Date().toISOString()
-        };
-        console.log(`📡 Emitting file-status-update for verification:`, updateEvent);
-        io.to(`job-${file.job_id}`).emit('file-status-update', updateEvent);
+        });
 
         res.json({
             status: "success",
@@ -2414,16 +2390,14 @@ app.post("/jobs/:id/files", authenticateToken, upload.array("files", 20), async 
 
         // Emit socket events for each newly added file to notify frontend immediately
         for (const fileRecord of addedFiles) {
-            io.to(`job-${jobId}`).emit('file-status-update', {
-                jobId,
-                fileId: fileRecord.id,
+            emitFilePatch(jobId, fileRecord.id, {
+                _newFile: true,
                 filename: fileRecord.filename,
                 extraction_status: 'pending',
                 processing_status: 'pending',
-                message: `File ${fileRecord.filename} added to job`,
-                timestamp: new Date().toISOString()
+                size: fileRecord.size || 0,
+                created_at: fileRecord.created_at || new Date().toISOString(),
             });
-            console.log(`📡 Emitted file-status-update for newly added file: ${fileRecord.id} - ${fileRecord.filename}`);
         }
 
         res.json({
@@ -2664,13 +2638,9 @@ async function processFilesAsync(job, files, schema, schemaName, processingConfi
                 console.log(`\n--- Processing file ${i + 1}/${files.length}: ${file.originalname} ---`);
 
                 // Emit file processing started event
-                io.to(`job-${job.id}`).emit('file-status-update', {
-                    jobId: job.id,
-                    fileId: fileRecord.id,
-                    filename: file.originalname,
+                emitFilePatch(job.id, fileRecord.id, {
                     extraction_status: 'processing',
                     processing_status: 'pending',
-                    message: `Starting extraction for ${file.originalname}...`
                 });
 
                 // Step 1: Update file extraction status to processing
@@ -2912,13 +2882,10 @@ async function processFilesAsync(job, files, schema, schemaName, processingConfi
                     });
 
                     // Emit file processing completed event
-                    io.to(`job-${job.id}`).emit('file-status-update', {
-                        jobId: job.id,
-                        fileId: fileRecord.id,
-                        filename: file.originalname,
+                    emitFilePatch(job.id, fileRecord.id, {
                         extraction_status: 'completed',
                         processing_status: 'completed',
-                        message: `Text extraction completed for ${file.originalname} (text-only mode)`
+                        has_result: true,
                     });
 
                     console.log(`✅ Text-only processing completed for ${file.originalname}`);
@@ -2927,13 +2894,9 @@ async function processFilesAsync(job, files, schema, schemaName, processingConfi
                     console.log(`🤖 Full extraction mode: Processing ${file.originalname} with AI...`);
 
                     // Emit extraction completed event
-                    io.to(`job-${job.id}`).emit('file-status-update', {
-                        jobId: job.id,
-                        fileId: fileRecord.id,
-                        filename: file.originalname,
+                    emitFilePatch(job.id, fileRecord.id, {
                         extraction_status: 'completed',
                         processing_status: 'processing',
-                        message: `Extraction completed for ${file.originalname}. Starting AI processing...`
                     });
 
                     // Step 4: Update file processing status to processing
@@ -3058,14 +3021,10 @@ async function processFilesAsync(job, files, schema, schemaName, processingConfi
                             perSection.totalAiTimeSeconds || null
                         );
 
-                        io.to(`job-${job.id}`).emit('file-status-update', {
-                            jobId: job.id,
-                            fileId: fileRecord.id,
-                            filename: file.originalname,
+                        emitFilePatch(job.id, fileRecord.id, {
                             extraction_status: 'completed',
                             processing_status: 'completed',
-                            message: `Successfully processed ${file.originalname} (${successCount} section(s))`,
-                            result: perSection.resultEnvelope,
+                            has_result: true,
                         });
 
                         // Skip the v1 single-schema path below.
@@ -3099,14 +3058,10 @@ async function processFilesAsync(job, files, schema, schemaName, processingConfi
                     await updateFileProcessingStatus(fileRecord.id, 'completed', processingResult.data, null, finalMetadata, aiProcessingTimeSeconds);
 
                     // Emit file processing completed event
-                    io.to(`job-${job.id}`).emit('file-status-update', {
-                        jobId: job.id,
-                        fileId: fileRecord.id,
-                        filename: file.originalname,
+                    emitFilePatch(job.id, fileRecord.id, {
                         extraction_status: 'completed',
                         processing_status: 'completed',
-                        message: `Successfully processed ${file.originalname}`,
-                        result: processingResult.data
+                        has_result: true,
                     });
                 }
 
@@ -3114,14 +3069,10 @@ async function processFilesAsync(job, files, schema, schemaName, processingConfi
                 console.error(`Error processing file ${file.originalname}:`, fileError.message);
 
                 // Emit file error event
-                io.to(`job-${job.id}`).emit('file-status-update', {
-                    jobId: job.id,
-                    fileId: fileRecord.id,
-                    filename: file.originalname,
+                emitFilePatch(job.id, fileRecord.id, {
                     extraction_status: fileRecord.extraction_status === 'processing' ? 'failed' : fileRecord.extraction_status,
                     processing_status: fileRecord.processing_status === 'processing' ? 'failed' : fileRecord.processing_status,
-                    message: `Error processing ${file.originalname}: ${fileError.message}`,
-                    error: fileError.message
+                    processing_error: fileError.message,
                 });
 
                 // Update file status to failed with timing
@@ -3436,16 +3387,14 @@ app.post("/extract", authenticateToken, upload.array("files", 20), async (req, r
             });
 
             // Emit socket event for each newly created file to notify frontend immediately
-            io.to(`job-${job.id}`).emit('file-status-update', {
-                jobId: job.id,
-                fileId: fileRecord.id,
+            emitFilePatch(job.id, fileRecord.id, {
+                _newFile: true,
                 filename: file.originalname,
                 extraction_status: 'pending',
                 processing_status: 'pending',
-                message: `File ${file.originalname} added to job`,
-                timestamp: new Date().toISOString()
+                size: file.size || 0,
+                created_at: new Date().toISOString(),
             });
-            console.log(`📡 Emitted file-status-update for newly created file: ${fileRecord.id} - ${file.originalname}`);
         }
 
         // Return jobId and file information immediately for better UX
