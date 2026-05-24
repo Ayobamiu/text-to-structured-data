@@ -57,6 +57,7 @@ import groqService from "./services/groqService.js";
 import { recordCorrections } from "./services/correctionsService.js";
 import { getPdfPageCount } from "./utils/pdfUtils.js";
 import { computeFlags } from "./services/constraintsService.js";
+import { decrementTotal } from "./database/jobFileStats.js";
 import {
     PROCESSING_METHODS,
     DEFAULT_MODELS,
@@ -3460,7 +3461,7 @@ app.delete("/files/:fileId", authenticateToken, async (req, res) => {
         const client = await pool.connect();
         try {
             const deleteQuery = `
-                DELETE FROM job_files 
+                DELETE FROM job_files
                 WHERE id = $1
                 RETURNING id, filename, job_id
             `;
@@ -3475,6 +3476,13 @@ app.delete("/files/:fileId", authenticateToken, async (req, res) => {
             }
 
             const deletedFile = deleteResult.rows[0];
+
+            // Phase 4: Decrement stats counters (best-effort)
+            try {
+                await decrementTotal(client, deletedFile.job_id, file.extraction_status, file.processing_status);
+            } catch (statsError) {
+                console.warn(`⚠️ Stats decrement failed for job ${deletedFile.job_id}:`, statsError.message);
+            }
 
             // Remove file from processing queue if it exists
             try {
@@ -3566,6 +3574,13 @@ app.delete("/files", authenticateToken, async (req, res) => {
                             filename: deletedFile.filename,
                             jobId: deletedFile.job_id
                         });
+
+                        // Phase 4: Decrement stats counters (best-effort)
+                        try {
+                            await decrementTotal(client, deletedFile.job_id, file.extraction_status, file.processing_status);
+                        } catch (statsError) {
+                            console.warn(`⚠️ Stats decrement failed for job ${deletedFile.job_id}:`, statsError.message);
+                        }
 
                         // Remove file from processing queue if it exists
                         try {
