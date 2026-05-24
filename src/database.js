@@ -1359,18 +1359,11 @@ export async function getAllFiles(limit = 50, offset = 0, status = null, jobId =
             pending: parseInt(countResult.rows[0].pending)
         };
 
-        // Large columns that should only be fetched when explicitly needed
-        // These columns can be very large (extracted_text can be MBs per file)
-        // Large columns: actual_result, extracted_text, extracted_tables, pages, openai_feed_blocked, openai_feed_unblocked, source_locations, raw_data
-        // Note: result and markdown are always included
-        const largeColumns = includeLargeColumns
-            ? 'jf.actual_result, jf.extracted_text, jf.extracted_tables, jf.pages, jf.openai_feed_blocked, jf.openai_feed_unblocked, jf.source_locations, jf.raw_data,'
-            : '';
-
-        // Get paginated files with preview data
-        // Always include result and markdown
+        // Phase 1: Skinny list — only columns needed to render a table row.
+        // Heavy columns (result, markdown, extraction_metadata, processing_metadata)
+        // are fetched on-demand in the detail/fullscreen view.
         const filesQuery = `
-            SELECT 
+            SELECT
                 jf.id,
                 jf.filename,
                 jf.size,
@@ -1383,45 +1376,24 @@ export async function getAllFiles(limit = 50, offset = 0, status = null, jobId =
                 jf.job_id,
                 j.name as job_name,
                 j.extraction_mode as job_extraction_mode,
-                jf.result,
-                jf.markdown,
-                ${largeColumns}
                 jf.extraction_error,
                 jf.processing_error,
                 jf.page_count,
                 jf.selected_pages,
                 jf.admin_verified,
                 jf.customer_verified,
-                jf.extraction_metadata,
-                jf.processing_metadata,
                 jf.review_status,
                 jf.reviewed_by,
                 jf.reviewed_at,
                 jf.review_notes,
-                COALESCE(
-                    JSON_AGG(
-                        CASE 
-                            WHEN pdt.id IS NOT NULL 
-                            THEN JSON_BUILD_OBJECT(
-                                'id', pdt.id,
-                                'name', pdt.name,
-                                'created_at', pdt.created_at
-                            )
-                            ELSE NULL
-                        END
-                    ) FILTER (WHERE pdt.id IS NOT NULL),
-                    '[]'::json
-                ) as previews
+                (jf.result IS NOT NULL) as has_result,
+                (jf.extraction_metadata->>'extraction_method') as extraction_method,
+                '[]'::jsonb as flags,
+                (SELECT COUNT(*)::int FROM preview_data_table pdt WHERE jf.id = ANY(pdt.items_ids)) as previews_count
             FROM job_files jf
             LEFT JOIN jobs j ON jf.job_id = j.id
-            LEFT JOIN preview_data_table pdt ON jf.id = ANY(pdt.items_ids)
             ${whereConditions}
-            GROUP BY jf.id, jf.filename, jf.size, jf.extraction_status, jf.processing_status,
-                     jf.extraction_time_seconds, jf.ai_processing_time_seconds, jf.created_at,
-                     jf.processed_at, jf.job_id, j.name, j.extraction_mode, jf.result, jf.markdown${includeLargeColumns ? ', jf.actual_result, jf.extracted_text, jf.extracted_tables, jf.pages, jf.openai_feed_blocked, jf.openai_feed_unblocked, jf.source_locations, jf.raw_data' : ''},
-                     jf.extraction_error, jf.processing_error, jf.admin_verified,
-                     jf.customer_verified, jf.page_count, jf.selected_pages, jf.extraction_metadata, jf.processing_metadata
-            ORDER BY jf.created_at DESC 
+            ORDER BY jf.created_at DESC
             LIMIT $${++paramCount} OFFSET $${++paramCount}
         `;
 

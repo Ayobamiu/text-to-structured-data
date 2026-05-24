@@ -241,6 +241,41 @@ class MGSDataService {
 
         return result;
     }
+
+    /**
+     * Resolve MGS inventory county names for a set of permit numbers.
+     * @param {string[]} permitNumbers
+     * @returns {Promise<Record<string, string>>}
+     */
+    async getCountyMapByPermitNumbers(permitNumbers = []) {
+        const permits = [
+            ...new Set(
+                (permitNumbers || [])
+                    .map((p) => p?.toString().trim())
+                    .filter(Boolean)
+            ),
+        ];
+
+        if (permits.length === 0) {
+            return {};
+        }
+
+        const csvData = await this.loadCSVData();
+        const permitSet = new Set(permits);
+        const map = {};
+
+        for (const row of csvData) {
+            const permit = row.permit_no?.toString().trim();
+            if (!permit || !permitSet.has(permit) || map[permit]) {
+                continue;
+            }
+            if (row.CNTY_NAME) {
+                map[permit] = row.CNTY_NAME.trim();
+            }
+        }
+
+        return map;
+    }
 }
 
 const datumMap = {

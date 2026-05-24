@@ -46,6 +46,7 @@ import queueService from "./queue.js";
 import authRoutes from "./routes/auth.js";
 import organizationRoutes from "./routes/organizations.js";
 import previewRoutes, { setWebSocketInstance } from "./routes/previews.js";
+import mgsRoutes from "./routes/mgs.js";
 import healthRoutes from "./routes/health.js";
 import { authenticateToken, optionalAuth, securityHeaders, requireRole } from "./middleware/auth.js";
 import { rateLimitConfig } from "./auth.js";
@@ -139,6 +140,9 @@ app.use('/organizations', organizationRoutes);
 // Preview routes
 app.use('/previews', express.json());
 app.use('/previews', previewRoutes);
+
+app.use('/mgs', express.json());
+app.use('/mgs', authenticateToken, mgsRoutes);
 
 // Health check routes (no auth required)
 app.use('/', healthRoutes);

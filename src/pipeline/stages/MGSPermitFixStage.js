@@ -37,15 +37,18 @@ export class MGSPermitFixStage extends PipelineStage {
 
         // Step 1: Fix permit number
         let finalResult = mgsDataService.autoFixPermitNumber(result, filename);
+        const extractedCountyFromDocument = finalResult?.county || null;
         console.log(`✅ Step 1: Permit number fixed for ${filename}`);
 
         // Step 2: Look up and merge MGS data
         const permitNumber = mgsDataService.extractPermitFromData(finalResult);
+        let mgsExpectedCounty = null;
         if (permitNumber) {
             console.log(`🔍 Step 2: Looking up MGS data for permit ${permitNumber}`);
             try {
                 const mgsData = await mgsDataService.getMGSDataByPermitNumber(permitNumber);
                 if (mgsData) {
+                    mgsExpectedCounty = mgsData.county || null;
                     finalResult = mgsDataService.mergeMGSData(finalResult, mgsData);
                     console.log(`✅ Step 2: MGS data populated for permit ${permitNumber}`);
 
@@ -64,12 +67,24 @@ export class MGSPermitFixStage extends PipelineStage {
             console.log(`⚠️ Step 2: No permit number found, skipping MGS data lookup`);
         }
 
+        const priorMetadata =
+            context.metadata && typeof context.metadata === 'object'
+                ? context.metadata
+                : {};
+
         return {
             ...context,
             result: finalResult,
+            metadata: {
+                ...priorMetadata,
+                mgs_expected_county: mgsExpectedCounty,
+                extracted_county: extractedCountyFromDocument,
+            },
             mgsProcessing: {
                 success: true,
-                permitNumber: permitNumber || null
+                permitNumber: permitNumber || null,
+                mgsExpectedCounty,
+                extractedCounty: extractedCountyFromDocument,
             }
         };
     }
