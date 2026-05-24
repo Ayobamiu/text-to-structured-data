@@ -1507,7 +1507,8 @@ app.put("/files/:id/results", authenticateToken, async (req, res) => {
                 data: {
                     fileId: updatedFile.id,
                     filename: updatedFile.filename,
-                    results: parsedResults
+                    results: parsedResults,
+                    flags
                 }
             });
 
