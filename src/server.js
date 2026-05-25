@@ -2576,9 +2576,23 @@ app.post("/pdf/page-count", authenticateToken, upload.single("file"), async (req
 });
 
 // Get all files across all jobs
+// Phase 6: supports search, filter by status, and server-side sort
 app.get("/files", authenticateToken, async (req, res) => {
     try {
-        const { limit = 50, offset = 0, status, jobId } = req.query;
+        const {
+            limit = 50,
+            offset = 0,
+            status,
+            jobId,
+            // Phase 6 params
+            search,
+            extractionStatus,
+            processingStatus,
+            reviewStatus,
+            hasResult,
+            sortField,
+            sortOrder,
+        } = req.query;
 
         // Get user's organization IDs (with JWT optimization)
         const organizationIds = await getUserOrganizationIds(req.user);
@@ -2588,13 +2602,24 @@ app.get("/files", authenticateToken, async (req, res) => {
             parseInt(offset),
             status || null,
             jobId || null,
-            organizationIds
+            organizationIds,
+            false, // includeLargeColumns
+            {
+                search: search || null,
+                extractionStatus: extractionStatus || null,
+                processingStatus: processingStatus || null,
+                reviewStatus: reviewStatus || null,
+                hasResult: hasResult != null ? hasResult : null,
+                sortField: sortField || null,
+                sortOrder: sortOrder || null,
+            }
         );
 
         res.json({
             status: "success",
             files: result.files,
             total: result.total,
+            filteredTotal: result.filteredTotal,
             stats: result.stats,
             limit: parseInt(limit),
             offset: parseInt(offset),

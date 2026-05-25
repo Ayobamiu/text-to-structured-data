@@ -1407,7 +1407,28 @@ export async function closePool() {
 // Get all files across all jobs with pagination
 // Returns files from jobs in organizations the user is a member of (any role)
 // OPTIMIZED: Excludes large columns (extracted_text, markdown, result, etc.) by default to reduce egress
-export async function getAllFiles(limit = 50, offset = 0, status = null, jobId = null, organizationIds = null, includeLargeColumns = false) {
+// Phase 6: Server-side search, filter & sort.
+// Allowed sort columns — whitelist to prevent SQL injection via ORDER BY.
+const ALLOWED_SORT_COLUMNS = {
+    'filename': 'jf.filename',
+    'size': 'jf.size',
+    'created_at': 'jf.created_at',
+    'processed_at': 'jf.processed_at',
+    'extraction_status': 'jf.extraction_status',
+    'processing_status': 'jf.processing_status',
+    'review_status': 'jf.review_status',
+    'page_count': 'jf.page_count',
+};
+
+export async function getAllFiles(limit = 50, offset = 0, status = null, jobId = null, organizationIds = null, includeLargeColumns = false, {
+    search = null,
+    extractionStatus = null,
+    processingStatus = null,
+    reviewStatus = null,
+    hasResult = null,
+    sortField = null,
+    sortOrder = null,
+} = {}) {
     const client = await pool.connect();
     try {
         // Build base query conditions
@@ -1415,6 +1436,7 @@ export async function getAllFiles(limit = 50, offset = 0, status = null, jobId =
         const params = [];
         let paramCount = 0;
 
+        // Legacy status filter (matches either extraction or processing)
         if (status) {
             paramCount++;
             whereConditions += ` AND (jf.extraction_status = $${paramCount} OR jf.processing_status = $${paramCount})`;
@@ -1437,6 +1459,7 @@ export async function getAllFiles(limit = 50, offset = 0, status = null, jobId =
             return {
                 files: [],
                 total: 0,
+                filteredTotal: 0,
                 stats: {
                     total: 0,
                     completed: 0,
@@ -1447,9 +1470,52 @@ export async function getAllFiles(limit = 50, offset = 0, status = null, jobId =
             };
         }
 
-        // Get total count and file statistics
+        // --- Phase 6 filters ---
+
+        // Filename search (trigram / ILIKE)
+        if (search && typeof search === 'string' && search.trim().length > 0) {
+            paramCount++;
+            whereConditions += ` AND jf.filename ILIKE $${paramCount}`;
+            params.push(`%${search.trim()}%`);
+        }
+
+        // Specific status filters
+        if (extractionStatus) {
+            const validStatuses = ['pending', 'processing', 'completed', 'failed'];
+            if (validStatuses.includes(extractionStatus)) {
+                paramCount++;
+                whereConditions += ` AND jf.extraction_status = $${paramCount}`;
+                params.push(extractionStatus);
+            }
+        }
+
+        if (processingStatus) {
+            const validStatuses = ['pending', 'processing', 'completed', 'failed'];
+            if (validStatuses.includes(processingStatus)) {
+                paramCount++;
+                whereConditions += ` AND jf.processing_status = $${paramCount}`;
+                params.push(processingStatus);
+            }
+        }
+
+        if (reviewStatus) {
+            const validStatuses = ['pending', 'approved', 'rejected', 'needs_review'];
+            if (validStatuses.includes(reviewStatus)) {
+                paramCount++;
+                whereConditions += ` AND jf.review_status = $${paramCount}`;
+                params.push(reviewStatus);
+            }
+        }
+
+        if (hasResult === true || hasResult === 'true') {
+            whereConditions += ` AND jf.result IS NOT NULL`;
+        } else if (hasResult === false || hasResult === 'false') {
+            whereConditions += ` AND jf.result IS NULL`;
+        }
+
+        // Get total count and file statistics (respects filters)
         const countQuery = `
-            SELECT 
+            SELECT
                 COUNT(*) as total,
                 COUNT(CASE WHEN jf.processing_status = 'completed' THEN 1 END) as completed,
                 COUNT(CASE WHEN jf.processing_status = 'processing' THEN 1 END) as processing,
@@ -1468,6 +1534,12 @@ export async function getAllFiles(limit = 50, offset = 0, status = null, jobId =
             failed: parseInt(countResult.rows[0].failed),
             pending: parseInt(countResult.rows[0].pending)
         };
+
+        // --- Phase 6 sort ---
+        const sortCol = ALLOWED_SORT_COLUMNS[sortField] || 'jf.created_at';
+        const sortDir = sortOrder === 'ascend' ? 'ASC' : 'DESC';
+        // Secondary sort on id for stable ordering when primary column has ties
+        const orderClause = `ORDER BY ${sortCol} ${sortDir}, jf.id DESC`;
 
         // Phase 1: Skinny list — only columns needed to render a table row.
         // Heavy columns (result, markdown, extraction_metadata, processing_metadata)
@@ -1510,7 +1582,7 @@ export async function getAllFiles(limit = 50, offset = 0, status = null, jobId =
             FROM job_files jf
             LEFT JOIN jobs j ON jf.job_id = j.id
             ${whereConditions}
-            ORDER BY jf.created_at DESC
+            ${orderClause}
             LIMIT $${++paramCount} OFFSET $${++paramCount}
         `;
 
@@ -1520,6 +1592,7 @@ export async function getAllFiles(limit = 50, offset = 0, status = null, jobId =
         return {
             files: filesResult.rows,
             total: stats.total,
+            filteredTotal: stats.total,
             stats: stats
         };
     } catch (error) {
