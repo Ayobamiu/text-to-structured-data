@@ -35,7 +35,9 @@ import pool, {
     bulkUpdateFileReviewStatus,
     bulkUpdateFileVerification,
     updateFileDetectedSections,
-    userHasJobAccess
+    userHasJobAccess,
+    getFileSkinnyRow,
+    updateFileSelectedPages
 } from "./database.js";
 import { getUserById } from "./database/users.js";
 import { getUserOrganizations } from "./database/userOrganizationMemberships.js";
@@ -173,7 +175,17 @@ io.on('connection', (socket) => {
     socket.on('file-status-update', (data) => {
         logger.info(`Received file-status-update from worker:`, data);
         const { jobId, fileId, message, timestamp, error, ...patch } = data;
-        emitFilePatch(jobId, fileId, patch);
+        // Include message in the patch so the client can display live notifications
+        if (message) patch._message = message;
+
+        // Terminal status (completed/failed): emit full skinny row so the client
+        // gets flags, model, has_result, previews — everything that changed.
+        const isTerminal = patch.processing_status === 'completed' || patch.processing_status === 'failed';
+        if (isTerminal) {
+            emitFileFullPatch(jobId, fileId, { ...patch, has_result: patch.processing_status === 'completed' });
+        } else {
+            emitFilePatch(jobId, fileId, patch);
+        }
         logger.info(`Broadcasted file-status-update to job-${jobId}`);
     });
 
@@ -202,6 +214,30 @@ function emitFilePatch(jobId, fileId, patch) {
         patch,
         version,
     });
+}
+
+/**
+ * Emit a *complete* skinny-row patch after a terminal status change
+ * (completed / failed). Re-reads the row from DB so the client gets
+ * every derived field (flags, has_result, model, previews, etc.)
+ * without needing a full page refresh.
+ *
+ * Falls back to a minimal patch if the DB read fails.
+ */
+async function emitFileFullPatch(jobId, fileId, fallbackPatch = {}) {
+    try {
+        const row = await getFileSkinnyRow(fileId);
+        if (row) {
+            // Remove heavy/redundant fields the client already has
+            const { id, job_id, job_name, job_extraction_mode, ...patch } = row;
+            emitFilePatch(jobId, fileId, patch);
+        } else {
+            emitFilePatch(jobId, fileId, fallbackPatch);
+        }
+    } catch (err) {
+        console.warn(`⚠️ emitFileFullPatch failed for ${fileId}:`, err.message);
+        emitFilePatch(jobId, fileId, fallbackPatch);
+    }
 }
 
 // Apply JSON parsing only to specific routes (not multipart routes)
@@ -1455,8 +1491,8 @@ app.put("/files/:id/results", authenticateToken, async (req, res) => {
 
             const updatedFile = updateResult.rows[0];
 
-            // Emit file update event via WebSocket
-            emitFilePatch(file.job_id, updatedFile.id, {
+            // Emit full row so client gets flags, model, previews, etc.
+            await emitFileFullPatch(file.job_id, updatedFile.id, {
                 has_result: true,
                 flags,
             });
@@ -1760,11 +1796,11 @@ app.put("/files/bulk/review", authenticateToken, async (req, res) => {
             reviewNotes || null
         );
 
-        // Emit WebSocket events for each updated file
+        // Emit full row for each updated file so client gets flags etc.
         const jobIds = new Set();
         for (const file of updatedFiles) {
             jobIds.add(file.job_id);
-            emitFilePatch(file.job_id, file.id, {
+            await emitFileFullPatch(file.job_id, file.id, {
                 review_status: file.review_status,
                 reviewed_by: file.reviewed_by,
                 reviewed_at: file.reviewed_at,
@@ -1866,9 +1902,9 @@ app.put("/files/bulk/verify", authenticateToken, requireRole('admin'), async (re
             updateData.customerVerified !== undefined ? updateData.customerVerified : null
         );
 
-        // Emit WebSocket events for each updated file
+        // Emit full row for each updated file so client gets flags etc.
         for (const file of updatedFiles) {
-            emitFilePatch(file.job_id, file.id, {
+            await emitFileFullPatch(file.job_id, file.id, {
                 admin_verified: file.admin_verified,
                 customer_verified: file.customer_verified,
             });
@@ -1986,9 +2022,9 @@ app.put("/files/bulk/review-and-verify", authenticateToken, requireRole('admin')
             };
         });
 
-        // Emit WebSocket events for each updated file
+        // Emit full row for each updated file so client gets flags etc.
         for (const file of updatedFiles) {
-            emitFilePatch(file.job_id, file.id, {
+            await emitFileFullPatch(file.job_id, file.id, {
                 review_status: file.review_status,
                 reviewed_by: file.reviewed_by,
                 reviewed_at: file.reviewed_at,
@@ -2054,8 +2090,8 @@ app.put("/files/:id/review", authenticateToken, async (req, res) => {
             reviewNotes || null
         );
 
-        // Emit file update event via WebSocket
-        emitFilePatch(file.job_id, result.id, {
+        // Emit full row so client gets flags etc.
+        await emitFileFullPatch(file.job_id, result.id, {
             review_status: result.review_status,
             reviewed_by: result.reviewed_by,
             reviewed_at: result.reviewed_at,
@@ -2266,8 +2302,8 @@ app.put("/files/:id/verify", authenticateToken, requireRole('admin'), async (req
             updateData.customerVerified !== undefined ? updateData.customerVerified : null
         );
 
-        // Emit file update event via WebSocket
-        emitFilePatch(file.job_id, result.id, {
+        // Emit full row so client gets flags etc.
+        await emitFileFullPatch(file.job_id, result.id, {
             admin_verified: result.admin_verified,
             customer_verified: result.customer_verified,
         });
@@ -2717,6 +2753,12 @@ async function processFilesAsync(job, files, schema, schemaName, processingConfi
                     usePerSection,
                 });
 
+                // Persist classifier-derived pages so the skinny list can
+                // show "X of Y" in the Pages column (same as manual selection).
+                if (selectedPages && selectedPages.length > 0 && !fileForHelper.selected_pages) {
+                    await updateFileSelectedPages(fileRecord.id, selectedPages);
+                }
+
                 // When the visual classifier is explicitly enabled but failed,
                 // abort rather than silently extracting every page.
                 if (classifierFailed) {
@@ -2908,8 +2950,8 @@ async function processFilesAsync(job, files, schema, schemaName, processingConfi
                         pages: pages
                     });
 
-                    // Emit file processing completed event
-                    emitFilePatch(job.id, fileRecord.id, {
+                    // Emit full row patch so client gets flags, model, etc.
+                    await emitFileFullPatch(job.id, fileRecord.id, {
                         extraction_status: 'completed',
                         processing_status: 'completed',
                         has_result: true,
@@ -3048,7 +3090,7 @@ async function processFilesAsync(job, files, schema, schemaName, processingConfi
                             perSection.totalAiTimeSeconds || null
                         );
 
-                        emitFilePatch(job.id, fileRecord.id, {
+                        await emitFileFullPatch(job.id, fileRecord.id, {
                             extraction_status: 'completed',
                             processing_status: 'completed',
                             has_result: true,
@@ -3084,8 +3126,8 @@ async function processFilesAsync(job, files, schema, schemaName, processingConfi
                     // Step 7: Update file processing status to completed with timing
                     await updateFileProcessingStatus(fileRecord.id, 'completed', processingResult.data, null, finalMetadata, aiProcessingTimeSeconds);
 
-                    // Emit file processing completed event
-                    emitFilePatch(job.id, fileRecord.id, {
+                    // Emit full row patch so client gets flags, model, etc.
+                    await emitFileFullPatch(job.id, fileRecord.id, {
                         extraction_status: 'completed',
                         processing_status: 'completed',
                         has_result: true,
@@ -3095,7 +3137,7 @@ async function processFilesAsync(job, files, schema, schemaName, processingConfi
             } catch (fileError) {
                 console.error(`Error processing file ${file.originalname}:`, fileError.message);
 
-                // Emit file error event
+                // Emit quick failure patch for immediate UI feedback
                 emitFilePatch(job.id, fileRecord.id, {
                     extraction_status: fileRecord.extraction_status === 'processing' ? 'failed' : fileRecord.extraction_status,
                     processing_status: fileRecord.processing_status === 'processing' ? 'failed' : fileRecord.processing_status,
@@ -3104,14 +3146,19 @@ async function processFilesAsync(job, files, schema, schemaName, processingConfi
 
                 // Update file status to failed with timing
                 if (fileRecord.extraction_status === 'processing') {
-                    // Calculate partial extraction time if extraction was started
                     const partialExtractionTime = 0
                     await updateFileExtractionStatus(fileRecord.id, 'failed', null, null, null, null, fileError.message, partialExtractionTime);
                 } else if (fileRecord.processing_status === 'processing') {
-                    // Calculate partial AI processing time if AI processing was started
                     const partialAiProcessingTime = 0;
                     await updateFileProcessingStatus(fileRecord.id, 'failed', null, fileError.message, null, partialAiProcessingTime);
                 }
+
+                // Now that DB is updated, emit full row so client gets all columns
+                await emitFileFullPatch(job.id, fileRecord.id, {
+                    extraction_status: fileRecord.extraction_status === 'processing' ? 'failed' : fileRecord.extraction_status,
+                    processing_status: fileRecord.processing_status === 'processing' ? 'failed' : fileRecord.processing_status,
+                    processing_error: fileError.message,
+                });
             } finally {
                 // Clean up uploaded file
                 console.log(`Cleaning up uploaded file: ${file.path}`);
