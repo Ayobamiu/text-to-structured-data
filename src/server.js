@@ -175,6 +175,8 @@ io.on('connection', (socket) => {
         const { jobId, fileId, message, timestamp, error, ...patch } = data;
         // Include message in the patch so the client can display live notifications
         if (message) patch._message = message;
+        // When processing completes, flag has_result so the UI shows the view icon
+        if (patch.processing_status === 'completed') patch.has_result = true;
         emitFilePatch(jobId, fileId, patch);
         logger.info(`Broadcasted file-status-update to job-${jobId}`);
     });

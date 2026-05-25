@@ -1570,6 +1570,7 @@ export async function getAllFiles(limit = 50, offset = 0, status = null, jobId =
                 jf.review_notes,
                 (jf.result IS NOT NULL) as has_result,
                 (jf.extraction_metadata->>'extraction_method') as extraction_method,
+                (jf.processing_metadata->>'model') as processing_model,
                 jf.flags,
                 (
                     SELECT COALESCE(jsonb_agg(jsonb_build_object(
@@ -1589,8 +1590,21 @@ export async function getAllFiles(limit = 50, offset = 0, status = null, jobId =
         params.push(parseInt(limit), parseInt(offset));
         const filesResult = await client.query(filesQuery, params);
 
+        // Parse JSONB fields that may come as strings in some pg configurations
+        const files = filesResult.rows.map(file => {
+            if (file.selected_pages && typeof file.selected_pages === 'string') {
+                try { file.selected_pages = JSON.parse(file.selected_pages); }
+                catch { file.selected_pages = null; }
+            }
+            if (file.flags && typeof file.flags === 'string') {
+                try { file.flags = JSON.parse(file.flags); }
+                catch { file.flags = []; }
+            }
+            return file;
+        });
+
         return {
-            files: filesResult.rows,
+            files,
             total: stats.total,
             filteredTotal: stats.total,
             stats: stats
