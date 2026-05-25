@@ -565,6 +565,24 @@ export async function updateFileExtractionStatus(
     }
 }
 
+// Persist the derived selected_pages array (e.g. from the visual classifier).
+// Lightweight UPDATE — only touches selected_pages so it can run alongside
+// other status updates without conflicting.
+export async function updateFileSelectedPages(fileId, selectedPages) {
+    const client = await pool.connect();
+    try {
+        await client.query(
+            `UPDATE job_files SET selected_pages = $1, updated_at = NOW() WHERE id = $2`,
+            [selectedPages ? JSON.stringify(selectedPages) : null, fileId]
+        );
+    } catch (error) {
+        console.warn(`⚠️ Failed to persist selected_pages for file ${fileId}:`, error.message);
+        // Non-fatal — the extraction can proceed without this column being set
+    } finally {
+        client.release();
+    }
+}
+
 // Update file processing status
 export async function updateFileProcessingStatus(fileId, status, result = null, error = null, metadata = null, aiProcessingTimeSeconds = null) {
     const client = await pool.connect();
@@ -1612,6 +1630,73 @@ export async function getAllFiles(limit = 50, offset = 0, status = null, jobId =
     } catch (error) {
         console.error('Error fetching all files:', error.message);
         throw error;
+    } finally {
+        client.release();
+    }
+}
+
+/**
+ * Fetch a single file's "skinny" row — the same columns the list query returns.
+ * Used to build a complete socket patch after a status change so the client
+ * can update its local row fully without refetching.
+ */
+export async function getFileSkinnyRow(fileId) {
+    const client = await pool.connect();
+    try {
+        const result = await client.query(`
+            SELECT
+                jf.id,
+                jf.filename,
+                jf.size,
+                jf.extraction_status,
+                jf.processing_status,
+                jf.extraction_time_seconds,
+                jf.ai_processing_time_seconds,
+                jf.created_at,
+                jf.processed_at,
+                jf.job_id,
+                j.name as job_name,
+                j.extraction_mode as job_extraction_mode,
+                jf.extraction_error,
+                jf.processing_error,
+                jf.page_count,
+                jf.selected_pages,
+                jf.admin_verified,
+                jf.customer_verified,
+                jf.review_status,
+                jf.reviewed_by,
+                jf.reviewed_at,
+                jf.review_notes,
+                (jf.result IS NOT NULL) as has_result,
+                (jf.extraction_metadata->>'extraction_method') as extraction_method,
+                (jf.processing_metadata->>'model') as processing_model,
+                jf.flags,
+                (
+                    SELECT COALESCE(jsonb_agg(jsonb_build_object(
+                        'id', pdt.id,
+                        'name', pdt.name
+                    )), '[]'::jsonb)
+                    FROM preview_data_table pdt
+                    WHERE jf.id = ANY(pdt.items_ids)
+                ) as previews
+            FROM job_files jf
+            LEFT JOIN jobs j ON jf.job_id = j.id
+            WHERE jf.id = $1
+        `, [fileId]);
+
+        if (result.rows.length === 0) return null;
+
+        const file = result.rows[0];
+        // Parse JSONB fields that may come as strings
+        if (file.selected_pages && typeof file.selected_pages === 'string') {
+            try { file.selected_pages = JSON.parse(file.selected_pages); }
+            catch { file.selected_pages = null; }
+        }
+        if (file.flags && typeof file.flags === 'string') {
+            try { file.flags = JSON.parse(file.flags); }
+            catch { file.flags = []; }
+        }
+        return file;
     } finally {
         client.release();
     }

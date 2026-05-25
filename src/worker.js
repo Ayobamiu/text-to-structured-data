@@ -8,7 +8,8 @@ import {
     getFileById,
     updateFileExtractionStatus,
     updateFileProcessingStatus,
-    updateJobStatus
+    updateJobStatus,
+    updateFileSelectedPages
 } from './database.js';
 import S3Service from './s3Service.js';
 import ExtractionService from './services/extractionService.js';
@@ -1140,6 +1141,12 @@ class FileProcessorWorker {
         });
         this.lastClassifierMeta = classifierMeta;
         this.lastDetectedSections = detectedSections;
+
+        // Persist classifier-derived pages so the skinny list can
+        // show "X of Y" in the Pages column (same as manual selection).
+        if (selectedPages && selectedPages.length > 0 && !file.selected_pages) {
+            await updateFileSelectedPages(file.id, selectedPages);
+        }
 
         // When the visual classifier is explicitly enabled but failed,
         // abort rather than silently extracting every page.  A 200-page
