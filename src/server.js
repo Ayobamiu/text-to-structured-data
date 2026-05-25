@@ -173,6 +173,8 @@ io.on('connection', (socket) => {
     socket.on('file-status-update', (data) => {
         logger.info(`Received file-status-update from worker:`, data);
         const { jobId, fileId, message, timestamp, error, ...patch } = data;
+        // Include message in the patch so the client can display live notifications
+        if (message) patch._message = message;
         emitFilePatch(jobId, fileId, patch);
         logger.info(`Broadcasted file-status-update to job-${jobId}`);
     });
