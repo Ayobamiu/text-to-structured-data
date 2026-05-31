@@ -133,12 +133,13 @@ export function createFileProcessingContext({ file, job, mode = 'normal' }) {
  * Pure computation — no side effects, no DB writes.
  *
  * @param {Object}  args
- * @param {Object}  args.extractionResult  The raw extraction service output.
+ * @param {Object}  args.extractionResult    The raw extraction service output.
  * @param {Object|null} args.classifierMeta  Visual classifier provenance (optional).
  * @param {number|null} args.pageCount       Resolved page count.
+ * @param {string|null} args.extractionMethod  Fallback method name when extractionResult.method is absent.
  * @returns {Object}  The extraction_metadata object ready for DB storage.
  */
-export function buildExtractionMetadata({ extractionResult, classifierMeta = null, pageCount = null }) {
+export function buildExtractionMetadata({ extractionResult, classifierMeta = null, pageCount = null, extractionMethod = null }) {
     if (!extractionResult) {
         throw new Error('buildExtractionMetadata: extractionResult is required');
     }
@@ -159,7 +160,7 @@ export function buildExtractionMetadata({ extractionResult, classifierMeta = nul
         };
     } else {
         metadata = {
-            extraction_method: extractionResult.method || null,
+            extraction_method: extractionResult.method || extractionMethod || null,
             extraction_time_seconds:
                 extractionResult.extraction_time_seconds ||
                 extractionResult.extractionTimeSeconds ||

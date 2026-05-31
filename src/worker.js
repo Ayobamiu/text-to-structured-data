@@ -16,6 +16,7 @@ import ExtractionService from './services/extractionService.js';
 import ProcessingService from './services/processingService.js';
 import { deriveSelectedPagesAndMeta, resolveExtractionFlags } from './services/visualClassifierWiring.js';
 import { extractAndProcessPerSection } from './services/perSectionExtractor.js';
+import { buildExtractionMetadata } from './services/fileProcessingContext.js';
 dotenv.config();
 
 
@@ -385,36 +386,15 @@ class FileProcessorWorker {
                     pagesToStore = pages;
                 }
 
-                // Extract OpenAI feed data (if available, e.g., from PaddleOCR)
+                // Build extraction metadata (consolidated)
                 const openaiFeedBlocked = extractionResult.openai_feed?.blocked || null;
                 const openaiFeedUnblocked = extractionResult.openai_feed?.unblocked || null;
-
-                // Extract extraction metadata
-                const extractionMetadata = extractionResult.metadata ? {
-                    ...extractionResult.metadata,
-                    extraction_time_seconds: extractionResult.metadata.extraction_time_seconds || extractionResult.extraction_time_seconds || extractionResult.extractionTimeSeconds || null,
-                } : {
-                    extraction_method: extractionResult.method || null,
-                    extraction_time_seconds: extractionResult.extraction_time_seconds || extractionResult.extractionTimeSeconds || null,
-                    total_pages: pageCount || null,
-                    total_tables: (extractionResult.tables || [])?.length || null,
-                    text_length: (extractionResult.text || '')?.length || null,
-                    markdown_length: (extractionResult.markdown || '')?.length || null,
-                };
-
-                // Add OpenAI feed lengths if available
-                if (openaiFeedBlocked) {
-                    extractionMetadata.openai_feed_blocked_length = openaiFeedBlocked.length;
-                }
-                if (openaiFeedUnblocked) {
-                    extractionMetadata.openai_feed_unblocked_length = openaiFeedUnblocked.length;
-                }
-
-                // Surface classifier provenance in extraction metadata.
-                if (this.lastClassifierMeta) {
-                    extractionMetadata.visual_page_classifier = this.lastClassifierMeta;
-                    this.lastClassifierMeta = null;
-                }
+                const extractionMetadata = buildExtractionMetadata({
+                    extractionResult,
+                    classifierMeta: this.lastClassifierMeta,
+                    pageCount,
+                });
+                this.lastClassifierMeta = null;
 
                 // Debug logging to check values
                 console.log('🔍 Extraction result debug (extraction-only mode):', {
@@ -518,36 +498,15 @@ class FileProcessorWorker {
                     pagesToStore = pages;
                 }
 
-                // Extract OpenAI feed data (if available, e.g., from PaddleOCR)
+                // Build extraction metadata (consolidated)
                 const openaiFeedBlocked = extractionResult.openai_feed?.blocked || null;
                 const openaiFeedUnblocked = extractionResult.openai_feed?.unblocked || null;
-
-                // Extract extraction metadata
-                const extractionMetadata = extractionResult.metadata ? {
-                    ...extractionResult.metadata,
-                    extraction_time_seconds: extractionResult.metadata.extraction_time_seconds || extractionResult.extraction_time_seconds || extractionResult.extractionTimeSeconds || null,
-                } : {
-                    extraction_method: extractionResult.method || null,
-                    extraction_time_seconds: extractionResult.extraction_time_seconds || extractionResult.extractionTimeSeconds || null,
-                    total_pages: pageCount || null,
-                    total_tables: (extractionResult.tables || [])?.length || null,
-                    text_length: (extractionResult.text || '')?.length || null,
-                    markdown_length: (extractionResult.markdown || '')?.length || null,
-                };
-
-                // Add OpenAI feed lengths if available
-                if (openaiFeedBlocked) {
-                    extractionMetadata.openai_feed_blocked_length = openaiFeedBlocked.length;
-                }
-                if (openaiFeedUnblocked) {
-                    extractionMetadata.openai_feed_unblocked_length = openaiFeedUnblocked.length;
-                }
-
-                // Surface classifier provenance in extraction metadata.
-                if (this.lastClassifierMeta) {
-                    extractionMetadata.visual_page_classifier = this.lastClassifierMeta;
-                    this.lastClassifierMeta = null;
-                }
+                const extractionMetadata = buildExtractionMetadata({
+                    extractionResult,
+                    classifierMeta: this.lastClassifierMeta,
+                    pageCount,
+                });
+                this.lastClassifierMeta = null;
 
                 // Update extraction status for both modes with all fields
                 await updateFileExtractionStatus(
@@ -642,50 +601,15 @@ class FileProcessorWorker {
                     pagesToStore = pages;
                 }
 
-                // Extract OpenAI feed data (if available, e.g., from PaddleOCR)
+                // Build extraction metadata (consolidated)
                 const openaiFeedBlocked = extractionResult.openai_feed?.blocked || null;
                 const openaiFeedUnblocked = extractionResult.openai_feed?.unblocked || null;
-
-                // Extract extraction metadata
-                const extractionMetadata = extractionResult.metadata ? {
-                    ...extractionResult.metadata,
-                    extraction_time_seconds: extractionResult.metadata.extraction_time_seconds || extractionResult.extraction_time_seconds || extractionResult.extractionTimeSeconds || null,
-                } : {
-                    extraction_method: extractionResult.method || null,
-                    extraction_time_seconds: extractionResult.extraction_time_seconds || extractionResult.extractionTimeSeconds || null,
-                    total_pages: pageCount || null,
-                    total_tables: (extractionResult.tables || [])?.length || null,
-                    text_length: (extractionResult.text || '')?.length || null,
-                    markdown_length: (extractionResult.markdown || '')?.length || null,
-                };
-
-                // Add OpenAI feed lengths if available
-                if (openaiFeedBlocked) {
-                    extractionMetadata.openai_feed_blocked_length = openaiFeedBlocked.length;
-                }
-                if (openaiFeedUnblocked) {
-                    extractionMetadata.openai_feed_unblocked_length = openaiFeedUnblocked.length;
-                }
-
-                // Surface classifier provenance in extraction metadata so we can
-                // tell at a glance whether a given file was page-narrowed by the
-                // visual classifier and what it decided.
-                if (this.lastClassifierMeta) {
-                    extractionMetadata.visual_page_classifier = this.lastClassifierMeta;
-                    this.lastClassifierMeta = null;
-                }
-
-                // Debug logging to check values
-                console.log('🔍 Extraction result debug (full extraction mode):', {
-                    filename: file.filename,
-                    hasOpenAIFeed: !!extractionResult.openai_feed,
-                    hasMetadata: !!extractionResult.metadata,
-                    hasRawData: !!extractionResult.raw_data,
-                    extractionTimeSeconds: extractionResult.extraction_time_seconds || extractionResult.extractionTimeSeconds,
-                    openaiFeedBlocked: openaiFeedBlocked ? `${openaiFeedBlocked.length} chars` : 'null',
-                    openaiFeedUnblocked: openaiFeedUnblocked ? `${openaiFeedUnblocked.length} chars` : 'null',
-                    rawDataExists: !!extractionResult.raw_data,
+                const extractionMetadata = buildExtractionMetadata({
+                    extractionResult,
+                    classifierMeta: this.lastClassifierMeta,
+                    pageCount,
                 });
+                this.lastClassifierMeta = null;
 
                 // Update extraction status
                 await updateFileExtractionStatus(
