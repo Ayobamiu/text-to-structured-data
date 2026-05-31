@@ -325,7 +325,10 @@ export function deriveSectionsFromClassification(pageResults, opts = {}) {
     function flush() {
         if (!currentSection) return;
         const pageNumbers = currentSection.pages.map(p => p.page_number);
-        const confidences = currentSection.pages.map(p => p.confidence ?? 0);
+        // Confidence: only from pages that belong to this section's slug
+        // (absorbed 'none' gap pages should not affect section confidence)
+        const sectionPages = currentSection.pages.filter(p => p.document_type_slug === currentSection.document_type_slug);
+        const confidences = (sectionPages.length > 0 ? sectionPages : currentSection.pages).map(p => p.confidence ?? 0);
         const avgConfidence = confidences.reduce((a, b) => a + b, 0) / confidences.length;
         const minConfidence = Math.min(...confidences);
         const threshold = thresholdsBySlug.get(currentSection.document_type_slug) ?? DEFAULT_THRESHOLD;
@@ -335,12 +338,13 @@ export function deriveSectionsFromClassification(pageResults, opts = {}) {
         for (const p of currentSection.pages) {
             const isData = (p.page_purpose ?? 'unknown') === 'data';
             const isDuplicate = p.duplicate_of != null;
-            if (isData && !isDuplicate) {
+            const isAbsorbedGap = p.document_type_slug === 'none' || !p.document_type_slug;
+            if (isData && !isDuplicate && !isAbsorbedGap) {
                 extraction_pages.push(p.page_number);
             } else {
                 skipped_pages.push({
                     page_number: p.page_number,
-                    reason: p.duplicate_of != null ? 'duplicate' : (p.page_purpose ?? 'unknown'),
+                    reason: isAbsorbedGap ? 'gap_absorbed' : (p.duplicate_of != null ? 'duplicate' : (p.page_purpose ?? 'unknown')),
                     ...(p.duplicate_of != null ? { duplicate_of: p.duplicate_of } : {}),
                 });
             }
@@ -363,16 +367,22 @@ export function deriveSectionsFromClassification(pageResults, opts = {}) {
         currentSection = null;
     }
 
+    // Buffer for 'none' pages between classified pages. If the next
+    // classified page continues the same section, absorb the buffered
+    // nones as skipped pages (preserving section continuity). If it
+    // starts a new section, the gap was real — flush and discard.
+    let pendingNonePages = [];
+
     for (const page of pageResults) {
         const slug = page.document_type_slug;
 
-        // 'none' pages break runs (produce no section)
+        // Buffer 'none' pages — decide their fate when the next classified page arrives
         if (!slug || slug === 'none') {
-            flush();
+            pendingNonePages.push(page);
             continue;
         }
 
-        // Determine if we should start a new section
+        // Determine if this page continues the current section
         const sameRecordAsCurrent = currentSection &&
             currentSection.document_type_slug === slug &&
             page.record_id && currentSection.record_id &&
@@ -386,13 +396,23 @@ export function deriveSectionsFromClassification(pageResults, opts = {}) {
         );
 
         if (shouldStartNew) {
+            // Gap pages between different sections are true boundaries — discard them
             flush();
+            pendingNonePages = [];
             currentSection = {
                 document_type_slug: slug,
                 record_id: page.record_id,
                 pages: [page],
             };
         } else {
+            // This page continues the current section — absorb buffered none
+            // pages into the section as skipped (preserves section continuity
+            // so all data pages go to one AI call instead of being fragmented)
+            for (const nonePage of pendingNonePages) {
+                currentSection.pages.push(nonePage);
+            }
+            pendingNonePages = [];
+
             currentSection.pages.push(page);
             // Promote record_id if current section didn't have one
             if (page.record_id && !currentSection.record_id) {
@@ -401,6 +421,7 @@ export function deriveSectionsFromClassification(pageResults, opts = {}) {
         }
     }
 
+    // Trailing none pages after the last section are true gaps — discard
     flush();
     return sections;
 }
