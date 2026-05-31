@@ -3050,6 +3050,7 @@ async function processFilesAsync(job, files, schema, schemaName, processingConfi
                             processingService: processingServiceAdapter,
                             processingMethod: 'openai',
                             processingOptions: {},
+                            selectedPages,
                         });
 
                         const failedCount = perSection.sectionResults.filter((r) => r.status === 'failed').length;

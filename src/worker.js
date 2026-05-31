@@ -898,6 +898,7 @@ class FileProcessorWorker {
                     processingService: this.processingService,
                     processingMethod,
                     processingOptions: finalProcessingOptions,
+                    selectedPages: file.selected_pages || null,
                 });
 
                 this.lastDetectedSections = null;
@@ -1146,6 +1147,9 @@ class FileProcessorWorker {
         // show "X of Y" in the Pages column (same as manual selection).
         if (selectedPages && selectedPages.length > 0 && !file.selected_pages) {
             await updateFileSelectedPages(file.id, selectedPages);
+            // Also update in-memory file object so downstream code (e.g.
+            // per-section extractor in Stage 2) can read it without re-fetching.
+            file.selected_pages = selectedPages;
         }
 
         // When the visual classifier is explicitly enabled but failed,
