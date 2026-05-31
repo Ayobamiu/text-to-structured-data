@@ -21,6 +21,41 @@ import OpenAI from 'openai';
 import { rasterizePdf } from './pdfRasterizer.js';
 import { computeJpegSignature, assignDuplicates, countDuplicates } from './pageDeduplicator.js';
 
+// ---------------------------------------------------------------------------
+// Record ID normalization
+// ---------------------------------------------------------------------------
+
+/**
+ * Normalize a record_id string so that OCR variants of the same identifier
+ * are treated as equal during section grouping and record inventory tracking.
+ *
+ * Transformations (in order):
+ *   1. Trim leading/trailing whitespace
+ *   2. Collapse internal runs of whitespace to nothing around hyphens/dashes
+ *      ("GP- 1" → "GP-1", "MW -2" → "MW-2", "B - 3" → "B-3")
+ *   3. Collapse remaining internal whitespace to a single space
+ *   4. Uppercase ("gp-1" → "GP-1")
+ *   5. Strip trailing punctuation (periods, commas) that OCR sometimes appends
+ *
+ * Returns null for null/undefined/empty-string inputs.
+ */
+export function normalizeRecordId(raw) {
+    if (raw == null) return null;
+    let s = String(raw).trim();
+    if (s.length === 0) return null;
+
+    // Collapse whitespace around hyphens/dashes: "GP- 1" → "GP-1"
+    s = s.replace(/\s*[-–—]\s*/g, '-');
+    // Collapse remaining internal whitespace
+    s = s.replace(/\s+/g, ' ');
+    // Uppercase
+    s = s.toUpperCase();
+    // Strip trailing punctuation
+    s = s.replace(/[.,;:]+$/, '');
+
+    return s.length > 0 ? s : null;
+}
+
 const DEFAULT_OPTIONS = {
     model: 'gpt-4o-mini',
     detail: 'high',
@@ -64,6 +99,11 @@ function buildSystemPrompt(documentTypes) {
         if (skipWhen.length > 0) {
             typeLines.push(`      SKIP rules for ${dt.slug} (pages matching these are NOT this type — use "none"):`);
             for (const rule of skipWhen) typeLines.push(`        • ${rule}`);
+        }
+        const recordIdGuidance = hints.record_id_guidance || null;
+        if (recordIdGuidance) {
+            typeLines.push(`      Record ID rule for ${dt.slug} (use this to determine record_id):`);
+            typeLines.push(`        • ${recordIdGuidance}`);
         }
     }
     typeLines.push('  - none: this page does not match any of the above types');
@@ -447,6 +487,13 @@ export async function classifyPdfBatched({ pdfBuffer, documentTypes, options = {
             continue;
         }
 
+        // Normalize record_ids before accumulation so grouping, inventory,
+        // and cross-batch context all see consistent identifiers regardless
+        // of OCR variation ("GP- 1" vs "GP-1" vs "gp-1" all become "GP-1").
+        for (const p of result.pages) {
+            p.record_id = normalizeRecordId(p.record_id);
+        }
+
         // Accumulate results
         allResults.push(...result.pages);
 
@@ -546,4 +593,5 @@ export async function classifyPdfBatched({ pdfBuffer, documentTypes, options = {
 export default {
     classifyPdfBatched,
     deriveSectionsFromClassification,
+    normalizeRecordId,
 };
