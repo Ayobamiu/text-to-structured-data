@@ -3,17 +3,18 @@
 
   "_iteration_notes": [
     "v1: caught permits (p2, p3, p6) but over-applied to the well plugging record (p7).",
-    "v2 (this version): replaced the 'permit form' framing with an explicit Application-vs-Record distinction. Applications/Permits (administrative requests) are skipped; Records/Logs (factual documents) are kept — even when they're about the same activity (e.g. plugging an abandoned well).",
-    "Removed the prior duplicate-detection hint: the model classifies one page in isolation and cannot reliably tell that page N repeats page M. Semantic duplicates are tracked separately via the perceptual-hash deduplicator (planned)."
-  ],
-
-  "skip_when": [
-    "If the page is an APPLICATION or PERMIT form — titles like 'Application for Permit', 'Application for Permit to Drill', 'Permit to Drill', 'Application for Permission to Abandon' — classify the page as document_type_slug='none'. These are administrative request/permission documents, NOT the well log we extract. They may carry well metadata (location, casing, formations) but that data is also recorded on the actual log pages and would cause duplicate / wrong-source extraction.",
-    "Critical distinction — apply this rule strictly: an APPLICATION ('Application for X', 'Permit to X', 'Permission to X') is administrative and should be SKIPPED (document_type_slug='none'). A RECORD or LOG ('Well Plugging Record', 'Well Construction Log', 'Driller's Log', 'Formation Log', 'Completion Record') is the actual data document and should be KEPT as document_type_slug='mgs_well_log' with page_purpose='data'. Both kinds of pages may discuss the same activity (drilling, plugging, abandonment) — the title verb matters more than the topic."
+    "v2: replaced the 'permit form' framing with an explicit Application-vs-Record distinction.",
+    "v3 (this version): hints were never reaching the batched classifier (bug fixed in batchedVisualClassifier.js v5). Rewrote for the combined whitelist+blacklist approach. Added duplicate/summary page detection via cross-batch context."
   ],
 
   "keep_when": [
-    "An actual MGS well log has a tabular log structure with depth/elevation columns running down the page, formation or lithology descriptions per depth interval, and well construction details (casing, screen, surface completion). It is primarily a LOG of measurements and observations.",
-    "The mgs_well_log document type INCLUDES well plugging RECORDS (titles like 'Well Plugging Record'). These document HOW the well was plugged — cement intervals, plugging materials, depths sealed — and contain extractable data. Do NOT confuse a 'Well Plugging Record' (kept) with an 'Application for Permission to Abandon' (skipped); they are different documents that may be filed in the same packet."
+    "An actual MGS well log page has a TABULAR log structure — depth/elevation columns running down the page with formation or lithology descriptions per depth interval, well construction details (casing, screen, surface completion), or drilling progress entries. It is primarily a LOG of measurements and observations laid out in a grid or column format.",
+    "The mgs_well_log document type INCLUDES 'Well Plugging Record' pages (titles like 'Well Plugging Record', 'Record of Well Plugging'). These document HOW the well was plugged — cement intervals, plugging materials, depths sealed. They are DATA documents with extractable fields. Do NOT confuse a 'Well Plugging Record' (KEEP) with an 'Application for Permission to Abandon' (SKIP)."
+  ],
+
+  "skip_when": [
+    "APPLICATION and PERMIT forms — any page with a title containing 'Application for', 'Permit to', 'Permission to' (e.g., 'Application for Permit to Drill', 'Permit to Drill', 'Application for Permission to Abandon', 'Permit Granted'). These are administrative request/approval documents, NOT the well log itself. Classify as document_type_slug='none'. They may mention well data (location, depths, formations) but that data also appears on the actual log pages.",
+    "SUMMARY or DUPLICATE pages that RESTATE information already present on earlier pages in this document. If a page contains a condensed summary of drilling data, casing records, formation notes, or mud/operational details that REPEAT the same well's depth and formation information already visible on the primary log form (the full tabular grid pages), classify it as document_type_slug='none'. The primary log form with its full column layout is the authoritative source — shorter recap tables, casing run summaries, and operational notes that merely restate the same drilling data are redundant copies.",
+    "How to distinguish: the PRIMARY well log form has a detailed multi-row tabular grid (many depth intervals listed row by row). A SUMMARY/DUPLICATE page restates the same data in a shorter, less structured format — often a half-page of handwritten notes, a brief form with a few casing depths, or a condensed recap. When in doubt, check the RECORDS IDENTIFIED context: if an earlier page already captured the full tabular log for this well, a later page with the same well's data in condensed form is redundant."
   ]
 }

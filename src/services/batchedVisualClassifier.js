@@ -29,7 +29,8 @@ const DEFAULT_OPTIONS = {
     jpegQuality: 95,
     requestTimeoutMs: 60_000,
     // v4: batched classifier with record_id detection + bounded context
-    classifierVersion: 4,
+    // v5: splice per-document-type classifier_hints (keep/skip rules) into system prompt
+    classifierVersion: 5,
 };
 
 let _openaiClient = null;
@@ -47,6 +48,26 @@ function openai() {
 // ---------------------------------------------------------------------------
 
 function buildSystemPrompt(documentTypes) {
+    // Build the document type list with per-type classifier hints (keep/skip rules)
+    const typeLines = [];
+    for (const dt of documentTypes) {
+        const desc = dt.description ? ` — ${dt.description}` : '';
+        typeLines.push(`  - ${dt.slug} (${dt.display_name || dt.slug})${desc}`);
+
+        const hints = dt.classifier_hints || {};
+        const skipWhen = Array.isArray(hints.skip_when) ? hints.skip_when : [];
+        const keepWhen = Array.isArray(hints.keep_when) ? hints.keep_when : [];
+        if (keepWhen.length > 0) {
+            typeLines.push(`      KEEP rules for ${dt.slug} (pages matching these ARE this type):`);
+            for (const rule of keepWhen) typeLines.push(`        • ${rule}`);
+        }
+        if (skipWhen.length > 0) {
+            typeLines.push(`      SKIP rules for ${dt.slug} (pages matching these are NOT this type — use "none"):`);
+            for (const rule of skipWhen) typeLines.push(`        • ${rule}`);
+        }
+    }
+    typeLines.push('  - none: this page does not match any of the above types');
+
     return `You are a document-page classifier for a geological/environmental document extraction pipeline.
 
 You will see a BATCH of consecutive pages from a multi-page PDF. For each page, identify:
@@ -58,8 +79,9 @@ You will see a BATCH of consecutive pages from a multi-page PDF. For each page, 
   6. summary — a concise 1-2 sentence summary of what this page contains, including any identifiers, key data types, and record boundaries visible. This summary will be passed as context to classify later pages, so include details that help identify record continuity.
 
 Available document types:
-${documentTypes.map(dt => `  - ${dt.slug} (${dt.display_name || dt.slug})${dt.description ? ' — ' + dt.description : ''}`).join('\n')}
-  - none: this page does not match any of the above types
+${typeLines.join('\n')}
+
+IMPORTANT: The KEEP and SKIP rules above are authoritative. When a page matches a SKIP rule for a document type, classify it as "none" even if it discusses the same topic. When it matches a KEEP rule, classify it as that type. These rules override generic layout-based guessing.
 
 page_purpose values:
   - "data": page contains extractable fields, table rows, or measurement values
