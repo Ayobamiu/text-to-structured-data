@@ -3010,15 +3010,21 @@ async function processFilesAsync(job, files, schema, schemaName, processingConfi
                         // so the existing v1 path has no new module-load cost.
                         const { extractAndProcessPerSection } = await import('./services/perSectionExtractor.js');
 
+                        // Resolve processing config from the job so per-section
+                        // calls use the correct model/temperature/max_tokens.
+                        const procConfig = jobProcessingConfig?.processing || {};
+                        const procModel = procConfig.model || 'gpt-4o';
+                        const procOptions = { model: procModel, ...(procConfig.options || {}) };
+
                         // Adapter so perSectionExtractor (designed against the
                         // ProcessingService class API) can drive this code path
                         // which uses the slimmer processWithOpenAI utility.
                         const processingServiceAdapter = {
-                            async processText(text, schemaInfo) {
+                            async processText(text, schemaInfo, _method, opts) {
                                 return processWithOpenAI(text, {
                                     schemaName: schemaInfo?.schemaName || 'data_extraction',
                                     schema: schemaInfo?.schema,
-                                });
+                                }, opts || procOptions);
                             },
                         };
 
@@ -3026,8 +3032,8 @@ async function processFilesAsync(job, files, schema, schemaName, processingConfi
                             detectedSections: visualDetectedSections,
                             pages,
                             processingService: processingServiceAdapter,
-                            processingMethod: 'openai',
-                            processingOptions: {},
+                            processingMethod: procConfig.method || 'openai',
+                            processingOptions: procOptions,
                             selectedPages,
                         });
 

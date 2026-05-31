@@ -33,12 +33,6 @@ class FileProcessorWorker {
         this.s3Service = new S3Service();
         this.extractionService = new ExtractionService(this.s3Service);
         this.processingService = new ProcessingService();
-        // Per-file scratch space populated by deriveSelectedPages() and
-        // consumed when assembling extraction_metadata + when deciding
-        // whether to use per-section extraction. Worker is single-threaded
-        // over files (see pollQueue) so the stash pattern is safe.
-        this.lastClassifierMeta = null;
-        this.lastDetectedSections = null;
 
         // Initialize Socket.IO client for WebSocket events
         this.socket = io(SERVER_URL, {
@@ -178,11 +172,6 @@ class FileProcessorWorker {
         const { fileId, jobId, retries, mode = 'normal' } = queueItem;
         console.log(`🔄 Processing file: ${fileId} (attempt ${retries + 1}, mode: ${mode})`);
 
-        // Clear per-file classifier stash so a previous job cannot leak
-        // detected_sections into this run (worker is single-threaded per poll).
-        this.lastClassifierMeta = null;
-        this.lastDetectedSections = null;
-
         // Declare confidentHits, preProcessingMetadata, usePageDetection, and jobProcessingConfig at function scope so they're accessible in all code paths
         let confidentHits = [];
         let preProcessingMetadata = {};
@@ -247,6 +236,7 @@ class FileProcessorWorker {
                     : job.processing_config || null;
 
             let extractionResult;
+            let detectedSections = null; // Set by reprocess (from DB) or runFileExtraction (from classifier)
 
             if (mode === 'reprocess') {
                 // Reprocessing mode: Skip extraction, use existing text/markdown
@@ -269,7 +259,7 @@ class FileProcessorWorker {
                         : null;
 
                 if (usePerSection && reprocessSections) {
-                    this.lastDetectedSections = reprocessSections;
+                    detectedSections = reprocessSections;
                     console.log(
                         `🧩 Reprocess: reusing persisted detected_sections ` +
                         `(${reprocessSections.sections.length} section(s)) for per-section AI`
@@ -286,8 +276,6 @@ class FileProcessorWorker {
                         `but no detected_sections are stored for ${file.filename}. ` +
                         `Re-run text extraction first so the visual classifier can populate routing.`
                     );
-                } else {
-                    this.lastDetectedSections = null;
                 }
 
                 // Emit WebSocket event for reprocessing start
@@ -317,7 +305,7 @@ class FileProcessorWorker {
                     `(text: ${(extractionResult.text || '').length} chars, ` +
                     `markdown: ${(extractionResult.markdown || '').length} chars, ` +
                     `pages: ${reprocessPages.length}, ` +
-                    `per-section: ${this.lastDetectedSections ? 'yes' : 'no'})`
+                    `per-section: ${detectedSections ? 'yes' : 'no'})`
                 );
 
             } else if (mode === 'extraction-only') {
@@ -325,7 +313,7 @@ class FileProcessorWorker {
                 console.log(`📄 Extraction-only mode: Extracting text from ${file.filename}`);
                 this.emitFileStatusUpdate(jobId, file.id, 'processing', file.processing_status || 'pending', `Starting text extraction for ${file.filename}`);
 
-                ({ extractionResult } = await this.runFileExtraction(file, jobProcessingConfig));
+                ({ extractionResult, detectedSections } = await this.runFileExtraction(file, jobProcessingConfig));
 
                 this.emitFileStatusUpdate(jobId, file.id, 'completed', file.processing_status || 'pending', `Extraction completed for ${file.filename}`);
                 return; // Skip AI processing
@@ -335,7 +323,7 @@ class FileProcessorWorker {
                 console.log(`📄 ${mode} mode: Extracting text from ${file.filename}`);
                 this.emitFileStatusUpdate(jobId, file.id, 'processing', file.processing_status || 'pending', `Starting text extraction for ${file.filename}`);
 
-                ({ extractionResult } = await this.runFileExtraction(file, jobProcessingConfig));
+                ({ extractionResult, detectedSections } = await this.runFileExtraction(file, jobProcessingConfig));
 
                 this.emitFileStatusUpdate(jobId, file.id, 'completed', file.processing_status || 'pending', `Text extraction completed for ${file.filename}`);
 
@@ -347,7 +335,7 @@ class FileProcessorWorker {
 
                 let pagesToStore;
                 let extractionMetadata;
-                ({ extractionResult, pagesToStore, extractionMetadata } = await this.runFileExtraction(file, jobProcessingConfig));
+                ({ extractionResult, pagesToStore, extractionMetadata, detectedSections } = await this.runFileExtraction(file, jobProcessingConfig));
 
                 // Pre-processing pipeline: Run formation page detection before AI processing
                 usePageDetection = jobProcessingConfig?.usePageDetection !== false;
@@ -481,11 +469,10 @@ class FileProcessorWorker {
             // Otherwise we fall through to the v1 single-schema path below.
             // ─────────────────────────────────────────────────────────────
             const { usePerSection } = resolveExtractionFlags(jobProcessingConfig);
-            const detectedSectionsForExtraction = this.lastDetectedSections;
             const hasExtractableSections = !!(
-                detectedSectionsForExtraction &&
-                Array.isArray(detectedSectionsForExtraction.sections) &&
-                detectedSectionsForExtraction.sections.some(
+                detectedSections &&
+                Array.isArray(detectedSections.sections) &&
+                detectedSections.sections.some(
                     (s) => Array.isArray(s.extraction_pages) && s.extraction_pages.length > 0
                 )
             );
@@ -498,7 +485,7 @@ class FileProcessorWorker {
                 );
             } else if (usePerSection && hasExtractableSections && !Array.isArray(extractionResult.pages)) {
                 console.warn(
-                    `⚠️ Per-section extraction requested with ${detectedSectionsForExtraction.sections.length} section(s) ` +
+                    `⚠️ Per-section extraction requested with ${detectedSections.sections.length} section(s) ` +
                     `but extractionResult.pages is ${typeof extractionResult.pages}, not an array. ` +
                     `Falling through to v1 single-schema path (this is a bug — pages should always be an array here).`
                 );
@@ -506,20 +493,18 @@ class FileProcessorWorker {
 
             if (usePerSection && hasExtractableSections && Array.isArray(extractionResult.pages)) {
                 console.log(
-                    `🧩 Per-section extraction: ${detectedSectionsForExtraction.sections.length} section(s) ` +
+                    `🧩 Per-section extraction: ${detectedSections.sections.length} section(s) ` +
                     `for ${file.filename} (envelope v2)`
                 );
 
                 const perSection = await extractAndProcessPerSection({
-                    detectedSections: detectedSectionsForExtraction,
+                    detectedSections,
                     pages: extractionResult.pages,
                     processingService: this.processingService,
                     processingMethod,
                     processingOptions: finalProcessingOptions,
                     selectedPages: file.selected_pages || null,
                 });
-
-                this.lastDetectedSections = null;
 
                 const failedCount = perSection.sectionResults.filter((r) => r.status === 'failed').length;
                 const skippedCount = perSection.sectionResults.filter((r) => r.status?.startsWith('skipped_')).length;
@@ -579,7 +564,6 @@ class FileProcessorWorker {
             // ─────────────────────────────────────────────────────────────
             // v1 single-schema path (unchanged from before)
             // ─────────────────────────────────────────────────────────────
-            this.lastDetectedSections = null;
 
             // Parse schema data if it's a string
             let schemaData = job.schema_data;
@@ -739,53 +723,6 @@ class FileProcessorWorker {
         }
     }
 
-    /**
-     * Thin wrapper around the shared visualClassifierWiring helper.
-     *
-     * Kept as an instance method for backwards compatibility with the
-     * existing call sites (which already do `await this.deriveSelectedPages(...)`)
-     * and so the metadata-surfacing code below can read
-     * `this.lastClassifierMeta` after the call.
-     *
-     * Worker is single-threaded over files (see pollQueue), so the stash
-     * pattern is safe.
-     */
-    async deriveSelectedPages(file, jobProcessingConfig) {
-        const { usePerSection } = resolveExtractionFlags(jobProcessingConfig);
-        const { selectedPages, classifierMeta, detectedSections, classifierFailed } = await deriveSelectedPagesAndMeta({
-            file,
-            jobProcessingConfig,
-            s3Service: this.s3Service,
-            usePerSection,
-        });
-        this.lastClassifierMeta = classifierMeta;
-        this.lastDetectedSections = detectedSections;
-
-        // Persist classifier-derived pages so the skinny list can
-        // show "X of Y" in the Pages column (same as manual selection).
-        if (selectedPages && selectedPages.length > 0 && !file.selected_pages) {
-            await updateFileSelectedPages(file.id, selectedPages);
-            // Also update in-memory file object so downstream code (e.g.
-            // per-section extractor in Stage 2) can read it without re-fetching.
-            file.selected_pages = selectedPages;
-        }
-
-        // When the visual classifier is explicitly enabled but failed,
-        // abort rather than silently extracting every page.  A 200-page
-        // PDF falling through to full extraction is a costly surprise.
-        if (classifierFailed) {
-            const reason = classifierMeta?.reason || 'unknown';
-            const detail = classifierMeta?.error || '';
-            throw new Error(
-                `Visual page classifier failed for ${file.filename} ` +
-                `(reason: ${reason}${detail ? ' — ' + detail : ''}). ` +
-                `Aborting to prevent full-document extraction. ` +
-                `Retry the file or disable the visual classifier on this job.`
-            );
-        }
-
-        return selectedPages;
-    }
 
     /**
      * Consolidated file extraction: resolves pages, runs extraction with
@@ -802,7 +739,8 @@ class FileProcessorWorker {
      *   pageCount: number|null,
      *   pagesToStore: Array|number|null,
      *   openaiFeedBlocked: string|null,
-     *   openaiFeedUnblocked: string|null
+     *   openaiFeedUnblocked: string|null,
+     *   detectedSections: Object|null
      * }>}
      */
     async runFileExtraction(file, jobProcessingConfig) {
@@ -811,7 +749,33 @@ class FileProcessorWorker {
         console.log(`📋 Using extraction method: ${extractionMethod} (from job processing config)`);
 
         // 1. Resolve selected pages (manual > classifier > null)
-        const selectedPages = await this.deriveSelectedPages(file, jobProcessingConfig);
+        const { usePerSection } = resolveExtractionFlags(jobProcessingConfig);
+        const { selectedPages, classifierMeta, detectedSections, classifierFailed } = await deriveSelectedPagesAndMeta({
+            file,
+            jobProcessingConfig,
+            s3Service: this.s3Service,
+            usePerSection,
+        });
+
+        // Persist classifier-derived pages so the skinny list can
+        // show "X of Y" in the Pages column (same as manual selection).
+        if (selectedPages && selectedPages.length > 0 && !file.selected_pages) {
+            await updateFileSelectedPages(file.id, selectedPages);
+            file.selected_pages = selectedPages;
+        }
+
+        // When the visual classifier is explicitly enabled but failed,
+        // abort rather than silently extracting every page.
+        if (classifierFailed) {
+            const reason = classifierMeta?.reason || 'unknown';
+            const detail = classifierMeta?.error || '';
+            throw new Error(
+                `Visual page classifier failed for ${file.filename} ` +
+                `(reason: ${reason}${detail ? ' — ' + detail : ''}). ` +
+                `Aborting to prevent full-document extraction. ` +
+                `Retry the file or disable the visual classifier on this job.`
+            );
+        }
 
         // 2. Run extraction with fallback
         let extractionResult;
@@ -852,10 +816,9 @@ class FileProcessorWorker {
         const openaiFeedUnblocked = extractionResult.openai_feed?.unblocked || null;
         const extractionMetadata = buildExtractionMetadata({
             extractionResult,
-            classifierMeta: this.lastClassifierMeta,
+            classifierMeta,
             pageCount,
         });
-        this.lastClassifierMeta = null;
 
         // 5. Persist to DB
         await updateFileExtractionStatus(
@@ -876,7 +839,7 @@ class FileProcessorWorker {
 
         console.log(`✅ File ${file.filename} extraction completed and persisted`);
 
-        return { extractionResult, extractionMetadata, pageCount, pagesToStore, openaiFeedBlocked, openaiFeedUnblocked };
+        return { extractionResult, extractionMetadata, pageCount, pagesToStore, openaiFeedBlocked, openaiFeedUnblocked, detectedSections };
     }
 
     /**
