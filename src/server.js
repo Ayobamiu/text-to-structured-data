@@ -3086,8 +3086,25 @@ async function processFilesAsync(job, files, schema, schemaName, processingConfi
                     }
 
                     // ─────────────────────────────────────────────────────────
-                    // v1 single-schema path (unchanged)
+                    // v1 single-schema path
                     // ─────────────────────────────────────────────────────────
+                    // Detect if this is a degraded fallback (per-section was
+                    // requested but couldn't run).
+                    let v1FallbackReason = null;
+                    if (usePerSection && !hasExtractableSections) {
+                        v1FallbackReason = 'no_extractable_sections';
+                        console.warn(
+                            `⚠️ Per-section extraction requested but no extractable sections for ${file.originalname}; ` +
+                            `falling through to v1 single-schema path.`
+                        );
+                    } else if (usePerSection && hasExtractableSections && !Array.isArray(pages)) {
+                        v1FallbackReason = 'pages_not_array';
+                        console.warn(
+                            `⚠️ Per-section extraction requested but pages is not an array for ${file.originalname}; ` +
+                            `falling through to v1 single-schema path.`
+                        );
+                    }
+
                     console.log(`Step 5: Processing ${file.originalname} with OpenAI using shared processor...`);
 
                     const processingResult = await processWithOpenAI(contentForAI, {
@@ -3105,7 +3122,13 @@ async function processFilesAsync(job, files, schema, schemaName, processingConfi
                     // Step 6: Merge pre-processing metadata with processing metadata
                     const finalMetadata = {
                         ...processingResult.metadata,
-                        ...preProcessingMetadata // Include comprehensive page detection metadata
+                        ...preProcessingMetadata, // Include comprehensive page detection metadata
+                        // Flag degraded result when per-section was requested but fell through to v1
+                        ...(v1FallbackReason ? {
+                            result_envelope: 'v1_fallback',
+                            v1_fallback_reason: v1FallbackReason,
+                            v1_fallback_schema: schemaName || null,
+                        } : {}),
                     };
 
                     // Step 7: Update file processing status to completed with timing
