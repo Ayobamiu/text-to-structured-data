@@ -1,6 +1,7 @@
 import { PipelineStage } from '../PipelineStage.js';
 import { getDocumentTypesBySlugs } from '../../services/schemaRegistry.js';
 import { classifyPdf } from '../../services/visualPageClassifier.js';
+import { classifyPdfBatched, deriveSectionsFromClassification } from '../../services/batchedVisualClassifier.js';
 import {
     groupIntoSections,
     deriveFileStatus,
@@ -8,21 +9,20 @@ import {
 } from '../../services/sectionGrouper.js';
 
 /**
- * VisualPageClassifierStage (Phase 1, item #2)
+ * VisualPageClassifierStage (Phase 1, item #2 — v2 batched)
  *
- * Runs BEFORE extraction (different from FormationPageDetectionPreStage which
- * runs AFTER extraction). The whole point is to classify pages from their
- * rendered images so the existing extraction step can later be scoped to
- * just the pages that matter.
+ * Runs BEFORE extraction. Classifies pages from their rendered images so the
+ * extraction step can be scoped to just the pages that matter.
  *
- * This turn's wiring is intentionally minimal:
- *   - Stage is added but NOT yet inserted into the worker pipeline.
- *   - Behaviour change is gated by `processingConfig.useVisualClassifier`.
- *   - Output is persisted to job_files.detected_sections; no other column or
- *     code path is changed.
+ * v2 (batched classifier):
+ *   - Sends pages in batches of 5 at high detail (768px, q=95)
+ *   - Detects record boundaries and assigns record_id per page
+ *   - Uses bounded context (last batch + record inventory) between batches
+ *   - Produces per-page summaries for future re-use
+ *   - Falls back to v1 (per-page, low detail) if batched classifier fails
  *
- * The next turn (item #3) is what teaches the worker to read
- * detected_sections and skip OCR for pages outside any section.
+ * Behaviour change gated by `processingConfig.useVisualClassifier`.
+ * Output persisted to job_files.detected_sections.
  */
 export class VisualPageClassifierStage extends PipelineStage {
     constructor(options = {}) {
@@ -33,9 +33,9 @@ export class VisualPageClassifierStage extends PipelineStage {
             ...options,
         });
 
-        this.s3Service = options.s3Service || null; // Required at execute time
+        this.s3Service = options.s3Service || null;
         this.classifierOptions = options.classifierOptions || {};
-        this.persistResult = options.persistResult !== false; // Allow tests / dry-runs to skip the DB write
+        this.persistResult = options.persistResult !== false;
     }
 
     /**
@@ -43,7 +43,6 @@ export class VisualPageClassifierStage extends PipelineStage {
      *   - The job's processing_config opts in via useVisualClassifier=true.
      *   - The file has an s3_key (we need a PDF to rasterise).
      *   - We have an S3 service injected.
-     *   - There is at least one registered document_type to classify against.
      */
     shouldRun(context) {
         if (!super.shouldRun(context)) return false;
@@ -67,7 +66,6 @@ export class VisualPageClassifierStage extends PipelineStage {
 
     async execute(context) {
         // Per-job slug restriction. Empty array / undefined → all active types.
-        // Validation (unknown slugs error loudly) happens in the registry helper.
         const requestedSlugs = Array.isArray(context.processingConfig?.documentTypeSlugs)
             ? context.processingConfig.documentTypeSlugs
             : [];
@@ -94,6 +92,88 @@ export class VisualPageClassifierStage extends PipelineStage {
         console.log(`🧠 VisualPageClassifierStage: downloading PDF ${s3Key} for classification`);
         const pdfBuffer = await this.s3Service.downloadFile(s3Key);
 
+        // Use batched classifier (v2) — falls back to v1 on failure
+        let detectedSections;
+        try {
+            detectedSections = await this.#runBatchedClassifier(pdfBuffer, documentTypes, context);
+        } catch (batchedErr) {
+            console.warn(
+                `⚠️  Batched classifier failed, falling back to per-page classifier: ${batchedErr.message}`
+            );
+            detectedSections = await this.#runLegacyClassifier(pdfBuffer, documentTypes, context);
+        }
+
+        if (this.persistResult) {
+            await this.#persistDetectedSections(context.fileId, detectedSections);
+        }
+
+        const sections = detectedSections.sections || [];
+        const totalExtractPages = sections.reduce((n, s) => n + (s.extraction_pages?.length || 0), 0);
+        const totalSkipPages = sections.reduce((n, s) => n + (s.skipped_pages?.length || 0), 0);
+
+        const sectionSummary = sections
+            .map((s) => {
+                const recId = s.record_id ? `[${s.record_id}]` : '';
+                const skipBreakdown = (s.skipped_pages?.length || 0) > 0
+                    ? ` skip(${s.skipped_pages.length})`
+                    : '';
+                return `${s.document_type_slug}${recId}[${s.page_range[0]}-${s.page_range[1]}] extract(${s.extraction_pages?.length || 0})${skipBreakdown}@${s.confidence.toFixed(2)}`;
+            })
+            .join(', ') || '(none)';
+
+        console.log(
+            `🧩 VisualPageClassifierStage: ${sections.length} section(s), file_status=${detectedSections.status}, extract=${totalExtractPages}, skip=${totalSkipPages} — ${sectionSummary}`
+        );
+
+        return {
+            ...context,
+            detectedSections,
+            visualPageClassifier: {
+                success: true,
+                sectionCount: sections.length,
+                extractionPageCount: totalExtractPages,
+                skippedPageCount: totalSkipPages,
+                fileStatus: detectedSections.status,
+            },
+        };
+    }
+
+    /**
+     * v2: Batched classifier with record_id detection and bounded context.
+     */
+    async #runBatchedClassifier(pdfBuffer, documentTypes, context) {
+        const classification = await classifyPdfBatched({
+            pdfBuffer,
+            documentTypes,
+            options: this.classifierOptions,
+        });
+
+        const thresholdsBySlug = new Map(
+            documentTypes.map((dt) => [
+                dt.slug,
+                Number(dt.routing_confidence_threshold) || 0.75,
+            ])
+        );
+
+        const sections = deriveSectionsFromClassification(classification.pages, { thresholdsBySlug });
+        const status = deriveFileStatus(sections);
+
+        return {
+            classifier: classification.classifier,
+            grouper: { strategy: 'record_id', version: 4 },
+            candidate_slugs: documentTypes.map((dt) => dt.slug),
+            pages: classification.pages,
+            sections,
+            status,
+            page_summaries: classification.pageSummaries,
+            record_inventory: classification.recordInventory,
+        };
+    }
+
+    /**
+     * v1 fallback: Per-page classifier with slug_only grouping.
+     */
+    async #runLegacyClassifier(pdfBuffer, documentTypes, context) {
         const classification = await classifyPdf({
             pdfBuffer,
             documentTypes,
@@ -110,54 +190,17 @@ export class VisualPageClassifierStage extends PipelineStage {
         const sections = groupIntoSections(classification.pages, { thresholdsBySlug });
         const status = deriveFileStatus(sections);
 
-        const detectedSections = {
+        return {
             classifier: classification.classifier,
             grouper: getGrouperMetadata(),
-            // Provenance for the slug enum used at classification time. Lets a
-            // future debugger understand "model returned slug X — was X even
-            // in the candidate set on this run?"
             candidate_slugs: documentTypes.map((dt) => dt.slug),
             pages: classification.pages,
             sections,
             status,
         };
-
-        if (this.persistResult) {
-            await this.#persistDetectedSections(context.fileId, detectedSections);
-        }
-
-        const sectionSummary = sections
-            .map((s) => {
-                const skipBreakdown = s.skipped_pages.length
-                    ? ` skip(${s.skipped_pages.length})`
-                    : '';
-                return `${s.document_type_slug}[${s.page_range[0]}-${s.page_range[1]}] extract(${s.extraction_pages.length})${skipBreakdown}@${s.confidence.toFixed(2)}`;
-            })
-            .join(', ') || '(none)';
-
-        const totalExtractPages = sections.reduce((n, s) => n + s.extraction_pages.length, 0);
-        const totalSkipPages = sections.reduce((n, s) => n + s.skipped_pages.length, 0);
-        console.log(
-            `🧩 VisualPageClassifierStage: ${sections.length} section(s), file_status=${status}, extract=${totalExtractPages}, skip=${totalSkipPages} — ${sectionSummary}`
-        );
-
-        return {
-            ...context,
-            detectedSections,
-            visualPageClassifier: {
-                success: true,
-                sectionCount: sections.length,
-                extractionPageCount: totalExtractPages,
-                skippedPageCount: totalSkipPages,
-                fileStatus: status,
-            },
-        };
     }
 
     handleError(error, context) {
-        // Optional stage — never fail the file because the classifier failed.
-        // The downstream extractor falls back to its existing behaviour
-        // (OCR everything) when detected_sections is missing.
         console.warn(`⚠️  VisualPageClassifierStage failed (non-fatal) for file ${context.fileId}: ${error.message}`);
         return {
             ...context,

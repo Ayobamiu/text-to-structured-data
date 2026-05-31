@@ -149,6 +149,7 @@ export async function extractAndProcessPerSection({
         sectionResults.push({
             section_index: r.section_index,
             slug: r.slug,
+            record_id: r.record_id || null,
             page_range: r.page_range,
             extraction_pages: r.extraction_pages,
             status: r.status,
@@ -206,6 +207,7 @@ async function runSection({
     const baseMeta = {
         section_index: index,
         slug,
+        record_id: section.record_id || null,
         page_range: pageRange,
         extraction_pages: Array.isArray(section.extraction_pages) ? section.extraction_pages : [],
     };
