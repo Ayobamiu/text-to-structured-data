@@ -82,6 +82,7 @@ export async function extractAndProcessPerSection({
     processingOptions = {},
     maxConcurrency = DEFAULT_MAX_CONCURRENCY,
     getActiveSchema = defaultGetActiveSchema,
+    selectedPages = null,
 }) {
     if (!detectedSections || !Array.isArray(detectedSections.sections)) {
         throw new Error('extractAndProcessPerSection: detectedSections.sections must be an array');
@@ -98,11 +99,27 @@ export async function extractAndProcessPerSection({
     // Build page_number -> text map. Prefer page.text (mineru/extendai
     // primary content); fall back to page.markdown if a future extractor
     // only supplies markdown.
+    //
+    // When selectedPages is provided, the text extraction returned pages
+    // numbered 1..N (sequential), but the classifier's extraction_pages
+    // use original PDF page numbers. We remap: text page at index i maps
+    // to selectedPages[i] (the original PDF page number).
     const pageTextMap = new Map();
-    for (const page of pages) {
-        if (!page || typeof page.page_number !== 'number') continue;
+    for (let i = 0; i < pages.length; i++) {
+        const page = pages[i];
+        if (!page) continue;
         const txt = (page.text ?? page.markdown ?? '').toString();
-        pageTextMap.set(page.page_number, txt);
+
+        // Determine the key: original PDF page number
+        let key;
+        if (selectedPages && Array.isArray(selectedPages) && i < selectedPages.length) {
+            key = selectedPages[i];
+        } else if (typeof page.page_number === 'number') {
+            key = page.page_number;
+        } else {
+            continue;
+        }
+        pageTextMap.set(key, txt);
     }
 
     // Resolve schemas in advance and only once per distinct slug. The
@@ -149,6 +166,7 @@ export async function extractAndProcessPerSection({
         sectionResults.push({
             section_index: r.section_index,
             slug: r.slug,
+            record_id: r.record_id || null,
             page_range: r.page_range,
             extraction_pages: r.extraction_pages,
             status: r.status,
@@ -206,6 +224,7 @@ async function runSection({
     const baseMeta = {
         section_index: index,
         slug,
+        record_id: section.record_id || null,
         page_range: pageRange,
         extraction_pages: Array.isArray(section.extraction_pages) ? section.extraction_pages : [],
     };
