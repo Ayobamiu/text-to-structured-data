@@ -173,6 +173,13 @@ export async function extractAndProcessPerSection({
             error: r.error,
             duration_ms: r.duration_ms,
             ai_metadata: r.ai_metadata,
+            // Large-section guardrail fields (only present when flagged)
+            ...(r.large_section ? {
+                large_section: true,
+                estimated_input_tokens: r.estimated_input_tokens,
+                content_length: r.content_length,
+            } : {}),
+            ...(r.response_truncated ? { response_truncated: true } : {}),
         });
 
         if (r.status === 'success' && r.data !== undefined) {
@@ -260,6 +267,25 @@ async function runSection({
         };
     }
 
+    // ── Large-section guardrails ─────────────────────────────────────
+    // Estimate input token count (rough: ~4 chars per token for English).
+    // Flag sections above threshold so operators can monitor truncation
+    // risk without needing to inspect individual responses.
+    const LARGE_SECTION_TOKEN_THRESHOLD = 25000;
+    const LARGE_SECTION_PAGE_THRESHOLD = 6;
+    const estimatedInputTokens = Math.ceil(contentForAI.length / 4);
+    const pageCount = section.extraction_pages.length;
+    const isLargeSection = estimatedInputTokens > LARGE_SECTION_TOKEN_THRESHOLD
+        || pageCount > LARGE_SECTION_PAGE_THRESHOLD;
+
+    if (isLargeSection) {
+        console.warn(
+            `⚠️ Section ${index} (${slug}, pp ${pageRange.join('-')}): LARGE SECTION — ` +
+            `${pageCount} pages, ~${estimatedInputTokens.toLocaleString()} est. input tokens, ` +
+            `${contentForAI.length.toLocaleString()} chars`
+        );
+    }
+
     const startMs = Date.now();
     let aiResult;
     try {
@@ -275,6 +301,11 @@ async function runSection({
             status: 'failed',
             error: err?.message || String(err),
             duration_ms: Date.now() - startMs,
+            ...(isLargeSection ? {
+                large_section: true,
+                estimated_input_tokens: estimatedInputTokens,
+                content_length: contentForAI.length,
+            } : {}),
         };
     }
     const durationMs = Date.now() - startMs;
@@ -285,7 +316,39 @@ async function runSection({
             status: 'failed',
             error: aiResult?.error || 'AI processing returned no data',
             duration_ms: durationMs,
+            ...(isLargeSection ? {
+                large_section: true,
+                estimated_input_tokens: estimatedInputTokens,
+                content_length: contentForAI.length,
+            } : {}),
         };
+    }
+
+    // ── Truncation detection ─────────────────────────────────────────
+    // Check if the AI response looks truncated (incomplete JSON structure).
+    // This catches the case where max_tokens is hit on the output side.
+    let responseTruncated = false;
+    if (aiResult.data != null) {
+        try {
+            const serialized = typeof aiResult.data === 'string'
+                ? aiResult.data
+                : JSON.stringify(aiResult.data);
+            // Quick heuristic: if the raw response text ends mid-string
+            // or mid-value, JSON.stringify of the parsed result won't match.
+            // A more robust check: look at finish_reason from the AI response.
+            const finishReason = aiResult.metadata?.finish_reason
+                ?? aiResult.metadata?.choices?.[0]?.finish_reason;
+            if (finishReason === 'length') {
+                responseTruncated = true;
+                console.warn(
+                    `⚠️ Section ${index} (${slug}): RESPONSE TRUNCATED (finish_reason=length) — ` +
+                    `response likely hit max_tokens limit`
+                );
+            }
+        } catch {
+            // Serialization failed — data might already be malformed from truncation
+            responseTruncated = true;
+        }
     }
 
     console.log(
@@ -320,6 +383,14 @@ async function runSection({
         data: aiResult.data,
         schema_version: schemaInfo.version,
         schema_id: schemaInfo.schemaId,
+        // Large-section guardrail metadata — included only when flagged so
+        // the monitoring UI can surface sections at risk of truncation.
+        ...(isLargeSection ? {
+            large_section: true,
+            estimated_input_tokens: estimatedInputTokens,
+            content_length: contentForAI.length,
+        } : {}),
+        ...(responseTruncated ? { response_truncated: true } : {}),
     };
 }
 
