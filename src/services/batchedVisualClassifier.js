@@ -21,6 +21,41 @@ import OpenAI from 'openai';
 import { rasterizePdf } from './pdfRasterizer.js';
 import { computeJpegSignature, assignDuplicates, countDuplicates } from './pageDeduplicator.js';
 
+// ---------------------------------------------------------------------------
+// Record ID normalization
+// ---------------------------------------------------------------------------
+
+/**
+ * Normalize a record_id string so that OCR variants of the same identifier
+ * are treated as equal during section grouping and record inventory tracking.
+ *
+ * Transformations (in order):
+ *   1. Trim leading/trailing whitespace
+ *   2. Collapse internal runs of whitespace to nothing around hyphens/dashes
+ *      ("GP- 1" → "GP-1", "MW -2" → "MW-2", "B - 3" → "B-3")
+ *   3. Collapse remaining internal whitespace to a single space
+ *   4. Uppercase ("gp-1" → "GP-1")
+ *   5. Strip trailing punctuation (periods, commas) that OCR sometimes appends
+ *
+ * Returns null for null/undefined/empty-string inputs.
+ */
+export function normalizeRecordId(raw) {
+    if (raw == null) return null;
+    let s = String(raw).trim();
+    if (s.length === 0) return null;
+
+    // Collapse whitespace around hyphens/dashes: "GP- 1" → "GP-1"
+    s = s.replace(/\s*[-–—]\s*/g, '-');
+    // Collapse remaining internal whitespace
+    s = s.replace(/\s+/g, ' ');
+    // Uppercase
+    s = s.toUpperCase();
+    // Strip trailing punctuation
+    s = s.replace(/[.,;:]+$/, '');
+
+    return s.length > 0 ? s : null;
+}
+
 const DEFAULT_OPTIONS = {
     model: 'gpt-4o-mini',
     detail: 'high',
@@ -64,6 +99,11 @@ function buildSystemPrompt(documentTypes) {
         if (skipWhen.length > 0) {
             typeLines.push(`      SKIP rules for ${dt.slug} (pages matching these are NOT this type — use "none"):`);
             for (const rule of skipWhen) typeLines.push(`        • ${rule}`);
+        }
+        const recordIdGuidance = hints.record_id_guidance || null;
+        if (recordIdGuidance) {
+            typeLines.push(`      Record ID rule for ${dt.slug} (use this to determine record_id):`);
+            typeLines.push(`        • ${recordIdGuidance}`);
         }
     }
     typeLines.push('  - none: this page does not match any of the above types');
@@ -285,7 +325,10 @@ export function deriveSectionsFromClassification(pageResults, opts = {}) {
     function flush() {
         if (!currentSection) return;
         const pageNumbers = currentSection.pages.map(p => p.page_number);
-        const confidences = currentSection.pages.map(p => p.confidence ?? 0);
+        // Confidence: only from pages that belong to this section's slug
+        // (absorbed 'none' gap pages should not affect section confidence)
+        const sectionPages = currentSection.pages.filter(p => p.document_type_slug === currentSection.document_type_slug);
+        const confidences = (sectionPages.length > 0 ? sectionPages : currentSection.pages).map(p => p.confidence ?? 0);
         const avgConfidence = confidences.reduce((a, b) => a + b, 0) / confidences.length;
         const minConfidence = Math.min(...confidences);
         const threshold = thresholdsBySlug.get(currentSection.document_type_slug) ?? DEFAULT_THRESHOLD;
@@ -295,12 +338,13 @@ export function deriveSectionsFromClassification(pageResults, opts = {}) {
         for (const p of currentSection.pages) {
             const isData = (p.page_purpose ?? 'unknown') === 'data';
             const isDuplicate = p.duplicate_of != null;
-            if (isData && !isDuplicate) {
+            const isAbsorbedGap = p.document_type_slug === 'none' || !p.document_type_slug;
+            if (isData && !isDuplicate && !isAbsorbedGap) {
                 extraction_pages.push(p.page_number);
             } else {
                 skipped_pages.push({
                     page_number: p.page_number,
-                    reason: p.duplicate_of != null ? 'duplicate' : (p.page_purpose ?? 'unknown'),
+                    reason: isAbsorbedGap ? 'gap_absorbed' : (p.duplicate_of != null ? 'duplicate' : (p.page_purpose ?? 'unknown')),
                     ...(p.duplicate_of != null ? { duplicate_of: p.duplicate_of } : {}),
                 });
             }
@@ -323,16 +367,22 @@ export function deriveSectionsFromClassification(pageResults, opts = {}) {
         currentSection = null;
     }
 
+    // Buffer for 'none' pages between classified pages. If the next
+    // classified page continues the same section, absorb the buffered
+    // nones as skipped pages (preserving section continuity). If it
+    // starts a new section, the gap was real — flush and discard.
+    let pendingNonePages = [];
+
     for (const page of pageResults) {
         const slug = page.document_type_slug;
 
-        // 'none' pages break runs (produce no section)
+        // Buffer 'none' pages — decide their fate when the next classified page arrives
         if (!slug || slug === 'none') {
-            flush();
+            pendingNonePages.push(page);
             continue;
         }
 
-        // Determine if we should start a new section
+        // Determine if this page continues the current section
         const sameRecordAsCurrent = currentSection &&
             currentSection.document_type_slug === slug &&
             page.record_id && currentSection.record_id &&
@@ -346,13 +396,23 @@ export function deriveSectionsFromClassification(pageResults, opts = {}) {
         );
 
         if (shouldStartNew) {
+            // Gap pages between different sections are true boundaries — discard them
             flush();
+            pendingNonePages = [];
             currentSection = {
                 document_type_slug: slug,
                 record_id: page.record_id,
                 pages: [page],
             };
         } else {
+            // This page continues the current section — absorb buffered none
+            // pages into the section as skipped (preserves section continuity
+            // so all data pages go to one AI call instead of being fragmented)
+            for (const nonePage of pendingNonePages) {
+                currentSection.pages.push(nonePage);
+            }
+            pendingNonePages = [];
+
             currentSection.pages.push(page);
             // Promote record_id if current section didn't have one
             if (page.record_id && !currentSection.record_id) {
@@ -361,6 +421,7 @@ export function deriveSectionsFromClassification(pageResults, opts = {}) {
         }
     }
 
+    // Trailing none pages after the last section are true gaps — discard
     flush();
     return sections;
 }
@@ -445,6 +506,13 @@ export async function classifyPdfBatched({ pdfBuffer, documentTypes, options = {
                 });
             }
             continue;
+        }
+
+        // Normalize record_ids before accumulation so grouping, inventory,
+        // and cross-batch context all see consistent identifiers regardless
+        // of OCR variation ("GP- 1" vs "GP-1" vs "gp-1" all become "GP-1").
+        for (const p of result.pages) {
+            p.record_id = normalizeRecordId(p.record_id);
         }
 
         // Accumulate results
@@ -546,4 +614,5 @@ export async function classifyPdfBatched({ pdfBuffer, documentTypes, options = {
 export default {
     classifyPdfBatched,
     deriveSectionsFromClassification,
+    normalizeRecordId,
 };

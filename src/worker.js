@@ -477,13 +477,16 @@ class FileProcessorWorker {
                 )
             );
 
+            let v1FallbackReason = null;
             if (usePerSection && !hasExtractableSections) {
+                v1FallbackReason = 'no_extractable_sections';
                 console.warn(
                     `⚠️ Per-section extraction requested but no extractable sections were ` +
                     `found for ${file.filename}; falling through to v1 single-schema path. ` +
                     `This usually means the visual classifier did not run or its output is missing.`
                 );
             } else if (usePerSection && hasExtractableSections && !Array.isArray(extractionResult.pages)) {
+                v1FallbackReason = 'pages_not_array';
                 console.warn(
                     `⚠️ Per-section extraction requested with ${detectedSections.sections.length} section(s) ` +
                     `but extractionResult.pages is ${typeof extractionResult.pages}, not an array. ` +
@@ -637,7 +640,13 @@ class FileProcessorWorker {
                 // Merge pre-processing metadata with processing metadata
                 const finalMetadata = {
                     ...processingResult.metadata,
-                    ...preProcessingMetadata // Include comprehensive page detection metadata
+                    ...preProcessingMetadata, // Include comprehensive page detection metadata
+                    // Flag degraded result when per-section was requested but fell through to v1
+                    ...(v1FallbackReason ? {
+                        result_envelope: 'v1_fallback',
+                        v1_fallback_reason: v1FallbackReason,
+                        v1_fallback_schema: schemaData?.schemaName || null,
+                    } : {}),
                 };
 
                 await updateFileProcessingStatus(
