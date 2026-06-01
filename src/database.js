@@ -238,8 +238,8 @@ export async function getJobDetailsWithSummary(jobId) {
         // Set statement timeout for this connection (30 seconds)
         await client.query('SET statement_timeout = 30000');
 
-        // Run job query + stats table lookup in parallel
-        const [jobResult, statsResult] = await Promise.all([
+        // Run job query + stats table lookup + record count in parallel
+        const [jobResult, statsResult, recordCountResult] = await Promise.all([
             client.query(`
                 SELECT id, name, status, schema_data, user_id, organization_id,
                        created_at, updated_at, extraction_mode, processing_config
@@ -247,6 +247,10 @@ export async function getJobDetailsWithSummary(jobId) {
             `, [jobId]),
             client.query(`
                 SELECT * FROM job_file_stats WHERE job_id = $1
+            `, [jobId]),
+            client.query(`
+                SELECT COALESCE(SUM(jsonb_array_length(detected_sections->'sections')), 0)::int as total_records
+                FROM job_files WHERE job_id = $1
             `, [jobId])
         ]);
 
@@ -293,7 +297,8 @@ export async function getJobDetailsWithSummary(jobId) {
                 processing_failed: row.processing_failed,
                 // Combined counts for summary display
                 processing: epr + ppr,
-                pending: Math.min(ep, pp) // both extraction & processing pending
+                pending: Math.min(ep, pp), // both extraction & processing pending
+                total_records: recordCountResult.rows[0]?.total_records ?? 0,
             };
         } else {
             // Fallback: COUNT(*) for jobs that existed before stats table
@@ -326,7 +331,8 @@ export async function getJobDetailsWithSummary(jobId) {
                     processing_completed: 0,
                     processing_failed: 0,
                     processing: 0,
-                    pending: 0
+                    pending: 0,
+                    total_records: 0,
                 };
             } else {
                 const row = summaryResult.rows[0];
@@ -341,7 +347,8 @@ export async function getJobDetailsWithSummary(jobId) {
                     processing_completed: parseInt(row.processing_completed, 10),
                     processing_failed: parseInt(row.processing_failed, 10),
                     processing: parseInt(row.processing || 0, 10),
-                    pending: parseInt(row.pending || 0, 10)
+                    pending: parseInt(row.pending || 0, 10),
+                    total_records: recordCountResult.rows[0]?.total_records ?? 0,
                 };
             }
         }
