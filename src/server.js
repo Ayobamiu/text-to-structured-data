@@ -539,6 +539,98 @@ app.get("/system-stats", async (req, res) => {
     }
 });
 
+// ── Section monitoring ─────────────────────────────────────────────────
+// Returns per-section extraction stats for the monitoring UI: large
+// sections, truncation events, token estimates. Queries extraction_metadata
+// JSONB so no schema migration is needed.
+app.get("/monitoring/sections", authenticateToken, async (req, res) => {
+    try {
+        const { limit = 200, jobId } = req.query;
+        const organizationIds = await getUserOrganizationIds(req.user);
+        if (organizationIds.length === 0) {
+            return res.json({ status: "success", sections: [], summary: {} });
+        }
+
+        const client = await pool.connect();
+        try {
+            const orgPlaceholders = organizationIds.map((_, i) => `$${i + 1}`).join(',');
+            const params = [...organizationIds];
+            let jobFilter = '';
+            if (jobId) {
+                params.push(jobId);
+                jobFilter = `AND jf.job_id = $${params.length}`;
+            }
+            params.push(parseInt(limit));
+
+            // Extract section_results array elements with their parent file context
+            const query = `
+                SELECT
+                    jf.id as file_id,
+                    jf.filename,
+                    jf.job_id,
+                    j.name as job_name,
+                    jf.page_count,
+                    sr->>'slug' as slug,
+                    sr->>'record_id' as record_id,
+                    sr->'page_range' as page_range,
+                    sr->'extraction_pages' as extraction_pages,
+                    sr->>'status' as status,
+                    sr->>'error' as error,
+                    (sr->>'duration_ms')::int as duration_ms,
+                    (sr->>'estimated_input_tokens')::int as estimated_input_tokens,
+                    (sr->>'content_length')::int as content_length,
+                    COALESCE((sr->>'large_section')::boolean, false) as large_section,
+                    COALESCE((sr->>'response_truncated')::boolean, false) as response_truncated,
+                    jsonb_array_length(sr->'extraction_pages') as section_page_count,
+                    jf.created_at
+                FROM job_files jf
+                JOIN jobs j ON jf.job_id = j.id
+                CROSS JOIN LATERAL jsonb_array_elements(jf.extraction_metadata->'section_results') sr
+                WHERE j.organization_id IN (${orgPlaceholders})
+                ${jobFilter}
+                AND jf.extraction_metadata->'section_results' IS NOT NULL
+                ORDER BY
+                    COALESCE((sr->>'large_section')::boolean, false) DESC,
+                    COALESCE((sr->>'response_truncated')::boolean, false) DESC,
+                    (sr->>'estimated_input_tokens')::int DESC NULLS LAST,
+                    jf.created_at DESC
+                LIMIT $${params.length}
+            `;
+
+            const result = await client.query(query, params);
+
+            // Build summary stats
+            const sections = result.rows;
+            const totalSections = sections.length;
+            const largeSections = sections.filter(s => s.large_section).length;
+            const truncated = sections.filter(s => s.response_truncated).length;
+            const failed = sections.filter(s => s.status === 'failed').length;
+            const avgTokens = totalSections > 0
+                ? Math.round(sections.reduce((sum, s) => sum + (s.estimated_input_tokens || 0), 0) / totalSections)
+                : 0;
+            const maxTokens = Math.max(0, ...sections.map(s => s.estimated_input_tokens || 0));
+
+            res.json({
+                status: "success",
+                sections,
+                summary: {
+                    total_sections: totalSections,
+                    large_sections: largeSections,
+                    truncated,
+                    failed,
+                    avg_estimated_tokens: avgTokens,
+                    max_estimated_tokens: maxTokens,
+                },
+            });
+        } finally {
+            client.release();
+        }
+    } catch (error) {
+        console.error('❌ Section monitoring error:', error.message);
+        res.status(500).json({ status: "error", message: error.message });
+    }
+});
+
 // List jobs
 app.get("/jobs", authenticateToken, async (req, res) => {
     try {
