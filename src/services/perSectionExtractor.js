@@ -37,6 +37,7 @@
  * `maxConcurrency` if a doc explodes into many sections.
  */
 
+import { v4 as uuidv4 } from 'uuid';
 import { getActiveSchema as defaultGetActiveSchema } from './schemaRegistry.js';
 
 const DEFAULT_MAX_CONCURRENCY = 6;
@@ -185,7 +186,7 @@ export async function extractAndProcessPerSection({
         if (r.status === 'success' && r.data !== undefined) {
             anySuccess = true;
             if (!envelope[r.slug]) envelope[r.slug] = [];
-            envelope[r.slug].push(r.data);
+            envelope[r.slug].push({ section_result_id: r.section_result_id, ...r.data });
 
             if (r.schema_version != null) {
                 // Last writer wins — for multi-instance same-slug, all
@@ -229,6 +230,7 @@ async function runSection({
         : [section.extraction_pages?.[0] ?? null, section.extraction_pages?.at(-1) ?? null];
 
     const baseMeta = {
+        section_result_id: uuidv4(),
         section_index: index,
         slug,
         record_id: section.record_id || null,
