@@ -999,6 +999,16 @@ app.get("/files/:id/result", authenticateToken, async (req, res) => {
             });
         }
 
+        // Attach section verifications if any exist
+        const svResult = await pool.query(
+            `SELECT sv.*, u.email AS verified_by_email
+             FROM section_verifications sv
+             LEFT JOIN users u ON sv.verified_by = u.id
+             WHERE sv.file_id = $1 ORDER BY sv.created_at`,
+            [id]
+        );
+        file.section_verifications = svResult.rows;
+
         res.json({
             status: "success",
             file: file
@@ -2413,6 +2423,173 @@ app.put("/files/:id/verify", authenticateToken, requireRole('admin'), async (req
             message: "Failed to update file verification",
             error: error.message
         });
+    }
+});
+
+// ── Section-level verification ───────────────────────────────────
+
+// GET  /files/:id/section-verifications
+// Returns all verification rows for a file, keyed by section_result_id.
+app.get("/files/:id/section-verifications", authenticateToken, async (req, res) => {
+    try {
+        const { id: fileId } = req.params;
+        const result = await pool.query(
+            `SELECT sv.*, u.email AS verified_by_email
+             FROM section_verifications sv
+             LEFT JOIN users u ON sv.verified_by = u.id
+             WHERE sv.file_id = $1
+             ORDER BY sv.created_at`,
+            [fileId]
+        );
+        res.json({ status: "success", data: result.rows });
+    } catch (error) {
+        console.error('Error fetching section verifications:', error);
+        res.status(500).json({ status: "error", message: error.message });
+    }
+});
+
+// PUT  /files/:id/section-verifications/:sectionResultId
+// Upsert a single section's verification status.
+app.put("/files/:id/section-verifications/:sectionResultId", authenticateToken, async (req, res) => {
+    try {
+        const { id: fileId, sectionResultId } = req.params;
+        const { status: verifyStatus, notes } = req.body;
+
+        if (!['pending', 'approved', 'rejected', 'in_review'].includes(verifyStatus)) {
+            return res.status(400).json({
+                status: "error",
+                message: "status must be one of: pending, approved, rejected, in_review",
+            });
+        }
+
+        const result = await pool.query(
+            `INSERT INTO section_verifications (file_id, section_result_id, status, verified_by, verified_at, notes)
+             VALUES ($1, $2, $3, $4, NOW(), $5)
+             ON CONFLICT (file_id, section_result_id)
+             DO UPDATE SET status = $3, verified_by = $4, verified_at = NOW(), notes = COALESCE($5, section_verifications.notes), updated_at = NOW()
+             RETURNING *`,
+            [fileId, sectionResultId, verifyStatus, req.user.id, notes ?? null]
+        );
+
+        // Recompute file-level review_status from section verifications
+        // Must compare against total sections in result, not just verification rows
+        const [verRows, totalRow] = await Promise.all([
+            pool.query(`SELECT status FROM section_verifications WHERE file_id = $1`, [fileId]),
+            pool.query(
+                `SELECT COALESCE(SUM(jsonb_array_length(v)), 0)::int AS total
+                 FROM job_files, jsonb_each(result) AS kv(k, v)
+                 WHERE id = $1 AND jsonb_typeof(result) = 'object'`,
+                [fileId]
+            ),
+        ]);
+        const statuses = verRows.rows.map(r => r.status);
+        const totalSections = totalRow.rows[0]?.total ?? 0;
+        let fileReviewStatus = 'pending';
+        if (statuses.length > 0) {
+            if (statuses.every(s => s === 'approved') && statuses.length >= totalSections) {
+                fileReviewStatus = 'approved';
+            } else if (statuses.some(s => s === 'rejected')) {
+                fileReviewStatus = 'rejected';
+            } else if (statuses.some(s => s === 'approved' || s === 'in_review')) {
+                fileReviewStatus = 'in_review';
+            }
+        }
+        await pool.query(
+            `UPDATE job_files SET review_status = $1, updated_at = NOW() WHERE id = $2`,
+            [fileReviewStatus, fileId]
+        );
+
+        res.json({
+            status: "success",
+            data: result.rows[0],
+            file_review_status: fileReviewStatus,
+        });
+    } catch (error) {
+        console.error('Error upserting section verification:', error);
+        res.status(500).json({ status: "error", message: error.message });
+    }
+});
+
+// PUT  /files/:id/section-verifications-bulk
+// Set the same status for multiple sections at once (e.g. approve-all).
+app.put("/files/:id/section-verifications-bulk", authenticateToken, async (req, res) => {
+    try {
+        const { id: fileId } = req.params;
+        const { sectionResultIds, status: verifyStatus, notes } = req.body;
+
+        if (!Array.isArray(sectionResultIds) || sectionResultIds.length === 0) {
+            return res.status(400).json({ status: "error", message: "sectionResultIds must be a non-empty array" });
+        }
+        if (!['pending', 'approved', 'rejected', 'in_review'].includes(verifyStatus)) {
+            return res.status(400).json({ status: "error", message: "status must be one of: pending, approved, rejected, in_review" });
+        }
+
+        const client = await pool.connect();
+        try {
+            await client.query('BEGIN');
+
+            for (const sectionResultId of sectionResultIds) {
+                await client.query(
+                    `INSERT INTO section_verifications (file_id, section_result_id, status, verified_by, verified_at, notes)
+                     VALUES ($1, $2, $3, $4, NOW(), $5)
+                     ON CONFLICT (file_id, section_result_id)
+                     DO UPDATE SET status = $3, verified_by = $4, verified_at = NOW(), notes = COALESCE($5, section_verifications.notes), updated_at = NOW()`,
+                    [fileId, sectionResultId, verifyStatus, req.user.id, notes ?? null]
+                );
+            }
+
+            // Recompute file-level review_status
+            // Must compare against total sections in result, not just verification rows
+            const [verRows, totalRow] = await Promise.all([
+                client.query(`SELECT status FROM section_verifications WHERE file_id = $1`, [fileId]),
+                client.query(
+                    `SELECT COALESCE(SUM(jsonb_array_length(v)), 0)::int AS total
+                     FROM job_files, jsonb_each(result) AS kv(k, v)
+                     WHERE id = $1 AND jsonb_typeof(result) = 'object'`,
+                    [fileId]
+                ),
+            ]);
+            const statuses = verRows.rows.map(r => r.status);
+            const totalSections = totalRow.rows[0]?.total ?? 0;
+            let fileReviewStatus = 'pending';
+            if (statuses.length > 0) {
+                if (statuses.every(s => s === 'approved') && statuses.length >= totalSections) {
+                    fileReviewStatus = 'approved';
+                } else if (statuses.some(s => s === 'rejected')) {
+                    fileReviewStatus = 'rejected';
+                } else if (statuses.some(s => s === 'approved' || s === 'in_review')) {
+                    fileReviewStatus = 'in_review';
+                }
+            }
+            await client.query(
+                `UPDATE job_files SET review_status = $1, updated_at = NOW() WHERE id = $2`,
+                [fileReviewStatus, fileId]
+            );
+
+            await client.query('COMMIT');
+
+            const updated = await pool.query(
+                `SELECT sv.*, u.email AS verified_by_email
+                 FROM section_verifications sv
+                 LEFT JOIN users u ON sv.verified_by = u.id
+                 WHERE sv.file_id = $1 ORDER BY sv.created_at`,
+                [fileId]
+            );
+
+            res.json({
+                status: "success",
+                data: updated.rows,
+                file_review_status: fileReviewStatus,
+            });
+        } catch (err) {
+            await client.query('ROLLBACK');
+            throw err;
+        } finally {
+            client.release();
+        }
+    } catch (error) {
+        console.error('Error bulk-updating section verifications:', error);
+        res.status(500).json({ status: "error", message: error.message });
     }
 });
 
