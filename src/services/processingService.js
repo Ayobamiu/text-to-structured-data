@@ -1,15 +1,19 @@
 import OpenAI from 'openai';
+import Anthropic from '@anthropic-ai/sdk';
 import QwenProcessor from './qwenProcessor.js';
 import {
     PROCESSING_METHODS,
     OPENAI_MODELS_LIST,
     QWEN_MODELS_LIST,
+    CLAUDE_MODELS_LIST,
     getDefaultModel as getConfigDefaultModel,
     getDefaultOptions as getConfigDefaultOptions,
     getOpenAIUpgradeModel
 } from '../config/processingConfig.js';
 import { parseOpenAiStructuredResponse, OpenAiTruncationError } from '../utils/openaiResponse.js';
 import {
+    DOCUMENT_EXTRACTION_SYSTEM_PROMPT,
+    buildDocumentExtractionUserContent,
     buildDocumentExtractionMessages,
     buildDocumentExtractionResponseFormat,
     normalizeExtractionSchemaData,
@@ -21,6 +25,12 @@ class ProcessingService {
             apiKey: process.env.OPENAI_API_KEY,
         });
         this.qwenProcessor = new QwenProcessor();
+
+        // Claude client — lazy-initialized only when CLAUDE_API_KEY is set.
+        // We use CLAUDE_API_KEY (not ANTHROPIC_API_KEY) so it doesn't
+        // collide with the agent SDK's own env var in dev environments.
+        const claudeKey = process.env.CLAUDE_API_KEY;
+        this.anthropic = claudeKey ? new Anthropic({ apiKey: claudeKey }) : null;
     }
 
     /**
@@ -39,6 +49,8 @@ class ProcessingService {
                 return await this.processWithOpenAI(text, schemaData, options);
             } else if (method === PROCESSING_METHODS.QWEN) {
                 return await this.processWithQwen(text, schemaData, options);
+            } else if (method === PROCESSING_METHODS.CLAUDE) {
+                return await this.processWithClaude(text, schemaData, options);
             } else {
                 throw new Error(`Unsupported processing method: ${method}`);
             }
@@ -125,6 +137,23 @@ class ProcessingService {
                     // schema chunking).
                     const upgradeModel = getOpenAIUpgradeModel(modelUsed);
                     if (!upgradeModel) {
+                        // No bigger OpenAI model available. If Claude is
+                        // configured, escalate to it (64K output cap)
+                        // instead of surfacing a truncation error.
+                        if (this.anthropic) {
+                            console.warn(
+                                `⚠️ ${modelUsed} truncated (completion=${firstErr.completion_tokens} tokens). ` +
+                                `No OpenAI upgrade available — escalating to Claude.`
+                            );
+                            return await this.processWithClaude(text, schemaData, {
+                                ...options,
+                                _escalated_from: {
+                                    model: modelUsed,
+                                    reason: 'truncation',
+                                    original_completion_tokens: firstErr.completion_tokens,
+                                },
+                            });
+                        }
                         throw firstErr;
                     }
                     console.warn(
@@ -203,6 +232,121 @@ class ProcessingService {
     }
 
     /**
+     * Process text using Claude (Anthropic).
+     *
+     * Used for large sections that exceed GPT-4.1's 32K output cap.
+     * Claude Sonnet 4.6 supports 64K output tokens via streaming.
+     *
+     * Schema enforcement uses tool_use: we define a single tool whose
+     * input_schema is the extraction schema, then force the model to
+     * call it via tool_choice. The tool call's `input` IS the
+     * structured extraction result — same shape as OpenAI's output.
+     *
+     * @param {string} text - Text to process
+     * @param {Object} schemaData - Schema configuration
+     * @param {Object} options - Claude options
+     * @returns {Promise<Object>} Processing result (same shape as processWithOpenAI)
+     */
+    async processWithClaude(text, schemaData, options = {}) {
+        if (!this.anthropic) {
+            throw new Error(
+                'Claude processing requested but CLAUDE_API_KEY is not set. ' +
+                'Add it to .env to enable Claude routing for large sections.'
+            );
+        }
+
+        const startTime = Date.now();
+
+        try {
+            const model = options.model || getConfigDefaultModel(PROCESSING_METHODS.CLAUDE);
+            const modelDefaults = getConfigDefaultOptions(PROCESSING_METHODS.CLAUDE, model) || {};
+            const effective = { ...modelDefaults, ...options, model };
+
+            console.log(`🤖 Processing with Claude ${effective.model} (large-section route)`);
+
+            // Validate + normalise schema (same function as OpenAI path).
+            const { schemaName, schema } = normalizeExtractionSchemaData(schemaData);
+
+            // Streaming is required for large max_tokens values. We collect
+            // the full response via stream.finalMessage().
+            const stream = this.anthropic.messages.stream({
+                model: effective.model,
+                max_tokens: effective.max_tokens || 64000,
+                ...(typeof effective.temperature === 'number' ? { temperature: effective.temperature } : {}),
+                system: DOCUMENT_EXTRACTION_SYSTEM_PROMPT,
+                messages: [
+                    { role: 'user', content: buildDocumentExtractionUserContent(text) },
+                ],
+                tools: [
+                    {
+                        name: schemaName || 'extract_data',
+                        description:
+                            'Submit the extracted structured data from the document. ' +
+                            'Call this tool exactly once with all extracted fields.',
+                        input_schema: schema,
+                    },
+                ],
+                tool_choice: { type: 'tool', name: schemaName || 'extract_data' },
+            });
+
+            const response = await stream.finalMessage();
+            const endTime = Date.now();
+            const processingTimeSeconds = (endTime - startTime) / 1000;
+
+            // Extract the tool call result
+            const toolBlock = response.content.find((b) => b.type === 'tool_use');
+            if (!toolBlock || !toolBlock.input) {
+                throw new Error(
+                    `Claude response contained no tool_use block (stop_reason: ${response.stop_reason})`
+                );
+            }
+
+            const extractedData = toolBlock.input;
+            const usage = response.usage || {};
+
+            console.log(
+                `✅ Claude processing completed with ${effective.model} in ${processingTimeSeconds.toFixed(2)}s ` +
+                `(in=${usage.input_tokens || '?'} out=${usage.output_tokens || '?'})`
+            );
+
+            return {
+                success: true,
+                data: extractedData,
+                method: 'claude',
+                ai_processing_time_seconds: processingTimeSeconds,
+                metadata: {
+                    processing_method: 'claude',
+                    model: effective.model,
+                    temperature: effective.temperature,
+                    max_tokens: effective.max_tokens,
+                    tokens_used: (usage.input_tokens || 0) + (usage.output_tokens || 0),
+                    prompt_tokens: usage.input_tokens || 0,
+                    completion_tokens: usage.output_tokens || 0,
+                    processing_time: new Date().toISOString(),
+                    processing_time_seconds: processingTimeSeconds,
+                    ai_processing_time_seconds: processingTimeSeconds,
+                    routed_reason: 'large_section',
+                }
+            };
+        } catch (error) {
+            const endTime = Date.now();
+            const processingTimeSeconds = (endTime - startTime) / 1000;
+
+            console.error('❌ Claude processing error:', error.message);
+            return {
+                success: false,
+                error: error.message,
+                method: 'claude',
+                ai_processing_time_seconds: processingTimeSeconds,
+                metadata: {
+                    processing_time_seconds: processingTimeSeconds,
+                    ai_processing_time_seconds: processingTimeSeconds,
+                }
+            };
+        }
+    }
+
+    /**
      * Get available processing methods
      * @returns {Array<string>} List of available methods
      */
@@ -236,11 +380,14 @@ class ProcessingService {
             return this.getAvailableOpenAIModels();
         } else if (method === PROCESSING_METHODS.QWEN) {
             return this.getAvailableQwenModels();
+        } else if (method === PROCESSING_METHODS.CLAUDE) {
+            return CLAUDE_MODELS_LIST;
         }
         // Return all models if no method specified
         return {
             [PROCESSING_METHODS.OPENAI]: this.getAvailableOpenAIModels(),
-            [PROCESSING_METHODS.QWEN]: this.getAvailableQwenModels()
+            [PROCESSING_METHODS.QWEN]: this.getAvailableQwenModels(),
+            [PROCESSING_METHODS.CLAUDE]: CLAUDE_MODELS_LIST,
         };
     }
 

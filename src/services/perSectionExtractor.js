@@ -288,14 +288,42 @@ async function runSection({
         );
     }
 
+    // ── Route large sections to Claude ────────────────────────────────
+    // When a section is flagged as large and the current method is OpenAI,
+    // preemptively route to Claude Sonnet 4.6 (64K output cap) instead of
+    // risking truncation on GPT-4.1's 32K cap. This avoids a wasted
+    // GPT-4.1 call + retry. The fallback path in processingService still
+    // exists for cases where Claude isn't configured.
+    let effectiveMethod = processingMethod;
+    let effectiveOptions = processingOptions;
+    let routedToClaude = false;
+
+    if (isLargeSection && processingMethod === 'openai') {
+        // Only route if Claude API key is configured
+        if (process.env.CLAUDE_API_KEY) {
+            effectiveMethod = 'claude';
+            effectiveOptions = { temperature: 0.1 };
+            routedToClaude = true;
+            console.log(
+                `🔄 Section ${index} (${slug}, pp ${pageRange.join('-')}): ` +
+                `routing to Claude (large section, ~${estimatedInputTokens.toLocaleString()} est. tokens)`
+            );
+        } else {
+            console.warn(
+                `⚠️ Section ${index} (${slug}): large section would benefit from Claude routing ` +
+                `but CLAUDE_API_KEY is not set — falling back to OpenAI`
+            );
+        }
+    }
+
     const startMs = Date.now();
     let aiResult;
     try {
         aiResult = await processingService.processText(
             contentForAI,
             schemaInfo, // { schemaName, schema, ... } — drop-in for processText's schemaData
-            processingMethod,
-            processingOptions
+            effectiveMethod,
+            effectiveOptions
         );
     } catch (err) {
         return {
@@ -392,6 +420,7 @@ async function runSection({
             estimated_input_tokens: estimatedInputTokens,
             content_length: contentForAI.length,
         } : {}),
+        ...(routedToClaude ? { routed_to_claude: true } : {}),
         ...(responseTruncated ? { response_truncated: true } : {}),
     };
 }

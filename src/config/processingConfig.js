@@ -9,7 +9,8 @@ import { Extend, ExtendClient } from "extend-ai";
 
 export const PROCESSING_METHODS = {
     OPENAI: 'openai',
-    QWEN: 'qwen'
+    QWEN: 'qwen',
+    CLAUDE: 'claude',
 };
 
 export const OPENAI_MODELS = {
@@ -59,10 +60,30 @@ export const QWEN_MODELS = {
     QWEN3_CODER_FLASH_2025_07_28: 'qwen3-coder-flash-2025-07-28'
 };
 
+export const CLAUDE_MODELS = {
+    // Claude Sonnet 4.6 — 64K output token cap via streaming.
+    // Used as the escalation target for large sections that exceed
+    // GPT-4.1's 32K output cap. Schema enforcement via tool_use.
+    CLAUDE_SONNET_4_6: 'claude-sonnet-4-6',
+};
+
 // Arrays of all available models for easy iteration/validation
 export const OPENAI_MODELS_LIST = Object.values(OPENAI_MODELS);
 export const QWEN_MODELS_LIST = Object.values(QWEN_MODELS);
+export const CLAUDE_MODELS_LIST = Object.values(CLAUDE_MODELS);
 export const ALL_PROCESSING_METHODS = Object.values(PROCESSING_METHODS);
+
+// Claude default options.
+//
+// `max_tokens` set to 64K — the primary reason for routing to Claude.
+// `temperature` matches OpenAI's extraction setting (0.1).
+// Streaming is required by the Anthropic SDK for large max_tokens values.
+export const CLAUDE_DEFAULT_OPTIONS = {
+    [CLAUDE_MODELS.CLAUDE_SONNET_4_6]: {
+        temperature: 0.1,
+        max_tokens: 64000,
+    },
+};
 
 // Default models for each method.
 //
@@ -73,7 +94,8 @@ export const ALL_PROCESSING_METHODS = Object.values(PROCESSING_METHODS);
 // the same json_schema strict response_format and is cheaper per token.
 export const DEFAULT_MODELS = {
     [PROCESSING_METHODS.OPENAI]: OPENAI_MODELS.GPT_4_1,
-    [PROCESSING_METHODS.QWEN]: QWEN_MODELS.QWEN3_MAX
+    [PROCESSING_METHODS.QWEN]: QWEN_MODELS.QWEN3_MAX,
+    [PROCESSING_METHODS.CLAUDE]: CLAUDE_MODELS.CLAUDE_SONNET_4_6,
 };
 
 // Default options for OpenAI models.
@@ -202,6 +224,8 @@ export function getModelsForMethod(method) {
             return OPENAI_MODELS_LIST;
         case PROCESSING_METHODS.QWEN:
             return QWEN_MODELS_LIST;
+        case PROCESSING_METHODS.CLAUDE:
+            return CLAUDE_MODELS_LIST;
         default:
             return [];
     }
@@ -257,6 +281,13 @@ export function getDefaultOptions(method, model) {
 
         // Default fallback
         return QWEN_DEFAULT_OPTIONS[DEFAULT_MODELS[PROCESSING_METHODS.QWEN]];
+    } else if (method === PROCESSING_METHODS.CLAUDE) {
+        if (CLAUDE_DEFAULT_OPTIONS[model]) return CLAUDE_DEFAULT_OPTIONS[model];
+        // Prefix fallback for future Claude model snapshots
+        if (typeof model === 'string' && model.startsWith('claude-sonnet')) {
+            return CLAUDE_DEFAULT_OPTIONS[CLAUDE_MODELS.CLAUDE_SONNET_4_6];
+        }
+        return CLAUDE_DEFAULT_OPTIONS[DEFAULT_MODELS[PROCESSING_METHODS.CLAUDE]];
     }
 
     return null;
@@ -343,12 +374,15 @@ export default {
     PROCESSING_METHODS,
     OPENAI_MODELS,
     QWEN_MODELS,
+    CLAUDE_MODELS,
     OPENAI_MODELS_LIST,
     QWEN_MODELS_LIST,
+    CLAUDE_MODELS_LIST,
     ALL_PROCESSING_METHODS,
     DEFAULT_MODELS,
     OPENAI_DEFAULT_OPTIONS,
     QWEN_DEFAULT_OPTIONS,
+    CLAUDE_DEFAULT_OPTIONS,
     getModelsForMethod,
     getDefaultModel,
     getDefaultOptions,

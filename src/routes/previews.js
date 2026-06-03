@@ -23,6 +23,7 @@ import {
     getPreviewStatistics
 } from '../database/previewDataTable.js';
 import mgsDataService from '../services/mgsDataService.js';
+import { isV2Envelope, mapRecords, readField } from '../utils/resultEnvelope.js';
 import { authenticateToken, requireRole } from '../middleware/auth.js';
 import {
     extractPreviewClientMeta,
@@ -582,7 +583,9 @@ router.post('/file/:fileId/enrich-with-mgs', async (req, res) => {
             const { result: fileResult } = result.rows[0];
 
             console.log('fileResult', fileResult);
-            if (!fileResult || !fileResult.permit_number) {
+            // Read permit_number from the first record (works for V1 flat and V2 envelope)
+            const permitNumber = readField(fileResult, 'permit_number');
+            if (!fileResult || !permitNumber) {
                 return res.status(400).json({
                     success: false,
                     message: 'No permit number found in file result'
@@ -590,7 +593,7 @@ router.post('/file/:fileId/enrich-with-mgs', async (req, res) => {
             }
 
             // Extract MGS data using the permit number
-            const mgsData = await mgsDataService.getMGSDataByPermitNumber(fileResult.permit_number);
+            const mgsData = await mgsDataService.getMGSDataByPermitNumber(permitNumber);
 
             if (!mgsData) {
                 return res.status(404).json({
@@ -599,8 +602,10 @@ router.post('/file/:fileId/enrich-with-mgs', async (req, res) => {
                 });
             }
 
-            // Merge MGS data into the existing result
-            const updatedResult = mgsDataService.mergeMGSData(fileResult, mgsData);
+            // Merge MGS data into every record (V1: one flat object, V2: each envelope entry)
+            const updatedResult = mapRecords(fileResult, (record) =>
+                mgsDataService.mergeMGSData(record, mgsData)
+            );
 
             // Update the file with merged data
             const updateQuery = `
@@ -691,7 +696,9 @@ router.post('/files/bulk/enrich-with-mgs', async (req, res) => {
                     const resultData = fileData.result;
                     console.log(`📄 File ${fileId} result data:`, resultData ? 'exists' : 'null');
 
-                    if (!resultData || !resultData.permit_number) {
+                    // Read permit_number from first record (V1 or V2)
+                    const permitNum = readField(resultData, 'permit_number');
+                    if (!resultData || !permitNum) {
                         console.log(`⚠️ File ${fileId} has no permit number, skipping MGS enrichment`);
                         results.push({
                             fileId: fileId,
@@ -704,26 +711,28 @@ router.post('/files/bulk/enrich-with-mgs', async (req, res) => {
                         continue;
                     }
 
-                    console.log(`🔍 Looking up MGS data for permit: ${resultData.permit_number}`);
+                    console.log(`🔍 Looking up MGS data for permit: ${permitNum}`);
                     // Get MGS data
-                    const mgsData = await mgsDataService.getMGSDataByPermitNumber(resultData.permit_number);
+                    const mgsData = await mgsDataService.getMGSDataByPermitNumber(permitNum);
 
                     if (!mgsData) {
-                        console.log(`⚠️ No MGS data found for permit: ${resultData.permit_number}, skipping`);
+                        console.log(`⚠️ No MGS data found for permit: ${permitNum}, skipping`);
                         results.push({
                             fileId: fileId,
                             filename: fileData.filename,
                             success: true,
                             skipped: true,
-                            reason: `No MGS data found for permit number: ${resultData.permit_number}`
+                            reason: `No MGS data found for permit number: ${permitNum}`
                         });
                         successCount++;
                         continue;
                     }
 
                     console.log(`✅ Found MGS data for ${fileId}:`, Object.keys(mgsData));
-                    // Merge MGS data into existing result
-                    const updatedResult = mgsDataService.mergeMGSData(resultData, mgsData);
+                    // Merge MGS data into every record (V1 or V2)
+                    const updatedResult = mapRecords(resultData, (record) =>
+                        mgsDataService.mergeMGSData(record, mgsData)
+                    );
 
                     // Update the file result
                     const updateQuery = `
