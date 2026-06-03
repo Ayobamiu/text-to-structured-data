@@ -96,6 +96,8 @@ export function applyChangeSectionSlug(detectedSections, { index, slug, threshol
         section.threshold_used = Number(threshold);
     }
     section.status = 'approved';
+    // Different slug = different schema → old extraction is invalid.
+    section.section_result_id = null;
 
     const [start, end] = section.page_range;
     for (const p of blob.pages || []) {
@@ -235,16 +237,87 @@ function buildSectionFromPages(allPages, [start, end], proto) {
         page_purposes,
         confidence: Number(confidence.toFixed(4)),
         min_page_confidence: Number(minConfidence.toFixed(4)),
-        // Splitting is an explicit human decision: both halves come out
-        // 'approved' so they're eligible for extraction without a separate
-        // approve step.
+        // Splitting/merging is an explicit human decision: new sections come
+        // out 'approved' so they're eligible for extraction without a
+        // separate approve step.
         status: 'approved',
         threshold_used: proto.threshold_used,
+        // New section has no extraction result yet — signals "needs extraction".
+        section_result_id: null,
     };
+}
+
+/**
+ * Merge two adjacent sections into one. The resulting section inherits
+ * the first section's slug and threshold_used (the operator chose which
+ * section to expand, so the first section is the "anchor").
+ *
+ * Both sections must be adjacent — the first section's last page + 1 must
+ * equal the second section's first page. Throws otherwise.
+ *
+ * The merged section is marked `'approved'` (merging is a deliberate
+ * human routing decision).
+ *
+ * @param {Object} detectedSections  The full detected_sections blob.
+ * @param {Object} args
+ * @param {number} args.indexA       Index of the first section.
+ * @param {number} args.indexB       Index of the second section.
+ *                                   Must equal indexA + 1 (adjacent).
+ * @param {string} [args.slug]      Optional slug override for the merged
+ *                                   section. Defaults to sectionA's slug.
+ */
+export function applyMergeSections(detectedSections, { indexA, indexB, slug }) {
+    if (!Number.isInteger(indexA) || !Number.isInteger(indexB)) {
+        throw new Error('indexA and indexB must be integers');
+    }
+    if (indexB !== indexA + 1) {
+        throw new Error(
+            `Can only merge adjacent sections (indexB must be indexA + 1). ` +
+            `Got indexA=${indexA}, indexB=${indexB}`
+        );
+    }
+
+    const blob = cloneBlob(detectedSections);
+    const secA = requireSection(blob, indexA);
+    const secB = requireSection(blob, indexB);
+
+    // Verify adjacency by page range
+    if (secA.page_range[1] + 1 !== secB.page_range[0]) {
+        throw new Error(
+            `Sections are not page-adjacent: section ${indexA} ends at page ${secA.page_range[1]}, ` +
+            `section ${indexB} starts at page ${secB.page_range[0]}. ` +
+            `Expected a gap of exactly 1.`
+        );
+    }
+
+    const allPages = Array.isArray(blob.pages) ? blob.pages : [];
+    const mergedRange = [secA.page_range[0], secB.page_range[1]];
+
+    // Use the resolved slug (override or inherit from first section)
+    const proto = {
+        ...secA,
+        document_type_slug: slug || secA.document_type_slug,
+    };
+
+    const merged = buildSectionFromPages(allPages, mergedRange, proto);
+
+    // Replace both sections with the merged one
+    blob.sections.splice(indexA, 2, merged);
+    blob.status = deriveFileStatus(blob.sections);
+    appendEdit(blob, {
+        kind: 'merge',
+        section_index_a: indexA,
+        section_index_b: indexB,
+        merged_slug: merged.document_type_slug,
+        merged_page_range: mergedRange,
+    });
+
+    return blob;
 }
 
 export default {
     applyApproveSection,
     applyChangeSectionSlug,
     applySplitSection,
+    applyMergeSections,
 };

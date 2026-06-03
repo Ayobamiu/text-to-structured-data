@@ -9,7 +9,8 @@ import {
     updateFileExtractionStatus,
     updateFileProcessingStatus,
     updateJobStatus,
-    updateFileSelectedPages
+    updateFileSelectedPages,
+    updateFileDetectedSections
 } from './database.js';
 import S3Service from './s3Service.js';
 import ExtractionService from './services/extractionService.js';
@@ -525,6 +526,17 @@ class FileProcessorWorker {
                         || 'No section produced an extractable result';
                     throw new Error(`Per-section extraction failed: ${firstError}`);
                 }
+
+                // Write section_result_ids back to detected_sections so each
+                // section carries a stable link to its extraction record.
+                // This enables ID-based matching in split/merge/re-extract.
+                for (const sr of perSection.sectionResults) {
+                    if (sr.status === 'success' && sr.section_result_id) {
+                        const sec = detectedSections.sections[sr.section_index];
+                        if (sec) sec.section_result_id = sr.section_result_id;
+                    }
+                }
+                await updateFileDetectedSections(file.id, detectedSections);
 
                 const finalMetadata = {
                     ...preProcessingMetadata,
