@@ -7,7 +7,13 @@
  * Each flag is: { name, passed, message, severity, emphasis?, details? }
  *
  * Currently only applies to the MGS Michigan Well job.
+ *
+ * Supports both V1 flat results and V2 per-section envelopes. For V2,
+ * constraints are computed against the first record in the envelope
+ * (all records in a single-slug MGS file share the same well metadata).
  */
+
+import { getFirstRecord } from '../utils/resultEnvelope.js';
 
 const MGS_MICHIGAN_WELL_JOB_ID = '5667fe82-63e1-47fa-a640-b182b5c5d034';
 
@@ -88,8 +94,12 @@ export function computeFlags({ jobId, filename, processingStatus, result, proces
         return flags;
     }
 
+    // Unwrap V2 envelope → flat record so all field accesses below work.
+    // For V1 this is a no-op (returns result as-is).
+    const record = getFirstRecord(result);
+
     // --- 0. County name vs MGS inventory ---
-    const extractedCounty = result?.county || null;
+    const extractedCounty = record?.county || null;
     const expectedCounty = processingMetadata?.mgs_expected_county || null;
 
     if (extractedCounty && expectedCounty) {
@@ -119,7 +129,7 @@ export function computeFlags({ jobId, filename, processingStatus, result, proces
     }
 
     // --- 1. Permit number mismatch ---
-    const dataPermit = extractPermitFromData(result);
+    const dataPermit = extractPermitFromData(record);
     const filenamePermit = extractPermitFromFilename(filename);
 
     if (filenamePermit && dataPermit) {
@@ -136,18 +146,18 @@ export function computeFlags({ jobId, filename, processingStatus, result, proces
     }
 
     // --- 2. API number ---
-    const hasApiNumber = !!result?.api_number;
+    const hasApiNumber = !!record?.api_number;
     flags.push({
         name: 'API Number',
         passed: hasApiNumber,
         message: hasApiNumber
-            ? `API number: ${result.api_number}`
+            ? `API number: ${record.api_number}`
             : 'API number not found in extracted data',
         severity: hasApiNumber ? 'info' : 'error',
     });
 
     // --- 3. Elevation ---
-    const elevation = result?.elevation;
+    const elevation = record?.elevation;
     const correctElevation = elevation && elevation > 100;
     flags.push({
         name: 'Elevation',
@@ -162,7 +172,7 @@ export function computeFlags({ jobId, filename, processingStatus, result, proces
     });
 
     // --- 4. Formation count ---
-    const formationCount = result?.formations?.length || 0;
+    const formationCount = record?.formations?.length || 0;
     const correctFormationCount = formationCount >= 10;
     flags.push({
         name: 'Formation Count',
@@ -175,8 +185,8 @@ export function computeFlags({ jobId, filename, processingStatus, result, proces
     });
 
     // --- 5. Measured depth vs last formation depth ---
-    const measuredDepth = result?.measured_depth;
-    const formations = result?.formations || [];
+    const measuredDepth = record?.measured_depth;
+    const formations = record?.formations || [];
 
     if (measuredDepth != null && formations.length > 0) {
         const sortedFormations = [...formations]
@@ -238,7 +248,7 @@ export function computeFlags({ jobId, filename, processingStatus, result, proces
     }
 
     // --- 7. Perforation intervals ---
-    const perforationIntervals = result?.perforation_intervals || [];
+    const perforationIntervals = record?.perforation_intervals || [];
     const hasPerfs = Array.isArray(perforationIntervals) && perforationIntervals.length > 0;
     flags.push({
         name: 'Perforation Intervals',
@@ -251,7 +261,7 @@ export function computeFlags({ jobId, filename, processingStatus, result, proces
     });
 
     // --- 8. Pluggings ---
-    const pluggings = result?.pluggings || [];
+    const pluggings = record?.pluggings || [];
     const hasPluggings = Array.isArray(pluggings) && pluggings.length > 0;
     flags.push({
         name: 'Pluggings',
@@ -264,7 +274,7 @@ export function computeFlags({ jobId, filename, processingStatus, result, proces
     });
 
     // --- 9. Shows depths ---
-    const showsDepths = result?.shows_depths || [];
+    const showsDepths = record?.shows_depths || [];
     const hasShows = Array.isArray(showsDepths) && showsDepths.length > 0;
     flags.push({
         name: 'Shows Depths',
@@ -277,7 +287,7 @@ export function computeFlags({ jobId, filename, processingStatus, result, proces
     });
 
     // --- 10. Casing ---
-    const casing = result?.casing || [];
+    const casing = record?.casing || [];
     const hasCasing = Array.isArray(casing) && casing.length > 0;
     flags.push({
         name: 'Casing',

@@ -1,12 +1,16 @@
 import { PipelineStage } from '../PipelineStage.js';
 import mgsDataService from '../../services/mgsDataService.js';
 import { addItemsToPreview } from '../../database/previewDataTable.js';
+import { isV2Envelope, mapRecords, readField } from '../../utils/resultEnvelope.js';
 
 /**
  * Pipeline stage for MGS-specific processing
  * - Auto-fixes permit numbers
  * - Merges MGS data
  * - Adds to preview
+ *
+ * Supports both V1 flat results and V2 per-section envelopes.
+ * For V2, the fix/merge is applied to every record inside the envelope.
  */
 export class MGSPermitFixStage extends PipelineStage {
     constructor(options = {}) {
@@ -32,16 +36,23 @@ export class MGSPermitFixStage extends PipelineStage {
 
     async execute(context) {
         const { result, filename } = context;
+        const v2 = isV2Envelope(result);
 
-        console.log(`🔧 Starting MGS processing for file ${context.fileId}`);
+        console.log(`🔧 Starting MGS processing for file ${context.fileId}${v2 ? ' (v2 envelope)' : ''}`);
 
-        // Step 1: Fix permit number
-        let finalResult = mgsDataService.autoFixPermitNumber(result, filename);
-        const extractedCountyFromDocument = finalResult?.county || null;
+        // Step 1: Fix permit number (applies to every record)
+        let finalResult = mapRecords(result, (record) =>
+            mgsDataService.autoFixPermitNumber(record, filename)
+        );
+
+        const extractedCountyFromDocument = readField(finalResult, 'county') || null;
         console.log(`✅ Step 1: Permit number fixed for ${filename}`);
 
         // Step 2: Look up and merge MGS data
-        const permitNumber = mgsDataService.extractPermitFromData(finalResult);
+        // Read permit from the first record regardless of V1/V2
+        const permitNumber = mgsDataService.extractPermitFromData(
+            v2 ? _firstRecord(finalResult) : finalResult
+        );
         let mgsExpectedCounty = null;
         if (permitNumber) {
             console.log(`🔍 Step 2: Looking up MGS data for permit ${permitNumber}`);
@@ -49,7 +60,10 @@ export class MGSPermitFixStage extends PipelineStage {
                 const mgsData = await mgsDataService.getMGSDataByPermitNumber(permitNumber);
                 if (mgsData) {
                     mgsExpectedCounty = mgsData.county || null;
-                    finalResult = mgsDataService.mergeMGSData(finalResult, mgsData);
+                    // Merge into every record
+                    finalResult = mapRecords(finalResult, (record) =>
+                        mgsDataService.mergeMGSData(record, mgsData)
+                    );
                     console.log(`✅ Step 2: MGS data populated for permit ${permitNumber}`);
 
                     // Step 3: Add to preview
@@ -88,5 +102,15 @@ export class MGSPermitFixStage extends PipelineStage {
             }
         };
     }
+}
+
+/** Grab the first record from a V2 envelope (for permit lookup). */
+function _firstRecord(result) {
+    for (const arr of Object.values(result)) {
+        if (Array.isArray(arr) && arr.length > 0 && arr[0] && typeof arr[0] === 'object') {
+            return arr[0];
+        }
+    }
+    return result;
 }
 
