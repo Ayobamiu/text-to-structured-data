@@ -1507,6 +1507,103 @@ app.get("/files/:id/pages/:n/thumbnail.jpg", authenticateToken, async (req, res)
 });
 
 // Update file results endpoint
+// Patch a single record in a V2 envelope by section_result_id.
+// Replaces only the targeted record — much smaller payload than the
+// full-result PUT, avoids PayloadTooLargeError on big files.
+app.patch("/files/:id/result/:sectionResultId", authenticateToken, async (req, res) => {
+    try {
+        const { id: fileId, sectionResultId } = req.params;
+        const { data: recordData } = req.body;
+
+        if (!recordData || typeof recordData !== 'object') {
+            return res.status(400).json({
+                status: 'error',
+                message: 'data (the updated record object) is required in the request body',
+            });
+        }
+
+        const hasAccess = await checkFileAccess(fileId, req.user, res);
+        if (!hasAccess) return;
+
+        const file = await getFileResult(fileId);
+        if (!file) {
+            return res.status(404).json({ status: 'error', message: 'File not found' });
+        }
+
+        const result = file.result;
+        if (!result || typeof result !== 'object') {
+            return res.status(400).json({ status: 'error', message: 'File has no result to patch' });
+        }
+
+        // Find and replace the record with matching section_result_id
+        let found = false;
+        const updatedResult = {};
+        for (const [slug, arr] of Object.entries(result)) {
+            if (!Array.isArray(arr)) {
+                updatedResult[slug] = arr;
+                continue;
+            }
+            updatedResult[slug] = arr.map((rec) => {
+                if (rec?.section_result_id === sectionResultId) {
+                    found = true;
+                    // Preserve section_result_id, replace everything else
+                    return { section_result_id: sectionResultId, ...recordData };
+                }
+                return rec;
+            });
+        }
+
+        if (!found) {
+            return res.status(404).json({
+                status: 'error',
+                message: `No record found with section_result_id '${sectionResultId}'`,
+            });
+        }
+
+        // Recompute flags with the updated full result
+        const flags = computeFlags({
+            jobId: file.job_id,
+            filename: file.filename,
+            processingStatus: file.processing_status || 'completed',
+            result: updatedResult,
+            processingMetadata: file.processing_metadata || null,
+        });
+
+        const client = await pool.connect();
+        try {
+            const updateResult = await client.query(
+                `UPDATE job_files
+                 SET result = $1, flags = $2, updated_at = NOW()
+                 WHERE id = $3
+                 RETURNING id, filename, result`,
+                [JSON.stringify(updatedResult), JSON.stringify(flags), fileId]
+            );
+
+            if (updateResult.rows.length === 0) {
+                return res.status(404).json({ status: 'error', message: 'File not found' });
+            }
+
+            await emitFileFullPatch(file.job_id, fileId, { has_result: true, flags });
+
+            console.log(
+                `✅ Patched record ${sectionResultId.substring(0, 8)}... in file ${file.filename}`
+            );
+
+            res.json({
+                status: 'success',
+                fileId,
+                filename: updateResult.rows[0].filename,
+                sectionResultId,
+            });
+        } finally {
+            client.release();
+        }
+    } catch (error) {
+        console.error('❌ result patch:', error.message);
+        res.status(500).json({ status: 'error', message: error.message });
+    }
+});
+
 app.put("/files/:id/results", authenticateToken, async (req, res) => {
     try {
         const { id } = req.params;
