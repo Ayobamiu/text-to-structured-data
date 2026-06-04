@@ -1507,6 +1507,103 @@ app.get("/files/:id/pages/:n/thumbnail.jpg", authenticateToken, async (req, res)
 });
 
 // Update file results endpoint
+// Patch a single record in a V2 envelope by section_result_id.
+// Replaces only the targeted record — much smaller payload than the
+// full-result PUT, avoids PayloadTooLargeError on big files.
+app.patch("/files/:id/result/:sectionResultId", authenticateToken, async (req, res) => {
+    try {
+        const { id: fileId, sectionResultId } = req.params;
+        const { data: recordData } = req.body;
+
+        if (!recordData || typeof recordData !== 'object') {
+            return res.status(400).json({
+                status: 'error',
+                message: 'data (the updated record object) is required in the request body',
+            });
+        }
+
+        const hasAccess = await checkFileAccess(fileId, req.user, res);
+        if (!hasAccess) return;
+
+        const file = await getFileResult(fileId);
+        if (!file) {
+            return res.status(404).json({ status: 'error', message: 'File not found' });
+        }
+
+        const result = file.result;
+        if (!result || typeof result !== 'object') {
+            return res.status(400).json({ status: 'error', message: 'File has no result to patch' });
+        }
+
+        // Find and replace the record with matching section_result_id
+        let found = false;
+        const updatedResult = {};
+        for (const [slug, arr] of Object.entries(result)) {
+            if (!Array.isArray(arr)) {
+                updatedResult[slug] = arr;
+                continue;
+            }
+            updatedResult[slug] = arr.map((rec) => {
+                if (rec?.section_result_id === sectionResultId) {
+                    found = true;
+                    // Preserve section_result_id, replace everything else
+                    return { section_result_id: sectionResultId, ...recordData };
+                }
+                return rec;
+            });
+        }
+
+        if (!found) {
+            return res.status(404).json({
+                status: 'error',
+                message: `No record found with section_result_id '${sectionResultId}'`,
+            });
+        }
+
+        // Recompute flags with the updated full result
+        const flags = computeFlags({
+            jobId: file.job_id,
+            filename: file.filename,
+            processingStatus: file.processing_status || 'completed',
+            result: updatedResult,
+            processingMetadata: file.processing_metadata || null,
+        });
+
+        const client = await pool.connect();
+        try {
+            const updateResult = await client.query(
+                `UPDATE job_files
+                 SET result = $1, flags = $2, updated_at = NOW()
+                 WHERE id = $3
+                 RETURNING id, filename, result`,
+                [JSON.stringify(updatedResult), JSON.stringify(flags), fileId]
+            );
+
+            if (updateResult.rows.length === 0) {
+                return res.status(404).json({ status: 'error', message: 'File not found' });
+            }
+
+            await emitFileFullPatch(file.job_id, fileId, { has_result: true, flags });
+
+            console.log(
+                `✅ Patched record ${sectionResultId.substring(0, 8)}... in file ${file.filename}`
+            );
+
+            res.json({
+                status: 'success',
+                fileId,
+                filename: updateResult.rows[0].filename,
+                sectionResultId,
+            });
+        } finally {
+            client.release();
+        }
+    } catch (error) {
+        console.error('❌ result patch:', error.message);
+        res.status(500).json({ status: 'error', message: error.message });
+    }
+});
+
 app.put("/files/:id/results", authenticateToken, async (req, res) => {
     try {
         const { id } = req.params;
@@ -2363,6 +2460,438 @@ app.post("/files/:id/sections/:index/split", authenticateToken, async (req, res)
     } catch (error) {
         console.error('❌ section split:', error.message);
         res.status(400).json({ status: 'error', message: error.message });
+    }
+});
+
+// Merge two adjacent sections into one.
+app.post("/files/:id/sections/merge", authenticateToken, async (req, res) => {
+    try {
+        const fileId = req.params.id;
+        const indexA = parseInt(req.body?.indexA, 10);
+        const indexB = parseInt(req.body?.indexB, 10);
+
+        if (!Number.isInteger(indexA) || !Number.isInteger(indexB) || indexA < 0 || indexB < 0) {
+            return res.status(400).json({
+                status: 'error',
+                message: 'indexA and indexB must be non-negative integers',
+            });
+        }
+
+        const slug = req.body?.slug || undefined; // optional slug override
+
+        const hasAccess = await checkFileAccess(fileId, req.user, res);
+        if (!hasAccess) return;
+
+        const file = await loadFileWithSections(fileId, res);
+        if (!file) return;
+
+        const { applyMergeSections } = await import('./services/sectionRoutingEdits.js');
+        const updated = applyMergeSections(file.detected_sections, { indexA, indexB, slug });
+
+        await updateFileDetectedSections(fileId, updated);
+        emitDetectedSectionsUpdate(file, updated);
+
+        res.json({ status: 'success', detected_sections: updated });
+    } catch (error) {
+        console.error('❌ section merge:', error.message);
+        res.status(400).json({ status: 'error', message: error.message });
+    }
+});
+
+// Save updated detected_sections and re-extract sections that need it.
+// The client performs split/merge/slug-change locally, then sends the
+// final blob here. This endpoint persists it, identifies sections with
+// section_result_id === null, extracts those, and rebuilds the envelope.
+app.post("/files/:id/sections/save-and-reextract", authenticateToken, async (req, res) => {
+    try {
+        const fileId = req.params.id;
+        const newDetectedSections = req.body?.detected_sections;
+
+        if (!newDetectedSections || !Array.isArray(newDetectedSections.sections)) {
+            return res.status(400).json({
+                status: 'error',
+                message: 'detected_sections with a sections array is required',
+            });
+        }
+
+        const hasAccess = await checkFileAccess(fileId, req.user, res);
+        if (!hasAccess) return;
+
+        const file = await loadFileWithSections(fileId, res);
+        if (!file) return;
+
+        // Find sections needing extraction (section_result_id === null)
+        const sectionIndices = newDetectedSections.sections
+            .map((s, i) => (s.section_result_id == null ? i : -1))
+            .filter(i => i >= 0);
+
+        // Save the updated detected_sections first (even if no extraction needed)
+        await updateFileDetectedSections(fileId, newDetectedSections);
+
+        if (sectionIndices.length === 0) {
+            // No extraction needed — just save and return
+            emitDetectedSectionsUpdate(file, newDetectedSections);
+            return res.json({ status: 'success', detected_sections: newDetectedSections });
+        }
+
+        // Load pages for extraction
+        const pagesRow = await pool.query(
+            `SELECT pages FROM job_files WHERE id = $1`,
+            [fileId]
+        );
+        const filePages = pagesRow.rows[0]?.pages;
+
+        if (!filePages || !Array.isArray(filePages) || filePages.length === 0) {
+            return res.status(400).json({
+                status: 'error',
+                message: 'File has no extracted pages — run extraction first',
+            });
+        }
+
+        // Get job processing config
+        const jobRow = await pool.query(
+            `SELECT processing_config FROM jobs WHERE id = $1`,
+            [file.job_id]
+        );
+        if (jobRow.rows.length === 0) {
+            return res.status(404).json({ status: 'error', message: 'Job not found' });
+        }
+        const jobProcessingConfig = jobRow.rows[0].processing_config || {};
+        const processingMethod = jobProcessingConfig.processing?.method || 'openai';
+        const processingOptions = jobProcessingConfig.processing?.options || {};
+
+        // Build partial sections blob for extraction
+        const partialSections = {
+            ...newDetectedSections,
+            sections: sectionIndices.map(i => newDetectedSections.sections[i]),
+        };
+
+        const { extractAndProcessPerSection } = await import('./services/perSectionExtractor.js');
+        const ProcessingService = (await import('./services/processingService.js')).default;
+        const processingService = new ProcessingService();
+
+        console.log(
+            `🔄 Save & re-extract for file ${file.filename}: ` +
+            `${sectionIndices.length} section(s) need extraction [${sectionIndices.join(', ')}]`
+        );
+
+        emitFilePatch(file.job_id, fileId, { processing_status: 'processing' });
+
+        const perSection = await extractAndProcessPerSection({
+            detectedSections: partialSections,
+            pages: filePages,
+            processingService,
+            processingMethod,
+            processingOptions,
+            selectedPages: file.selected_pages || null,
+        });
+
+        if (!perSection.anySuccess) {
+            const firstError = perSection.sectionResults.find(r => r.error)?.error
+                || 'No section produced a result';
+            return res.status(500).json({ status: 'error', message: firstError });
+        }
+
+        // ID-based envelope rebuild (same logic as reextract-sections)
+        const newRecordById = new Map();
+        const slugCounters = {};
+        for (let pi = 0; pi < perSection.sectionResults.length; pi++) {
+            const sr = perSection.sectionResults[pi];
+            if (sr.status !== 'success' || !sr.section_result_id) continue;
+            const slug = sr.slug;
+            const slugArr = perSection.resultEnvelope[slug];
+            if (!slugArr) continue;
+            if (slugCounters[slug] == null) slugCounters[slug] = 0;
+            const record = slugArr[slugCounters[slug]++];
+            if (record) newRecordById.set(sr.section_result_id, { slug, record });
+        }
+
+        const oldRecordById = new Map();
+        const existingResult = file.result || {};
+        for (const [slug, arr] of Object.entries(existingResult)) {
+            if (!Array.isArray(arr)) continue;
+            for (const rec of arr) {
+                if (rec?.section_result_id) {
+                    oldRecordById.set(rec.section_result_id, { slug, record: rec });
+                }
+            }
+        }
+
+        // Write new section_result_ids to detected_sections
+        const finalDetectedSections = JSON.parse(JSON.stringify(newDetectedSections));
+        for (let pi = 0; pi < perSection.sectionResults.length; pi++) {
+            const sr = perSection.sectionResults[pi];
+            const originalIndex = sectionIndices[pi];
+            if (sr.status === 'success' && sr.section_result_id) {
+                finalDetectedSections.sections[originalIndex].section_result_id = sr.section_result_id;
+            }
+        }
+        finalDetectedSections.edits = [];
+        await updateFileDetectedSections(fileId, finalDetectedSections);
+
+        // Rebuild envelope by ID
+        const mergedResult = {};
+        for (const section of finalDetectedSections.sections) {
+            const slug = section.document_type_slug;
+            const id = section.section_result_id;
+            if (!slug) continue;
+            if (!mergedResult[slug]) mergedResult[slug] = [];
+
+            const newEntry = id ? newRecordById.get(id) : null;
+            const oldEntry = id ? oldRecordById.get(id) : null;
+
+            if (newEntry) {
+                mergedResult[slug].push(newEntry.record);
+            } else if (oldEntry) {
+                mergedResult[slug].push(oldEntry.record);
+            }
+        }
+
+        const existingMeta = file.extraction_metadata || {};
+        const finalMetadata = {
+            ...existingMeta,
+            result_envelope: 'v2',
+            section_results: perSection.sectionResults.map((sr, pi) => ({
+                ...sr,
+                section_index: sectionIndices[pi],
+            })),
+        };
+
+        await updateFileProcessingStatus(
+            fileId, 'completed', mergedResult, null, finalMetadata,
+            perSection.totalAiTimeSeconds || null
+        );
+
+        emitFilePatch(file.job_id, fileId, {
+            processing_status: 'completed',
+            result: mergedResult,
+            detected_sections: finalDetectedSections,
+        });
+
+        console.log(
+            `✅ Save & re-extract completed for file ${file.filename}: ` +
+            `${perSection.sectionResults.filter(r => r.status === 'success').length} succeeded`
+        );
+
+        res.json({
+            status: 'success',
+            detected_sections: finalDetectedSections,
+            sectionResults: perSection.sectionResults,
+        });
+    } catch (error) {
+        console.error('❌ save-and-reextract:', error.message);
+        res.status(500).json({ status: 'error', message: error.message });
+    }
+});
+
+// Re-extract specific sections (after split/merge/slug-change).
+// Runs per-section extraction on only the requested section indices,
+// then merges results into the existing V2 envelope.
+app.post("/files/:id/reextract-sections", authenticateToken, async (req, res) => {
+    try {
+        const fileId = req.params.id;
+        const sectionIndices = req.body?.sectionIndices; // number[] — which sections to re-extract
+
+        if (!Array.isArray(sectionIndices) || sectionIndices.length === 0) {
+            return res.status(400).json({
+                status: 'error',
+                message: 'sectionIndices must be a non-empty array of section indices',
+            });
+        }
+
+        const hasAccess = await checkFileAccess(fileId, req.user, res);
+        if (!hasAccess) return;
+
+        const file = await loadFileWithSections(fileId, res);
+        if (!file) return;
+
+        // getFileResult omits the (large) pages column, so load it separately.
+        const pagesRow = await pool.query(
+            `SELECT pages FROM job_files WHERE id = $1`,
+            [fileId]
+        );
+        const filePages = pagesRow.rows[0]?.pages;
+
+        if (!filePages || !Array.isArray(filePages) || filePages.length === 0) {
+            return res.status(400).json({
+                status: 'error',
+                message: 'File has no extracted pages — run extraction first',
+            });
+        }
+
+        // Get the job's processing config
+        const jobRow = await pool.query(
+            `SELECT processing_config, schema_data FROM jobs WHERE id = $1`,
+            [file.job_id]
+        );
+        if (jobRow.rows.length === 0) {
+            return res.status(404).json({ status: 'error', message: 'Job not found' });
+        }
+        const jobProcessingConfig = jobRow.rows[0].processing_config || {};
+        const processingMethod = jobProcessingConfig.processing?.method || 'openai';
+        const processingOptions = jobProcessingConfig.processing?.options || {};
+
+        // Build a subset of detected_sections containing only the requested indices
+        const allSections = file.detected_sections.sections;
+        const invalidIndices = sectionIndices.filter(i => i < 0 || i >= allSections.length);
+        if (invalidIndices.length > 0) {
+            return res.status(400).json({
+                status: 'error',
+                message: `Invalid section indices: ${invalidIndices.join(', ')} (file has ${allSections.length} sections)`,
+            });
+        }
+
+        // Create a partial detected_sections blob with only the target sections
+        const partialSections = {
+            ...file.detected_sections,
+            sections: sectionIndices.map(i => allSections[i]),
+        };
+
+        // Import services
+        const { extractAndProcessPerSection } = await import('./services/perSectionExtractor.js');
+        const ProcessingService = (await import('./services/processingService.js')).default;
+        const processingService = new ProcessingService();
+
+        console.log(
+            `🔄 Re-extracting ${sectionIndices.length} section(s) for file ${file.filename}: ` +
+            `indices [${sectionIndices.join(', ')}]`
+        );
+
+        // Emit status update
+        emitFilePatch(file.job_id, fileId, { processing_status: 'processing' });
+
+        const perSection = await extractAndProcessPerSection({
+            detectedSections: partialSections,
+            pages: filePages,
+            processingService,
+            processingMethod,
+            processingOptions,
+            selectedPages: file.selected_pages || null,
+        });
+
+        if (!perSection.anySuccess) {
+            const firstError = perSection.sectionResults.find(r => r.error)?.error
+                || 'No section produced a result';
+            return res.status(500).json({ status: 'error', message: firstError });
+        }
+
+        // ── ID-based envelope rebuild ──────────────────────────────────
+        //
+        // Each section in detected_sections carries a `section_result_id`
+        // (set during extraction, nulled by split/merge/slug-change).
+        // Each record in the envelope carries the same ID.
+        //
+        // Strategy:
+        // 1. Build a lookup of NEW records by section_result_id (from re-extract).
+        // 2. Build a lookup of OLD records by section_result_id (from existing envelope).
+        // 3. Write new section_result_ids back to detected_sections.
+        // 4. Walk all sections in order, pick each record by its ID.
+
+        // 1. Index new records by section_result_id
+        const newRecordById = new Map();
+        const slugCounters = {};
+        for (let pi = 0; pi < perSection.sectionResults.length; pi++) {
+            const sr = perSection.sectionResults[pi];
+            if (sr.status !== 'success' || !sr.section_result_id) continue;
+            const slug = sr.slug;
+            const slugArr = perSection.resultEnvelope[slug];
+            if (!slugArr) continue;
+
+            if (slugCounters[slug] == null) slugCounters[slug] = 0;
+            const record = slugArr[slugCounters[slug]++];
+            if (record) newRecordById.set(sr.section_result_id, { slug, record });
+        }
+
+        // 2. Index old records by section_result_id
+        const oldRecordById = new Map();
+        const existingResult = file.result || {};
+        for (const [slug, arr] of Object.entries(existingResult)) {
+            if (!Array.isArray(arr)) continue;
+            for (const rec of arr) {
+                if (rec?.section_result_id) {
+                    oldRecordById.set(rec.section_result_id, { slug, record: rec });
+                }
+            }
+        }
+
+        // 3. Write new section_result_ids back to detected_sections
+        const updatedDetectedSections = JSON.parse(JSON.stringify(file.detected_sections));
+        for (let pi = 0; pi < perSection.sectionResults.length; pi++) {
+            const sr = perSection.sectionResults[pi];
+            const originalIndex = sectionIndices[pi];
+            if (sr.status === 'success' && sr.section_result_id) {
+                updatedDetectedSections.sections[originalIndex].section_result_id = sr.section_result_id;
+            }
+        }
+        // Clear the edits array — the re-extract resolves them.
+        updatedDetectedSections.edits = [];
+        await updateFileDetectedSections(fileId, updatedDetectedSections);
+
+        // 4. Rebuild envelope: walk ALL sections, pick record by ID
+        const mergedResult = {};
+        for (const section of updatedDetectedSections.sections) {
+            const slug = section.document_type_slug;
+            const id = section.section_result_id;
+            if (!slug) continue;
+            if (!mergedResult[slug]) mergedResult[slug] = [];
+
+            const newEntry = id ? newRecordById.get(id) : null;
+            const oldEntry = id ? oldRecordById.get(id) : null;
+
+            if (newEntry) {
+                mergedResult[slug].push(newEntry.record);
+            } else if (oldEntry) {
+                mergedResult[slug].push(oldEntry.record);
+            }
+            // If neither exists (section_result_id is null and wasn't re-extracted),
+            // the section has no record yet — skip. This is visible in the UI as a
+            // section that still needs extraction.
+        }
+
+        // Update metadata
+        const existingMeta = file.extraction_metadata || {};
+        const finalMetadata = {
+            ...existingMeta,
+            result_envelope: 'v2',
+            section_results: perSection.sectionResults.map((sr, pi) => ({
+                ...sr,
+                section_index: sectionIndices[pi],
+            })),
+            last_reextract: {
+                section_indices: sectionIndices,
+                timestamp: new Date().toISOString(),
+            },
+        };
+
+        await updateFileProcessingStatus(
+            fileId,
+            'completed',
+            mergedResult,
+            null,
+            finalMetadata,
+            perSection.totalAiTimeSeconds || null
+        );
+
+        // Emit completion
+        emitFilePatch(file.job_id, fileId, {
+            processing_status: 'completed',
+            result: mergedResult,
+            detected_sections: updatedDetectedSections,
+        });
+
+        console.log(
+            `✅ Re-extraction completed for file ${file.filename}: ` +
+            `${perSection.sectionResults.filter(r => r.status === 'success').length} succeeded`
+        );
+
+        res.json({
+            status: 'success',
+            sectionResults: perSection.sectionResults,
+            detected_sections: updatedDetectedSections,
+        });
+    } catch (error) {
+        console.error('❌ section re-extract:', error.message);
+        res.status(500).json({ status: 'error', message: error.message });
     }
 });
 

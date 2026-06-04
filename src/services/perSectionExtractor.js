@@ -166,6 +166,7 @@ export async function extractAndProcessPerSection({
     for (const r of taskResults) {
         sectionResults.push({
             section_index: r.section_index,
+            section_result_id: r.section_result_id,
             slug: r.slug,
             record_id: r.record_id || null,
             page_range: r.page_range,
