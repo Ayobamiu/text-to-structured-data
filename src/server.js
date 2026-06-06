@@ -2955,6 +2955,238 @@ app.put("/files/:id/verify", authenticateToken, requireRole('admin'), async (req
     }
 });
 
+// ── Section QA ──────────────────────────────────────────────────────
+
+// POST /files/:id/sections/:sectionResultId/qa
+// Run VLM QA on a single section and save findings.
+app.post("/files/:id/sections/:sectionResultId/qa", authenticateToken, async (req, res) => {
+    try {
+        const { id: fileId, sectionResultId } = req.params;
+
+        const hasAccess = await checkFileAccess(fileId, req.user, res);
+        if (!hasAccess) return;
+
+        const file = await getFileResult(fileId);
+        if (!file) return res.status(404).json({ status: 'error', message: 'File not found' });
+
+        if (!file.result || typeof file.result !== 'object') {
+            return res.status(400).json({ status: 'error', message: 'File has no extraction result' });
+        }
+        if (!file.s3_key) {
+            return res.status(400).json({ status: 'error', message: 'File has no S3 key — QA requires S3 storage' });
+        }
+
+        // Find the record in the V2 envelope
+        let extractionRecord = null;
+        let slug = null;
+        for (const [s, arr] of Object.entries(file.result)) {
+            if (!Array.isArray(arr)) continue;
+            const found = arr.find(r => r?.section_result_id === sectionResultId);
+            if (found) { extractionRecord = found; slug = s; break; }
+        }
+
+        if (!extractionRecord) {
+            return res.status(404).json({ status: 'error', message: `No record with section_result_id '${sectionResultId}'` });
+        }
+
+        // Find extraction_pages for this section
+        const detected = file.detected_sections?.sections || [];
+        const section = detected.find(s => s.section_result_id === sectionResultId);
+        const pageNumbers = section?.extraction_pages || [];
+
+        if (!pageNumbers.length) {
+            return res.status(400).json({ status: 'error', message: 'No extraction pages found for this section' });
+        }
+
+        // Download PDF once
+        const s3 = new S3Service();
+        const pdfBuffer = await s3.downloadFile(file.s3_key);
+
+        const { runSectionQA, saveQAFindings } = await import('./services/sectionQAService.js');
+
+        console.log(`🔍 Running QA on section ${sectionResultId.substring(0, 8)}... (${slug}, page ${pageNumbers[0]})`);
+
+        const qaResult = await runSectionQA({
+            fileId,
+            sectionResultId,
+            slug,
+            pageNumbers,
+            extractionRecord,
+            pdfBuffer,
+        });
+
+        const savedFindings = await saveQAFindings({
+            fileId,
+            sectionResultId,
+            findings: qaResult.findings,
+            overall_quality: qaResult.overall_quality,
+        });
+
+        console.log(
+            `✅ QA complete for ${sectionResultId.substring(0, 8)}...: ` +
+            `${qaResult.findings.length} finding(s), quality=${qaResult.overall_quality}`
+        );
+
+        res.json({
+            status: 'success',
+            sectionResultId,
+            overall_quality: qaResult.overall_quality,
+            summary: qaResult.summary,
+            findings: savedFindings,
+            tokens: qaResult.tokens,
+        });
+    } catch (error) {
+        console.error('❌ section QA error:', error.message);
+        res.status(500).json({ status: 'error', message: error.message });
+    }
+});
+
+// POST /files/:id/qa
+// Run VLM QA on ALL sections in a file.
+app.post("/files/:id/qa", authenticateToken, async (req, res) => {
+    try {
+        const { id: fileId } = req.params;
+
+        const hasAccess = await checkFileAccess(fileId, req.user, res);
+        if (!hasAccess) return;
+
+        const file = await getFileResult(fileId);
+        if (!file) return res.status(404).json({ status: 'error', message: 'File not found' });
+
+        if (!file.result || typeof file.result !== 'object') {
+            return res.status(400).json({ status: 'error', message: 'File has no extraction result' });
+        }
+        if (!file.s3_key) {
+            return res.status(400).json({ status: 'error', message: 'File has no S3 key' });
+        }
+
+        // Collect all records from V2 envelope
+        const allRecords = [];
+        for (const [s, arr] of Object.entries(file.result)) {
+            if (!Array.isArray(arr)) continue;
+            for (const rec of arr) {
+                if (rec?.section_result_id) allRecords.push({ slug: s, record: rec, sectionResultId: rec.section_result_id });
+            }
+        }
+
+        if (!allRecords.length) {
+            return res.status(400).json({ status: 'error', message: 'No V2 records found — is this a V2 file?' });
+        }
+
+        // Download PDF once for all sections
+        const s3 = new S3Service();
+        const pdfBuffer = await s3.downloadFile(file.s3_key);
+
+        const detected = file.detected_sections?.sections || [];
+        const { runSectionQA, saveQAFindings } = await import('./services/sectionQAService.js');
+
+        console.log(`🔍 Running QA on all ${allRecords.length} sections of ${file.filename}...`);
+
+        const results = [];
+        let totalFindings = 0;
+
+        for (const { slug, record, sectionResultId } of allRecords) {
+            const section = detected.find(s => s.section_result_id === sectionResultId);
+            const pageNumbers = section?.extraction_pages || [];
+            if (!pageNumbers.length) {
+                results.push({ sectionResultId, skipped: true, reason: 'no extraction pages' });
+                continue;
+            }
+
+            try {
+                const qaResult = await runSectionQA({
+                    fileId,
+                    sectionResultId,
+                    slug,
+                    pageNumbers,
+                    extractionRecord: record,
+                    pdfBuffer,
+                });
+
+                const savedFindings = await saveQAFindings({
+                    fileId,
+                    sectionResultId,
+                    findings: qaResult.findings,
+                    overall_quality: qaResult.overall_quality,
+                });
+
+                totalFindings += savedFindings.length;
+                results.push({
+                    sectionResultId,
+                    slug,
+                    page: pageNumbers[0],
+                    overall_quality: qaResult.overall_quality,
+                    findingCount: savedFindings.length,
+                    findings: savedFindings,
+                });
+            } catch (err) {
+                console.warn(`⚠️ QA failed for section ${sectionResultId.substring(0, 8)}...: ${err.message}`);
+                results.push({ sectionResultId, error: err.message });
+            }
+        }
+
+        console.log(`✅ QA complete for ${file.filename}: ${totalFindings} finding(s) across ${results.length} sections`);
+
+        res.json({
+            status: 'success',
+            fileId,
+            totalSections: allRecords.length,
+            results,
+            totalFindings,
+        });
+    } catch (error) {
+        console.error('❌ file QA error:', error.message);
+        res.status(500).json({ status: 'error', message: error.message });
+    }
+});
+
+// GET /files/:id/qa-findings
+// Returns all QA findings for a file, grouped by section_result_id.
+app.get("/files/:id/qa-findings", authenticateToken, async (req, res) => {
+    try {
+        const { id: fileId } = req.params;
+
+        const hasAccess = await checkFileAccess(fileId, req.user, res);
+        if (!hasAccess) return;
+
+        const { getQAFindings } = await import('./services/sectionQAService.js');
+        const grouped = await getQAFindings(fileId);
+
+        res.json({ status: 'success', findings: grouped });
+    } catch (error) {
+        console.error('❌ get QA findings:', error.message);
+        res.status(500).json({ status: 'error', message: error.message });
+    }
+});
+
+// PATCH /files/:id/qa-findings/:findingId
+// Update a finding's status: accepted or dismissed.
+app.patch("/files/:id/qa-findings/:findingId", authenticateToken, async (req, res) => {
+    try {
+        const { id: fileId, findingId } = req.params;
+        const { status } = req.body;
+
+        if (!['accepted', 'dismissed'].includes(status)) {
+            return res.status(400).json({ status: 'error', message: "status must be 'accepted' or 'dismissed'" });
+        }
+
+        const hasAccess = await checkFileAccess(fileId, req.user, res);
+        if (!hasAccess) return;
+
+        const { updateQAFindingStatus } = await import('./services/sectionQAService.js');
+        const updated = await updateQAFindingStatus(findingId, fileId, status);
+
+        if (!updated) {
+            return res.status(404).json({ status: 'error', message: 'Finding not found' });
+        }
+
+        res.json({ status: 'success', finding: updated });
+    } catch (error) {
+        console.error('❌ update QA finding:', error.message);
+        res.status(500).json({ status: 'error', message: error.message });
+    }
+});
+
 // ── Section-level verification ───────────────────────────────────
 
 // GET  /files/:id/section-verifications

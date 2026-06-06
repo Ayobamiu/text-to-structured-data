@@ -309,3 +309,216 @@ export function buildPageClassificationMessages(
         },
     ];
 }
+
+// ---------------------------------------------------------------------------
+// Section QA — post-extraction vision review (vision + strict json_schema)
+// ---------------------------------------------------------------------------
+// Shows the model a section's page image(s) alongside its extraction JSON and
+// asks "what's wrong?". Field hints are derived from the active schema so any
+// registered document type works without code changes.
+
+export const SECTION_QA_RESPONSE_NAME = 'extraction_qa_review';
+
+export const SECTION_QA_ISSUE_TYPES = [
+    'wrong_value',
+    'missing_value',
+    'extra_value',
+    'missing_rows',
+    'extra_rows',
+    'wrong_count',
+    'formatting',
+] as const;
+
+export const SECTION_QA_SEVERITIES = ['error', 'warning', 'info'] as const;
+
+export const SECTION_QA_RESPONSE_SCHEMA: Record<string, unknown> = {
+    type: 'object',
+    additionalProperties: false,
+    required: ['summary', 'issues', 'overall_quality'],
+    properties: {
+        summary: {
+            type: 'string',
+            description:
+                'One sentence: how many issues, what kind. E.g., "2 errors found in lithology depths."',
+        },
+        issues: {
+            type: 'array',
+            description:
+                'All discrepancies between page image(s) and extraction. Empty array if extraction is correct.',
+            items: {
+                type: 'object',
+                additionalProperties: false,
+                required: ['field', 'issue_type', 'severity', 'expected', 'actual', 'explanation'],
+                properties: {
+                    field: {
+                        type: 'string',
+                        description: 'Dot-path with array indices. E.g., "lithology_intervals[0].depth_to_ft"',
+                    },
+                    issue_type: {
+                        type: 'string',
+                        enum: [...SECTION_QA_ISSUE_TYPES],
+                    },
+                    severity: {
+                        type: 'string',
+                        enum: [...SECTION_QA_SEVERITIES],
+                    },
+                    expected: {
+                        type: ['string', 'null'],
+                        description:
+                            'A VERBATIM quote of text visible on the page. Never a placeholder like "Unknown"/"N/A"/"Null" or a guess like "1 or more rows". Null only for hallucinated values (issue_type=extra_value).',
+                    },
+                    actual: {
+                        type: ['string', 'null'],
+                        description:
+                            'The value actually present in the provided extraction JSON at this field. Null if the JSON field is genuinely null/absent.',
+                    },
+                    explanation: {
+                        type: 'string',
+                        description: 'Why this is an issue. Max 25 words.',
+                    },
+                },
+            },
+        },
+        overall_quality: {
+            type: 'string',
+            enum: ['perfect', 'good', 'acceptable', 'poor'],
+            description: 'perfect=no issues. good=info/warning only. acceptable=1-2 errors. poor=3+ errors.',
+        },
+    },
+};
+
+export function buildSectionQAResponseFormat(): OpenAIResponseFormat {
+    return buildStrictJsonSchemaResponseFormat(
+        SECTION_QA_RESPONSE_NAME,
+        SECTION_QA_RESPONSE_SCHEMA,
+        true
+    );
+}
+
+/**
+ * Turn an extraction JSON Schema into a compact field-path hint block so the
+ * model uses EXACT field paths instead of hallucinating names. Walks the
+ * top-level `properties`, classifying each as an object (nested `properties`),
+ * an array (`items.properties`), or a scalar. Summarizes field names only —
+ * never inlines the raw schema — to keep prompt tokens small.
+ *
+ * @param jsonSchema Active schema (object or JSON string)
+ * @returns hint block, or '' when the schema has no usable properties
+ */
+export function schemaToFieldHints(jsonSchema: unknown): string {
+    let schema: any = jsonSchema;
+    if (typeof schema === 'string') {
+        try { schema = JSON.parse(schema); } catch { return ''; }
+    }
+    const props = schema?.properties;
+    if (!props || typeof props !== 'object') return '';
+
+    const names = (obj: Record<string, unknown>) => Object.keys(obj || {});
+
+    const objectLines: string[] = [];
+    const arrayLines: string[] = [];
+    const scalars: string[] = [];
+
+    for (const [key, def] of Object.entries(props as Record<string, any>)) {
+        if (!def || typeof def !== 'object') { scalars.push(key); continue; }
+        const isArray = def.type === 'array' || (!def.type && !!def.items);
+        const isObject = def.type === 'object' || (!def.type && !!def.properties && !isArray);
+
+        if (isObject && def.properties) {
+            objectLines.push(`    ${key}: ${names(def.properties).join(', ')}`);
+        } else if (isArray) {
+            const itemProps = def.items?.properties;
+            arrayLines.push(
+                itemProps
+                    ? `    ${key}: each row has ${names(itemProps).join(', ')}`
+                    : `    ${key}: array of values`,
+            );
+        } else {
+            scalars.push(key);
+        }
+    }
+
+    const parts: string[] = [];
+    if (objectLines.length) parts.push('  Objects:\n' + objectLines.join('\n'));
+    if (arrayLines.length) parts.push('  Arrays (count rows carefully):\n' + arrayLines.join('\n'));
+    if (scalars.length) parts.push('  Scalars: ' + scalars.join(', '));
+    if (!parts.length) return '';
+
+    return `\nSchema fields (use EXACTLY these field paths in issues):\n${parts.join('\n')}`;
+}
+
+/**
+ * System prompt for post-extraction QA. The rules are tuned to suppress the
+ * common false-positive classes:
+ *   1. claiming a field is null/wrong without reading the provided JSON,
+ *   2. no-op findings where page and extraction are both empty,
+ *   3. number/unit/date formatting differences,
+ *   4. speculative/placeholder "expected" values not quoted from the page.
+ *
+ * @param opts.schema    Active JSON schema → field hints (optional)
+ * @param opts.pageCount How many page images are attached (default 1)
+ */
+export function buildSectionQASystemPrompt(
+    opts: { schema?: unknown; pageCount?: number } = {}
+): string {
+    const { schema = null, pageCount = 1 } = opts;
+    const fieldHints = schemaToFieldHints(schema);
+    const multi = pageCount > 1;
+    const pageWord = multi ? 'pages' : 'page';
+
+    const inputDesc = multi
+        ? `1. ${pageCount} IMAGES — consecutive pages of ONE document section, in order
+2. A JSON extraction result produced by an AI from those pages combined`
+        : `1. An IMAGE of one page from a PDF document
+2. A JSON extraction result produced by an AI from that page`;
+
+    const rowRule = multi
+        ? `count rows across ALL ${pageCount} page images before flagging — a single array (e.g. lithology_intervals) often continues from one page onto the next`
+        : `count table rows carefully before flagging`;
+
+    return `You are a document extraction QA reviewer. Compare a source document ${multi ? 'section (one or more page images)' : 'page image'} against its structured extraction result and flag only real discrepancies.
+
+You will receive:
+${inputDesc}
+
+HOW TO COMPARE (read carefully — most false reports come from skipping this):
+- The extraction JSON is given to you IN FULL. Before flagging any field, locate that field in the JSON and read its actual value. Never claim a field is null, missing, or wrong without checking the JSON first — if the JSON already holds the correct value, do NOT flag it.
+- Every "expected" value MUST be a verbatim quote of text you can actually read on the ${pageWord}. Never invent placeholders ("Unknown", "N/A", "Null") or guesses ("1 or more rows", "Steel?"). If you cannot read a concrete value on the ${pageWord}, do not raise the issue.
+- "actual" MUST be the value really present in the JSON for that field.
+- If a field is blank on the ${pageWord} AND null/empty in the extraction, that is CORRECT — do not flag it.
+- Do NOT flag an issue where "expected" and "actual" mean the same thing.
+
+NOT ERRORS (never flag these):
+- Enum/label normalization: "hollow_stem_auger" for "Hollow Stem Auger". Only flag if the MEANING differs.
+- Number/unit formatting: 3 and 3.0 are equal; ignore trailing zeros, thousands separators (1,000 vs 1000), and unit suffixes ("5 ft" vs 5) when the magnitude matches.
+- Date formatting (2024-01-15 vs 01/15/2024): at most "info" severity, never "error".
+
+FLAG ONLY WHAT YOU CAN VERIFY ON THE ${multi ? 'PAGES' : 'PAGE'}:
+- WRONG VALUES: JSON value clearly contradicts what's printed on the ${pageWord}.
+- MISSING VALUES: JSON field is null/empty but a concrete value is clearly visible on the ${pageWord}.
+- EXTRA VALUES: JSON has a value that is NOT present on the ${pageWord} (hallucination).
+- MISSING / EXTRA ROWS: an array has fewer/more items than rows visible — ${rowRule}.
+
+Output rules:
+- If the extraction matches the ${pageWord}, return an empty issues array.
+- Be specific: exact field paths with array indices (e.g., "lithology_intervals[2].primary_material").
+${fieldHints}`;
+}
+
+/**
+ * User-message text for a QA call. Image content parts are appended by the
+ * caller (they carry runtime JPEG buffers).
+ *
+ * @param record           Extraction record (already stripped of internal ids)
+ * @param renderedPages     1-indexed page numbers actually attached, in order
+ */
+export function buildSectionQAUserText(
+    record: Record<string, unknown>,
+    renderedPages: number[]
+): string {
+    const json = JSON.stringify(record, null, 2);
+    if (renderedPages.length > 1) {
+        return `Review this extraction result against the source pages (pages ${renderedPages.join(', ')}, in order). The extraction covers ALL these pages — array rows may continue from one page to the next.\n\nEXTRACTION RESULT:\n${json}`;
+    }
+    return `Review this extraction result against the source page.\n\nEXTRACTION RESULT:\n${json}`;
+}
