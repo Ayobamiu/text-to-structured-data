@@ -12,10 +12,20 @@
 
 import OpenAI from 'openai';
 import pool from '../database.js';
+import { getActiveSchema } from './schemaRegistry.js';
+import {
+    buildSectionQASystemPrompt,
+    buildSectionQAUserText,
+    buildSectionQAResponseFormat,
+} from '../config/openaiPrompts.ts';
 
 const QA_MODEL = 'gpt-4o-mini';
 const IMAGE_WIDTH = 1024; // Higher res than classifier — need to read actual values
 const IMAGE_QUALITY = 90;
+// Multi-page sections: cap how many page images we send to one QA call. Each
+// image is ~25k input tokens at detail:'high', so this bounds cost/latency.
+// Sections longer than this are QA'd on their first MAX_QA_PAGES pages.
+const MAX_QA_PAGES = 4;
 
 let _openaiClient = null;
 function openai() {
@@ -24,132 +34,102 @@ function openai() {
     return _openaiClient;
 }
 
-// ─── Schema field hints per slug ────────────────────────────────────
-// Helps the VLM use the correct field paths.
-// These are loaded from the schema registry at runtime for integration;
-// for now a static map covers the main document types.
+// ─── False-positive filtering ────────────────────────────────────────
+// Prompts (system prompt, field hints, response schema) live in
+// ../config/openaiPrompts.ts — single source of truth. This service keeps
+// only the processing logic, including a last line of defence that drops
+// no-op findings the model still occasionally emits.
 
-const SCHEMA_FIELD_HINTS = {
-    borehole_log: `
-Schema fields for borehole_log (use EXACTLY these field paths in issues):
-  Objects:
-    site_identification: boring_well_id, site_name, site_address, county, state, ground_elevation_ft, toc_elevation_ft, latitude_dd, longitude_dd
-    document_metadata: firm_name, client, log_date, job_number, project_number, page_number, total_pages, document_type (array)
-    drilling_and_personnel: drilling_method, total_depth_ft, contractor, date_start, date_end, geologist_logged_by, borehole_diameter_in
-    well_construction: well_installed (bool), casing_diameter_in, screen_from_ft, screen_to_ft, filter_pack_material, grout_type
-    field_screening: pid_instrument, max_reading_ppm, pid_trace_present (bool)
-    spt_setup: spt_performed (bool), sampler_type, hammer_weight_lb
-  Arrays (count rows carefully):
-    lithology_intervals: each row has depth_from_ft, depth_to_ft, primary_material, uscs_symbol, description_raw, color_description, consistency_density
-    spt_intervals: each row has test_depth_ft, n_value, blows_2nd_6in, blows_3rd_6in
-    groundwater_observations: each has depth_ft, observation_type, measurement_date
-    samples_collected: sample records`,
+// Strings the model uses to mean "blank/absent". Normalized away so a finding
+// whose page value and extracted value are both empty is treated as a non-issue.
+const EMPTY_TOKENS = new Set(['', 'null', 'n/a', 'na', 'none', 'nil', '-', '–', 'unknown', 'undefined']);
 
-    aquifer_test: `
-Schema fields for aquifer_test (use EXACTLY these field paths in issues):
-  Objects:
-    document_metadata: firm_name, project_name, project_number, client, document_type (array)
-    test_setup: control_well_id, well_number, test_type, well_depth_ft, swl_ft, test_start_date, pumping_rates_gpm (array)
-    calculated_parameters: transmissivity_ft2_day, hydraulic_conductivity_ft_day, storativity, analysis_method, aquifer_type
-  Arrays:
-    observation_wells: each has well_id, distance_from_pw_ft, swl_ft
-    pumping_steps: each has step_number, pumping_rate_gpm, duration_min
-    time_series_readings: each has elapsed_time, water_level_ft, drawdown_ft, phase
-    datalogger_panels: each has well_id, logger_model, readings (nested array)`,
-
-    mgs_well_log: `
-Schema fields for mgs_well_log (use EXACTLY these field paths in issues):
-  Scalars: permit_number, api_number, county, well_number, lease_name, completion_date, true_depth, measured_depth, elevation, elevation_datum, status, well_type, deviation, target_zone, deepest_formation, acidized, fractured, h2s_present, injection_well, number_of_plugs, workovers, issues, land_use_type, type_fluid_injected, latitude, longitude
-  Arrays:
-    formations: each has from, to, formation
-    casing: each has type, size, Interval, cement_type, bags_of_cement
-    pluggings: each has type, depth, details, interval, plugging_date, bag_of_cements
-    shows_depths: each has depth, formation, oil_or_gas
-    perforation_intervals: each has from, to`,
-};
-
-// ─── System prompt ──────────────────────────────────────────────────
-
-function buildSystemPrompt(slug) {
-    const fieldHints = SCHEMA_FIELD_HINTS[slug] || '';
-
-    return `You are a document extraction QA reviewer. Compare a source document page image against its structured extraction result and flag discrepancies.
-
-You will receive:
-1. An IMAGE of one page from a PDF document
-2. A JSON extraction result produced by an AI from that page
-
-Your task: Check every meaningful field against what's visible on the page. Flag:
-- WRONG VALUES: field value doesn't match what's on the page
-- MISSING VALUES: field is null but data is clearly visible on the page
-- EXTRA VALUES: field has a value not present on the page (hallucination)
-- MISSING ROWS: array has fewer items than rows visible on the page
-- EXTRA ROWS: array has more items than rows on the page
-
-Rules:
-- Only flag issues you can VERIFY by looking at the page image. Don't guess.
-- Enum normalization is expected — "hollow_stem_auger" for "Hollow Stem Auger" is correct. Only flag if the MEANING differs.
-- Date format differences (2024-01-15 vs 01/15/2024) are "info" severity, not errors.
-- Count table rows carefully before flagging missing/extra rows.
-- If the extraction is correct, return an empty issues array.
-- Be specific: use exact field paths with array indices (e.g., "lithology_intervals[2].primary_material").
-- Do NOT flag issues where expected equals actual — that is not an error.
-${fieldHints}`;
+function normalizeQAValue(v) {
+    if (v == null) return '';
+    return String(v).trim().toLowerCase();
 }
 
-// ─── Response schema ─────────────────────────────────────────────────
+function isEmptyQAValue(v) {
+    return EMPTY_TOKENS.has(normalizeQAValue(v));
+}
 
-const QA_RESPONSE_SCHEMA = {
-    type: 'object',
-    additionalProperties: false,
-    required: ['summary', 'issues', 'overall_quality'],
-    properties: {
-        summary: {
-            type: 'string',
-            description: 'One sentence: how many issues, what kind. E.g., "2 errors found in lithology depths."',
-        },
-        issues: {
-            type: 'array',
-            description: 'All discrepancies between page image and extraction. Empty array if extraction is correct.',
-            items: {
-                type: 'object',
-                additionalProperties: false,
-                required: ['field', 'issue_type', 'severity', 'expected', 'actual', 'explanation'],
-                properties: {
-                    field: {
-                        type: 'string',
-                        description: 'Dot-path with array indices. E.g., "lithology_intervals[0].depth_to_ft"',
-                    },
-                    issue_type: {
-                        type: 'string',
-                        enum: ['wrong_value', 'missing_value', 'extra_value', 'missing_rows', 'extra_rows', 'wrong_count', 'formatting'],
-                    },
-                    severity: {
-                        type: 'string',
-                        enum: ['error', 'warning', 'info'],
-                    },
-                    expected: {
-                        type: ['string', 'null'],
-                        description: 'Quote exact text from page. Null for hallucinated values.',
-                    },
-                    actual: {
-                        type: ['string', 'null'],
-                        description: 'The extracted value. Null if field is missing.',
-                    },
-                    explanation: {
-                        type: 'string',
-                        description: 'Why this is an issue. Max 25 words.',
-                    },
-                },
-            },
-        },
-        overall_quality: {
-            type: 'string',
-            enum: ['perfect', 'good', 'acceptable', 'poor'],
-            description: 'perfect=no issues. good=info/warning only. acceptable=1-2 errors. poor=3+ errors.',
-        },
-    },
-};
+/**
+ * Equality used throughout QA comparison: case/whitespace-insensitive, treats
+ * all "blank" tokens as equal, and compares numerically when both sides parse
+ * as numbers (so "5.5'" == 5.5, "3.0" == "3").
+ */
+export function qaValuesEqual(a, b) {
+    if (isEmptyQAValue(a) && isEmptyQAValue(b)) return true;
+    if (normalizeQAValue(a) === normalizeQAValue(b)) return true;
+    const na = parseFloat(a);
+    const nb = parseFloat(b);
+    return !Number.isNaN(na) && !Number.isNaN(nb) && na === nb;
+}
+
+/**
+ * True when a finding is a no-op and should be discarded:
+ *   - page value and extracted value are both empty/placeholder, OR
+ *   - expected and actual are equal after normalization.
+ * Catches the "expected == actual" hallucinations that the literal
+ * `expected !== actual` check missed (e.g. "Null" vs null, "3.0" vs "3").
+ */
+export function isNoOpFinding(issue) {
+    return qaValuesEqual(issue?.expected, issue?.actual);
+}
+
+// ─── Verify findings against the real extraction record ──────────────
+// The model frequently MISQUOTES `actual` — it reports an extracted value that
+// isn't actually in the JSON we gave it, manufacturing a fake discrepancy.
+// We own the extraction record, so we don't have to trust the model's `actual`:
+// resolve the field path in the real record, OVERWRITE `actual` with the truth,
+// and drop the finding when the page value (`expected`) already equals it.
+
+// Row-count issues reference the array itself, not a scalar value — skip the
+// value-substitution logic for them (a "row count" can't be compared to a cell).
+const ROW_ISSUE_TYPES = new Set(['missing_rows', 'extra_rows', 'wrong_count']);
+
+/** Read a dot/bracket path ("a.b[2].c") out of an object. */
+export function readFieldPath(obj, path) {
+    if (obj == null || !path) return undefined;
+    const parts = String(path).replace(/\[(\d+)\]/g, '.$1').split('.').filter(Boolean);
+    let cur = obj;
+    for (const p of parts) {
+        if (cur == null) return undefined;
+        cur = cur[p];
+    }
+    return cur;
+}
+
+function toActualString(v) {
+    if (v === undefined || v === null) return null;
+    if (typeof v === 'object') return JSON.stringify(v);
+    return String(v);
+}
+
+/**
+ * Reconcile one model finding against the real extraction record.
+ * Returns { keep, issue } where `issue.actual` is corrected to ground truth.
+ *
+ * @param {object} issue   model-emitted finding (field, issue_type, expected, actual, ...)
+ * @param {object} record  the extraction record that was sent to the model
+ */
+export function verifyFindingAgainstRecord(issue, record) {
+    // Row-count issues: nothing to substitute; just drop obvious no-ops.
+    if (ROW_ISSUE_TYPES.has(issue?.issue_type)) {
+        return { keep: !isNoOpFinding(issue), issue };
+    }
+
+    const realValue = readFieldPath(record, issue?.field);
+    const corrected = { ...issue, actual: toActualString(realValue) };
+
+    // No real discrepancy: the page value already matches the true extracted
+    // value → the model fabricated the mismatch. Drop it.
+    if (qaValuesEqual(corrected.expected, realValue)) return { keep: false, issue: corrected };
+    // Both sides blank / expected == corrected actual → no-op. Drop.
+    if (isNoOpFinding(corrected)) return { keep: false, issue: corrected };
+
+    return { keep: true, issue: corrected };
+}
 
 // ─── Core QA function ────────────────────────────────────────────────
 
@@ -168,57 +148,83 @@ const QA_RESPONSE_SCHEMA = {
 export async function runSectionQA({ fileId, sectionResultId, slug, pageNumbers, extractionRecord, pdfBuffer }) {
     const { rasterizePdf } = await import('./pdfRasterizer.js');
 
-    // Use the first extraction page — that's the primary data page
-    const pageNumber = pageNumbers[0];
+    // Pick the pages to QA: dedupe, sort, and cap at MAX_QA_PAGES so a long
+    // section doesn't blow up cost/latency. extraction_pages can be
+    // non-contiguous, so we rasterize the spanning range then keep the wanted
+    // ones (pdftoppm only accepts a contiguous first..last range).
+    const wantedPages = [...new Set(pageNumbers)]
+        .filter((n) => Number.isInteger(n) && n > 0)
+        .sort((a, b) => a - b)
+        .slice(0, MAX_QA_PAGES);
 
-    const pages = await rasterizePdf(pdfBuffer, {
-        firstPage: pageNumber,
-        lastPage: pageNumber,
+    if (!wantedPages.length) {
+        throw new Error('No valid pages to QA');
+    }
+
+    const rendered = await rasterizePdf(pdfBuffer, {
+        firstPage: wantedPages[0],
+        lastPage: wantedPages[wantedPages.length - 1],
         widthPx: IMAGE_WIDTH,
         jpegQuality: IMAGE_QUALITY,
     });
 
+    const wanted = new Set(wantedPages);
+    const pages = rendered
+        .filter((p) => wanted.has(p.pageNumber))
+        .sort((a, b) => a.pageNumber - b.pageNumber);
+
     if (!pages.length) {
-        throw new Error(`Could not rasterize page ${pageNumber} for QA`);
+        throw new Error(`Could not rasterize pages ${wantedPages.join(', ')} for QA`);
     }
 
-    const imageDataUrl = `data:image/jpeg;base64,${pages[0].jpeg.toString('base64')}`;
+    // Field hints come from the active schema in the registry (not hardcoded).
+    // Non-fatal: if the slug isn't registered we just omit the hints.
+    let activeSchema = null;
+    try {
+        const active = await getActiveSchema(slug);
+        activeSchema = active?.schema ?? null;
+    } catch (err) {
+        console.warn(`⚠️ getActiveSchema('${slug}') failed for QA hints: ${err.message}`);
+    }
 
     // Strip section_result_id from the record — not relevant for QA
     const { section_result_id: _strip, ...cleanRecord } = extractionRecord;
 
+    const renderedPages = pages.map((p) => p.pageNumber);
+    const imageBlocks = pages.map((p) => ({
+        type: 'image_url',
+        image_url: { url: `data:image/jpeg;base64,${p.jpeg.toString('base64')}`, detail: 'high' },
+    }));
+
     const response = await openai().chat.completions.create({
         model: QA_MODEL,
         messages: [
-            { role: 'system', content: buildSystemPrompt(slug) },
+            {
+                role: 'system',
+                content: buildSectionQASystemPrompt({ schema: activeSchema, pageCount: pages.length }),
+            },
             {
                 role: 'user',
                 content: [
-                    {
-                        type: 'text',
-                        text: `Review this extraction result against the source page.\n\nEXTRACTION RESULT:\n${JSON.stringify(cleanRecord, null, 2)}`,
-                    },
-                    {
-                        type: 'image_url',
-                        image_url: { url: imageDataUrl, detail: 'high' },
-                    },
+                    { type: 'text', text: buildSectionQAUserText(cleanRecord, renderedPages) },
+                    ...imageBlocks,
                 ],
             },
         ],
-        response_format: {
-            type: 'json_schema',
-            json_schema: {
-                name: 'extraction_qa_review',
-                strict: true,
-                schema: QA_RESPONSE_SCHEMA,
-            },
-        },
+        response_format: buildSectionQAResponseFormat(),
     });
 
     const result = JSON.parse(response.choices[0].message.content);
 
-    // Filter out nonsense: issues where expected === actual
-    const validIssues = result.issues.filter(issue => issue.expected !== issue.actual);
+    // Verify every finding against the real extraction record: correct the
+    // model's `actual` to ground truth and drop findings where the page value
+    // already matches it (the model's dominant false-positive mode — it
+    // fabricates `actual` to manufacture a discrepancy).
+    const validIssues = [];
+    for (const issue of result.issues || []) {
+        const { keep, issue: verified } = verifyFindingAgainstRecord(issue, cleanRecord);
+        if (keep) validIssues.push(verified);
+    }
 
     return {
         findings: validIssues,
