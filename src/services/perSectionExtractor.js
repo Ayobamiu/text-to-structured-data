@@ -84,6 +84,7 @@ export async function extractAndProcessPerSection({
     maxConcurrency = DEFAULT_MAX_CONCURRENCY,
     getActiveSchema = defaultGetActiveSchema,
     selectedPages = null,
+    onSectionComplete = null,
 }) {
     if (!detectedSections || !Array.isArray(detectedSections.sections)) {
         throw new Error('extractAndProcessPerSection: detectedSections.sections must be an array');
@@ -143,15 +144,32 @@ export async function extractAndProcessPerSection({
     // Run sections in parallel (bounded). Order of `tasks` follows section
     // order, so when we collect results we keep document order.
     const tasks = sections.map((section, index) =>
-        () => runSection({
-            section,
-            index,
-            pageTextMap,
-            schemasBySlug,
-            processingService,
-            processingMethod,
-            processingOptions,
-        })
+        async () => {
+            const r = await runSection({
+                section,
+                index,
+                pageTextMap,
+                schemasBySlug,
+                processingService,
+                processingMethod,
+                processingOptions,
+            });
+            // Fire the per-section progress callback as each finishes (sections
+            // run concurrently, so this is completion order, not section order).
+            if (typeof onSectionComplete === 'function') {
+                try {
+                    onSectionComplete({
+                        section_index: r.section_index,
+                        slug: r.slug,
+                        record_id: r.record_id || null,
+                        page_range: r.page_range,
+                        status: r.status,
+                        warning: r.completeness_warning || null,
+                    });
+                } catch { /* never let telemetry break extraction */ }
+            }
+            return r;
+        }
     );
 
     const taskResults = await runWithConcurrency(tasks, maxConcurrency);
@@ -393,8 +411,9 @@ async function runSection({
     // emission (KCSI Table A-1 returned 3 of 35 analytes with 30k tokens of
     // unused max_tokens budget). Counts source <tr>/ug/L hits as a proxy
     // for how many rows the model should have produced.
+    let completenessWarning = null;
     try {
-        const completenessWarning = buildCompletenessWarning(aiResult.data, contentForAI);
+        completenessWarning = buildCompletenessWarning(aiResult.data, contentForAI);
         if (completenessWarning) {
             console.warn(
                 `⚠️ Section ${index} (${slug}): ${completenessWarning} — ` +
@@ -414,6 +433,7 @@ async function runSection({
         data: aiResult.data,
         schema_version: schemaInfo.version,
         schema_id: schemaInfo.schemaId,
+        ...(completenessWarning ? { completeness_warning: completenessWarning } : {}),
         // Large-section guardrail metadata — included only when flagged so
         // the monitoring UI can surface sections at risk of truncation.
         ...(isLargeSection ? {
