@@ -3776,6 +3776,7 @@ async function processFilesAsync(job, files, schema, schemaName, processingConfi
                     classifierMeta: visualClassifierMeta,
                     detectedSections: visualDetectedSections,
                     classifierFailed,
+                    noExtractableContent,
                 } = await deriveSelectedPagesAndMeta({
                     file: fileForHelper,
                     jobProcessingConfig,
@@ -3800,6 +3801,30 @@ async function processFilesAsync(job, files, schema, schemaName, processingConfi
                         `Aborting to prevent full-document extraction. ` +
                         `Retry the file or disable the visual classifier on this job.`
                     );
+                }
+
+                // Classifier ran but found no extractable pages (every page is
+                // "none"). This is a successful empty outcome — mark the file
+                // completed-with-no-content and move on, rather than extracting
+                // the entire document.
+                if (noExtractableContent) {
+                    console.warn(
+                        `🚫 No extractable content for ${file.originalname} — skipping extraction (no_extractable_pages)`
+                    );
+                    // Mark both columns terminal so the file doesn't linger in
+                    // "processing" on the extraction side.
+                    await updateFileExtractionStatus(fileRecord.id, 'completed');
+                    await updateFileProcessingStatus(fileRecord.id, 'completed', null, null, {
+                        skipped: true,
+                        skipped_reason: 'no_extractable_pages',
+                        visual_page_classifier: visualClassifierMeta || null,
+                    });
+                    await emitFileFullPatch(job.id, fileRecord.id, {
+                        extraction_status: 'completed',
+                        processing_status: 'completed',
+                        processing_error: null,
+                    });
+                    continue; // next file (finally still runs to clean up the upload)
                 }
 
                 // Extract text (with fallback if extendai fails)

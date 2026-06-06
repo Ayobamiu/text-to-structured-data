@@ -35,8 +35,14 @@ import { flattenExtractionPages } from './sectionGrouper.js';
  *   selectedPages: number[]|null,
  *   classifierMeta: Object|null,
  *   detectedSections: Object|null,
- *   classifierFailed?: boolean
+ *   classifierFailed?: boolean,
+ *   noExtractableContent?: boolean
  * }>}
+ *
+ *   noExtractableContent
+ *     - true when the classifier ran successfully but every page is "none"
+ *       (no extractable pages). Callers MUST skip extraction and mark the file
+ *       as completed-with-no-content rather than extracting the whole document.
  *
  *   selectedPages
  *     - manual file selected_pages if set (precedence #1)
@@ -117,19 +123,25 @@ export async function deriveSelectedPagesAndMeta({ file, jobProcessingConfig, s3
     });
 
     if (pages.length === 0) {
+        // The classifier ran successfully and determined there is nothing worth
+        // extracting (every page is "none"/boilerplate/blank). Do NOT fall back
+        // to full-document extraction — that ingests an entire (possibly
+        // hundreds-of-page) PDF into the LLM for no benefit. Signal callers to
+        // skip extraction and mark the file as "no extractable content".
         console.warn(
-            `⚠️ Visual classifier returned no extractable pages for ${file.filename} ` +
-            `(${sections.length} section(s)) — falling back to full document`
+            `⚠️ Visual classifier found no extractable pages for ${file.filename} ` +
+            `(${sections.length} section(s)) — skipping extraction (no_extractable_pages)`
         );
         return {
             selectedPages: null,
-            // Even though we're falling back to the v1 path on selection, we
-            // still surface detectedSections so downstream callers can see
-            // the (empty) routing decision in the UI.
+            noExtractableContent: true,
+            // Surface detectedSections so the UI can still show the (empty)
+            // routing decision.
             detectedSections: classifierResult.detectedSections,
             classifierMeta: {
                 ran: true,
-                fell_back: true,
+                fell_back: false,
+                skipped: true,
                 fell_back_reason: 'no_extractable_pages',
                 section_count: sections.length,
                 file_status: classifierResult.detectedSections.status,

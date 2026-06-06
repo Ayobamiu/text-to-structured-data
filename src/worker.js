@@ -25,6 +25,21 @@ const WORKER_INTERVAL_MS = parseInt(process.env.WORKER_INTERVAL_MS || '5000'); /
 const MAX_RETRIES = parseInt(process.env.WORKER_MAX_RETRIES || '3');
 const SERVER_URL = process.env.SERVER_URL || "http://localhost:3000";
 
+/**
+ * Thrown when the visual classifier ran successfully but found no extractable
+ * pages (every page is "none"). This is NOT a failure — the file simply has no
+ * relevant content — so it must be marked completed-with-no-content rather than
+ * retried/failed or (worst of all) extracted in full.
+ */
+class NoExtractableContentError extends Error {
+    constructor({ detectedSections = null, classifierMeta = null } = {}) {
+        super('No extractable content: classifier found no relevant pages');
+        this.name = 'NoExtractableContentError';
+        this.detectedSections = detectedSections;
+        this.classifierMeta = classifierMeta;
+    }
+}
+
 class FileProcessorWorker {
     constructor() {
         this.isRunning = false;
@@ -690,6 +705,37 @@ class FileProcessorWorker {
             console.log(`🗑️ File ${file.id} processing completed`);
 
         } catch (error) {
+            // No extractable content is a successful (empty) outcome, not a
+            // failure: mark the file completed with a clear reason and skip
+            // extraction/AI entirely. Never retry, never extract the full doc.
+            if (error instanceof NoExtractableContentError) {
+                console.log(`🚫 ${fileId}: no extractable content — marking completed (no_extractable_pages)`);
+                try {
+                    // Mark both columns terminal so the file doesn't linger in
+                    // "processing" (normal mode set extraction_status=processing
+                    // before extraction ran).
+                    await updateFileExtractionStatus(fileId, 'completed');
+                    await updateFileProcessingStatus(fileId, 'completed', null, null, {
+                        skipped: true,
+                        skipped_reason: 'no_extractable_pages',
+                        visual_page_classifier: error.classifierMeta || null,
+                    });
+                    this.emitFileStatusUpdate(
+                        jobId,
+                        fileId,
+                        'completed',
+                        'completed',
+                        `No extractable content detected for ${fileId} — nothing to extract (every page classified as "none").`
+                    );
+                    this.processedCount++;
+                } catch (markErr) {
+                    console.error(`❌ Failed to mark ${fileId} as no-content completed:`, markErr.message);
+                } finally {
+                    await queueService.removeFileFromProcessing(fileId);
+                }
+                return;
+            }
+
             console.error('❌ Error processing file:', error.message);
             this.errorCount++;
 
@@ -771,12 +817,22 @@ class FileProcessorWorker {
 
         // 1. Resolve selected pages (manual > classifier > null)
         const { usePerSection } = resolveExtractionFlags(jobProcessingConfig);
-        const { selectedPages, classifierMeta, detectedSections, classifierFailed } = await deriveSelectedPagesAndMeta({
+        const { selectedPages, classifierMeta, detectedSections, classifierFailed, noExtractableContent } = await deriveSelectedPagesAndMeta({
             file,
             jobProcessingConfig,
             s3Service: this.s3Service,
             usePerSection,
         });
+
+        // Classifier ran but found nothing to extract — skip extraction rather
+        // than ingesting the entire document. Handled in processFile's catch as
+        // a completed-with-no-content outcome (not a failure).
+        if (noExtractableContent) {
+            console.warn(
+                `🚫 No extractable content for ${file.filename} — skipping extraction (no_extractable_pages)`
+            );
+            throw new NoExtractableContentError({ detectedSections, classifierMeta });
+        }
 
         // Persist classifier-derived pages so the skinny list can
         // show "X of Y" in the Pages column (same as manual selection).
