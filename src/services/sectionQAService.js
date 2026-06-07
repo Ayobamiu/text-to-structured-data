@@ -19,7 +19,9 @@ import {
     buildSectionQAResponseFormat,
 } from '../config/openaiPrompts.ts';
 
-const QA_MODEL = 'gpt-4o-mini';
+// Default QA model — overridable via env (QA_MODEL) or per-call (model arg /
+// request body) so we can A/B stronger vision+JSON models against gpt-4o-mini.
+const QA_MODEL = process.env.QA_MODEL || 'gpt-4o-mini';
 const IMAGE_WIDTH = 1024; // Higher res than classifier — need to read actual values
 const IMAGE_QUALITY = 90;
 // Multi-page sections: cap how many page images we send to one QA call. Each
@@ -145,7 +147,7 @@ export function verifyFindingAgainstRecord(issue, record) {
  * @param {Buffer} params.pdfBuffer      raw PDF bytes (caller provides to avoid re-download)
  * @returns {Promise<{ findings: object[], overall_quality: string, summary: string, tokens: object }>}
  */
-export async function runSectionQA({ fileId, sectionResultId, slug, pageNumbers, extractionRecord, pdfBuffer }) {
+export async function runSectionQA({ fileId, sectionResultId, slug, pageNumbers, extractionRecord, pdfBuffer, model = QA_MODEL }) {
     const { rasterizePdf } = await import('./pdfRasterizer.js');
 
     // Pick the pages to QA: dedupe, sort, and cap at MAX_QA_PAGES so a long
@@ -197,7 +199,7 @@ export async function runSectionQA({ fileId, sectionResultId, slug, pageNumbers,
     }));
 
     const response = await openai().chat.completions.create({
-        model: QA_MODEL,
+        model,
         messages: [
             {
                 role: 'system',
@@ -231,6 +233,7 @@ export async function runSectionQA({ fileId, sectionResultId, slug, pageNumbers,
         overall_quality: result.overall_quality,
         summary: result.summary,
         tokens: response.usage,
+        model, // the model actually used (for storage + A/B reporting)
     };
 }
 
@@ -248,7 +251,7 @@ export async function runSectionQA({ fileId, sectionResultId, slug, pageNumbers,
  * @param {string} params.overall_quality
  * @returns {Promise<object[]>} the saved finding rows
  */
-export async function saveQAFindings({ fileId, sectionResultId, findings, overall_quality }) {
+export async function saveQAFindings({ fileId, sectionResultId, findings, overall_quality, qaModel = QA_MODEL }) {
     const client = await pool.connect();
     try {
         await client.query('BEGIN');
@@ -293,7 +296,7 @@ export async function saveQAFindings({ fileId, sectionResultId, findings, overal
                     finding.actual,
                     finding.explanation,
                     overall_quality,
-                    QA_MODEL,
+                    qaModel,
                 ]
             );
             rows.push(result.rows[0]);
