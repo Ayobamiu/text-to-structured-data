@@ -1146,6 +1146,32 @@ app.get("/document-types", authenticateToken, async (req, res) => {
     }
 });
 
+// GET /document-types/:slug/schema
+// Returns the active JSON schema for a document type — read-only, any
+// authenticated user. Used by the result viewer to show field descriptions
+// (e.g. on hover). Field docs aren't sensitive, so this is not admin-gated.
+app.get("/document-types/:slug/schema", authenticateToken, async (req, res) => {
+    try {
+        const { slug } = req.params;
+        const { getActiveSchema } = await import("./services/schemaRegistry.js");
+        const active = await getActiveSchema(slug);
+        if (!active || !active.schema) {
+            return res.status(404).json({ status: 'error', message: `No active schema for '${slug}'` });
+        }
+        const schema = typeof active.schema === 'string' ? JSON.parse(active.schema) : active.schema;
+        res.json({
+            status: 'success',
+            slug: active.documentTypeSlug,
+            version: active.version,
+            schema_name: active.schemaName,
+            json_schema: schema,
+        });
+    } catch (error) {
+        console.error('❌ Error getting document-type schema:', error.message);
+        res.status(500).json({ status: 'error', message: error.message });
+    }
+});
+
 const REGISTRY_SLUG_PARAM = /^[a-z][a-z0-9_]{0,99}$/;
 
 /** Admin-only middleware pair for registry CRUD. */
