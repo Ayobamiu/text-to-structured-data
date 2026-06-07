@@ -2982,22 +2982,29 @@ app.post("/files/:id/sections/:sectionResultId/qa", authenticateToken, async (re
             return res.status(400).json({ status: 'error', message: 'File has no S3 key — QA requires S3 storage' });
         }
 
-        // Find the record in the V2 envelope
+        // Find the record (+ its slug and position) in the V2 envelope.
         let extractionRecord = null;
         let slug = null;
+        let recordIndex = -1;
         for (const [s, arr] of Object.entries(file.result)) {
             if (!Array.isArray(arr)) continue;
-            const found = arr.find(r => r?.section_result_id === sectionResultId);
-            if (found) { extractionRecord = found; slug = s; break; }
+            const idx = arr.findIndex(r => r?.section_result_id === sectionResultId);
+            if (idx >= 0) { extractionRecord = arr[idx]; slug = s; recordIndex = idx; break; }
         }
 
         if (!extractionRecord) {
             return res.status(404).json({ status: 'error', message: `No record with section_result_id '${sectionResultId}'` });
         }
 
-        // Find extraction_pages for this section
+        // Resolve extraction_pages. Prefer the section_result_id link in
+        // detected_sections, but fall back to POSITIONAL matching (slug + index)
+        // when detected_sections didn't get the id write-back — otherwise QA
+        // breaks on files where the link is missing even though the pages exist.
         const detected = file.detected_sections?.sections || [];
-        const section = detected.find(s => s.section_result_id === sectionResultId);
+        let section = detected.find(s => s.section_result_id === sectionResultId);
+        if (!section && slug && recordIndex >= 0) {
+            section = detected.filter(s => s.document_type_slug === slug)[recordIndex];
+        }
         const pageNumbers = section?.extraction_pages || [];
 
         if (!pageNumbers.length) {
@@ -3066,13 +3073,16 @@ app.post("/files/:id/qa", authenticateToken, async (req, res) => {
             return res.status(400).json({ status: 'error', message: 'File has no S3 key' });
         }
 
-        // Collect all records from V2 envelope
+        // Collect all records from V2 envelope (track position for the
+        // positional extraction_pages fallback below).
         const allRecords = [];
         for (const [s, arr] of Object.entries(file.result)) {
             if (!Array.isArray(arr)) continue;
-            for (const rec of arr) {
-                if (rec?.section_result_id) allRecords.push({ slug: s, record: rec, sectionResultId: rec.section_result_id });
-            }
+            arr.forEach((rec, idx) => {
+                if (rec?.section_result_id) {
+                    allRecords.push({ slug: s, record: rec, sectionResultId: rec.section_result_id, recordIndex: idx });
+                }
+            });
         }
 
         if (!allRecords.length) {
@@ -3091,8 +3101,11 @@ app.post("/files/:id/qa", authenticateToken, async (req, res) => {
         const results = [];
         let totalFindings = 0;
 
-        for (const { slug, record, sectionResultId } of allRecords) {
-            const section = detected.find(s => s.section_result_id === sectionResultId);
+        for (const { slug, record, sectionResultId, recordIndex } of allRecords) {
+            // Match by section_result_id, falling back to slug + position when
+            // detected_sections lacks the id link (see single-section endpoint).
+            let section = detected.find(s => s.section_result_id === sectionResultId);
+            if (!section) section = detected.filter(s => s.document_type_slug === slug)[recordIndex];
             const pageNumbers = section?.extraction_pages || [];
             if (!pageNumbers.length) {
                 results.push({ sectionResultId, skipped: true, reason: 'no extraction pages' });
