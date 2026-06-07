@@ -3045,6 +3045,7 @@ app.post("/files/:id/sections/:sectionResultId/qa", authenticateToken, async (re
             pageNumbers,
             extractionRecord,
             pdfBuffer,
+            model: req.body?.model, // optional per-request override for A/B
         });
 
         const savedFindings = await saveQAFindings({
@@ -3052,6 +3053,7 @@ app.post("/files/:id/sections/:sectionResultId/qa", authenticateToken, async (re
             sectionResultId,
             findings: qaResult.findings,
             overall_quality: qaResult.overall_quality,
+            qaModel: qaResult.model,
         });
 
         console.log(
@@ -3133,6 +3135,7 @@ app.post("/files/:id/qa", authenticateToken, async (req, res) => {
                     pageNumbers,
                     extractionRecord: record,
                     pdfBuffer,
+                    model: req.body?.model, // optional per-request override for A/B
                 });
 
                 const savedFindings = await saveQAFindings({
@@ -3140,6 +3143,7 @@ app.post("/files/:id/qa", authenticateToken, async (req, res) => {
                     sectionResultId,
                     findings: qaResult.findings,
                     overall_quality: qaResult.overall_quality,
+                    qaModel: qaResult.model,
                 });
 
                 totalFindings += savedFindings.length;
