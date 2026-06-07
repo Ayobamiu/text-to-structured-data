@@ -561,16 +561,37 @@ class FileProcessorWorker {
                     selectedPages: file.selected_pages || null,
                     onSectionComplete: (info) => {
                         sectionsDone += 1;
-                        // Surface per-section progress + any quality warning
-                        // (e.g. "stopped extracting early") inline on the timeline.
+                        // Surface per-section progress + quality signals on the
+                        // timeline: the completeness warning AND whether the
+                        // section was escalated to Claude (so escalation is
+                        // observable, not just a console log).
+                        const c = info?.completeness;
+                        let message;
+                        let level = 'info';
+                        if (info?.escalated) {
+                            message = `Section ${sectionsDone} of ${sectionTotal}: escalated to Claude` +
+                                (c ? ` (${c.emitted} rows${c.complete ? ', complete' : ' — verify completeness'})` : '');
+                            level = c?.complete ? 'info' : 'warning';
+                        } else if (c?.agreed) {
+                            // Tried Claude, it agreed with OpenAI → verified, not a problem.
+                            message = `Section ${sectionsDone} of ${sectionTotal}: ${c.emitted} rows verified (2 models agree)`;
+                            level = 'info';
+                        } else if (info?.warning) {
+                            message = info.warning;
+                            level = 'warning';
+                        } else {
+                            message = `Section ${sectionsDone} of ${sectionTotal} extracted${info?.slug ? ` (${info.slug})` : ''}`;
+                        }
                         void this.emitProcessingEvent(file.id, file.job_id, {
                             phase: 'ai_extraction',
-                            status: info?.warning ? 'info' : 'active',
-                            level: info?.warning ? 'warning' : 'info',
+                            status: level === 'warning' ? 'info' : 'active',
+                            level,
                             progress: { current: sectionsDone, total: sectionTotal },
-                            message: info?.warning
-                                || `Section ${sectionsDone} of ${sectionTotal} extracted${info?.slug ? ` (${info.slug})` : ''}`,
-                            data: { slug: info?.slug, record_id: info?.record_id, page_range: info?.page_range },
+                            message,
+                            data: {
+                                slug: info?.slug, record_id: info?.record_id, page_range: info?.page_range,
+                                escalated: info?.escalated || false, completeness: c || null,
+                            },
                         });
                     },
                 });
