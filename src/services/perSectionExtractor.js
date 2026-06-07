@@ -165,6 +165,8 @@ export async function extractAndProcessPerSection({
                         page_range: r.page_range,
                         status: r.status,
                         warning: r.completeness_warning || null,
+                        escalated: r.escalated_to_claude || false,
+                        completeness: r.completeness || null,
                     });
                 } catch { /* never let telemetry break extraction */ }
             }
@@ -422,13 +424,26 @@ async function runSection({
         console.warn(`⚠️ completeness check failed: ${warnErr.message}`);
     }
     const isUnderExtracted = (e, est) => est >= 10 && e > 0 && e * 3 < est;
+    const under = isUnderExtracted(emittedRows, estimatedRows);
+
+    // Make the gate decision observable — this is the line to look for in worker
+    // logs to confirm the escalation code is actually running for a section.
+    if (under) {
+        console.log(
+            `🔎 Section ${index} (${slug}): completeness gate — under-extracted ${emittedRows}/~${estimatedRows}, ` +
+            `method=${effectiveMethod}, claudeKey=${process.env.CLAUDE_API_KEY ? 'set' : 'MISSING'} → ` +
+            `${under && effectiveMethod === 'openai' && process.env.CLAUDE_API_KEY ? 'ESCALATING' : 'NOT escalating'}`
+        );
+    }
 
     let escalatedToClaude = false;
+    let escalationAttempted = false;
     if (
-        isUnderExtracted(emittedRows, estimatedRows) &&
+        under &&
         effectiveMethod === 'openai' &&
         process.env.CLAUDE_API_KEY
     ) {
+        escalationAttempted = true;
         console.warn(
             `⚠️ Section ${index} (${slug}): under-extracted ${emittedRows}/~${estimatedRows} rows on OpenAI — escalating to Claude`
         );
@@ -459,15 +474,36 @@ async function runSection({
         }
     }
 
-    const stillIncomplete = isUnderExtracted(emittedRows, estimatedRows);
-    const completenessWarning = stillIncomplete
-        ? `extracted ${emittedRows} items but source has ~${estimatedRows} repeating rows`
-        : null;
-    if (completenessWarning) {
-        console.warn(
-            `⚠️ Section ${index} (${slug}): ${completenessWarning}${escalatedToClaude ? ' (after Claude escalation)' : ''} — ` +
-            `model may have stopped extracting early despite token headroom`
-        );
+    // ── Completeness verdict — trust two-model agreement, not the estimate ──
+    // The <tr>-based estimate over-counts (it sums every table row on the page,
+    // not just the array we're checking), so it can't declare "incomplete" on
+    // its own. We let the Claude cross-check be the arbiter:
+    //   • Claude did NOT beat OpenAI → two independent models agree → the count
+    //     is right and the estimate was the noisy one → mark COMPLETE, no flag.
+    //   • Claude found more → genuine under-extraction we partly recovered →
+    //     soft "verify completeness" flag (the one page worth a human glance).
+    //   • Couldn't escalate (no Claude key / not openai) → unvalidated → keep
+    //     the original warning.
+    const heuristicUnder = isUnderExtracted(emittedRows, estimatedRows);
+    const modelsAgree = escalationAttempted && !escalatedToClaude;
+
+    let complete;
+    let completenessWarning = null;
+    if (modelsAgree) {
+        complete = true; // verified by a second, independent model
+    } else if (heuristicUnder) {
+        complete = false;
+        completenessWarning = escalatedToClaude
+            ? `escalated to Claude (${emittedRows} rows) — page looks dense (~${estimatedRows}); verify completeness`
+            : `extracted ${emittedRows} items but source has ~${estimatedRows} repeating rows`;
+    } else {
+        complete = true;
+    }
+
+    if (modelsAgree) {
+        console.log(`✅ Section ${index} (${slug}): ${emittedRows} rows verified — OpenAI and Claude agree`);
+    } else if (completenessWarning) {
+        console.warn(`⚠️ Section ${index} (${slug}): ${completenessWarning}`);
     }
 
     return {
@@ -481,8 +517,10 @@ async function runSection({
         completeness: {
             emitted: emittedRows,
             estimated: estimatedRows,
+            attempted: escalationAttempted,
             escalated: escalatedToClaude,
-            complete: !stillIncomplete,
+            agreed: modelsAgree,
+            complete,
         },
         ...(completenessWarning ? { completeness_warning: completenessWarning } : {}),
         ...(escalatedToClaude ? { escalated_to_claude: true } : {}),
