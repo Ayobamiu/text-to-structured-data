@@ -195,6 +195,12 @@ io.on('connection', (socket) => {
         io.to(`job-${data.jobId}`).emit('job-status-update', data);
         logger.info(`Broadcasted job-status-update to job-${data.jobId}`);
     });
+
+    // Curated processing-timeline events from the worker → relay to the job room.
+    socket.on('file-processing-event', (data) => {
+        if (!data?.jobId) return;
+        io.to(`job-${data.jobId}`).emit('file-processing-event', data);
+    });
 });
 
 
@@ -3155,6 +3161,26 @@ app.get("/files/:id/qa-findings", authenticateToken, async (req, res) => {
         res.json({ status: 'success', findings: grouped });
     } catch (error) {
         console.error('❌ get QA findings:', error.message);
+        res.status(500).json({ status: 'error', message: error.message });
+    }
+});
+
+// GET /files/:id/processing-events
+// Returns the curated processing timeline for a file (for hydration when a
+// client opens/refreshes a file after — or during — processing).
+app.get("/files/:id/processing-events", authenticateToken, async (req, res) => {
+    try {
+        const { id: fileId } = req.params;
+
+        const hasAccess = await checkFileAccess(fileId, req.user, res);
+        if (!hasAccess) return;
+
+        const { getProcessingEvents } = await import('./services/processingEventsService.js');
+        const events = await getProcessingEvents(fileId);
+
+        res.json({ status: 'success', events });
+    } catch (error) {
+        console.error('❌ get processing events:', error.message);
         res.status(500).json({ status: 'error', message: error.message });
     }
 });

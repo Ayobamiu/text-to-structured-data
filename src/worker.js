@@ -18,6 +18,7 @@ import ProcessingService from './services/processingService.js';
 import { deriveSelectedPagesAndMeta, resolveExtractionFlags } from './services/visualClassifierWiring.js';
 import { extractAndProcessPerSection } from './services/perSectionExtractor.js';
 import { buildExtractionMetadata } from './services/fileProcessingContext.js';
+import { recordProcessingEvent } from './services/processingEventsService.js';
 dotenv.config();
 
 
@@ -77,6 +78,33 @@ class FileProcessorWorker {
                 timestamp: new Date().toISOString()
             });
             console.log(`📡 Emitted file-status-update: ${fileId} - ${extractionStatus}/${processingStatus}`);
+        }
+    }
+
+    /**
+     * Emit a curated processing-timeline event: persist it (for hydration) and
+     * push it live over the socket as `file-processing-event`. Never throws —
+     * telemetry must not break the pipeline.
+     *
+     * @param {string} fileId
+     * @param {string|null} jobId
+     * @param {object} evt  { phase, step?, status?, progress?, message?, level?, data? }
+     */
+    async emitProcessingEvent(fileId, jobId, evt) {
+        try {
+            const saved = await recordProcessingEvent({ fileId, jobId, ...evt });
+            if (this.socket && this.socket.connected) {
+                this.socket.emit('file-processing-event', {
+                    fileId,
+                    jobId,
+                    id: saved?.id,
+                    seq: saved?.seq,
+                    created_at: saved?.created_at || new Date().toISOString(),
+                    ...evt,
+                });
+            }
+        } catch (err) {
+            console.warn(`⚠️ emitProcessingEvent failed: ${err.message}`);
         }
     }
 
@@ -511,11 +539,19 @@ class FileProcessorWorker {
             }
 
             if (usePerSection && hasExtractableSections && Array.isArray(extractionResult.pages)) {
+                const sectionTotal = detectedSections.sections.length;
                 console.log(
-                    `🧩 Per-section extraction: ${detectedSections.sections.length} section(s) ` +
+                    `🧩 Per-section extraction: ${sectionTotal} section(s) ` +
                     `for ${file.filename} (envelope v2)`
                 );
 
+                await this.emitProcessingEvent(file.id, file.job_id, {
+                    phase: 'ai_extraction', status: 'active',
+                    progress: { current: 0, total: sectionTotal },
+                    message: `Extracting structured data from ${sectionTotal} section${sectionTotal === 1 ? '' : 's'}…`,
+                });
+
+                let sectionsDone = 0;
                 const perSection = await extractAndProcessPerSection({
                     detectedSections,
                     pages: extractionResult.pages,
@@ -523,11 +559,34 @@ class FileProcessorWorker {
                     processingMethod,
                     processingOptions: finalProcessingOptions,
                     selectedPages: file.selected_pages || null,
+                    onSectionComplete: (info) => {
+                        sectionsDone += 1;
+                        // Surface per-section progress + any quality warning
+                        // (e.g. "stopped extracting early") inline on the timeline.
+                        void this.emitProcessingEvent(file.id, file.job_id, {
+                            phase: 'ai_extraction',
+                            status: info?.warning ? 'info' : 'active',
+                            level: info?.warning ? 'warning' : 'info',
+                            progress: { current: sectionsDone, total: sectionTotal },
+                            message: info?.warning
+                                || `Section ${sectionsDone} of ${sectionTotal} extracted${info?.slug ? ` (${info.slug})` : ''}`,
+                            data: { slug: info?.slug, record_id: info?.record_id, page_range: info?.page_range },
+                        });
+                    },
                 });
 
                 const failedCount = perSection.sectionResults.filter((r) => r.status === 'failed').length;
                 const skippedCount = perSection.sectionResults.filter((r) => r.status?.startsWith('skipped_')).length;
                 const successCount = perSection.sectionResults.filter((r) => r.status === 'success').length;
+
+                await this.emitProcessingEvent(file.id, file.job_id, {
+                    phase: 'ai_extraction', status: 'done',
+                    progress: { current: sectionTotal, total: sectionTotal },
+                    message: `${successCount} of ${sectionTotal} section${sectionTotal === 1 ? '' : 's'} extracted`
+                        + (failedCount ? `, ${failedCount} failed` : '')
+                        + (skippedCount ? `, ${skippedCount} skipped` : ''),
+                    data: { successCount, failedCount, skippedCount },
+                });
 
                 console.log(
                     `🧩 Per-section result: ${successCount} ok, ${failedCount} failed, ${skippedCount} skipped ` +
@@ -700,6 +759,10 @@ class FileProcessorWorker {
                 throw new Error(`OpenAI processing failed: ${processingResult.error}`);
             }
 
+            await this.emitProcessingEvent(file.id, jobId, {
+                phase: 'done', status: 'done', message: 'Processing complete',
+            });
+
             // Remove from processing
             await queueService.removeFileFromProcessing(file.id);
             console.log(`🗑️ File ${file.id} processing completed`);
@@ -710,6 +773,11 @@ class FileProcessorWorker {
             // extraction/AI entirely. Never retry, never extract the full doc.
             if (error instanceof NoExtractableContentError) {
                 console.log(`🚫 ${fileId}: no extractable content — marking completed (no_extractable_pages)`);
+                await this.emitProcessingEvent(fileId, jobId, {
+                    phase: 'skipped', status: 'done', level: 'warning',
+                    message: 'No extractable content — every page classified as "none". Nothing was extracted.',
+                    data: { skipped_reason: 'no_extractable_pages' },
+                });
                 try {
                     // Mark both columns terminal so the file doesn't linger in
                     // "processing" (normal mode set extraction_status=processing
@@ -738,6 +806,12 @@ class FileProcessorWorker {
 
             console.error('❌ Error processing file:', error.message);
             this.errorCount++;
+
+            await this.emitProcessingEvent(fileId, jobId, {
+                phase: 'failed', status: 'failed', level: 'error',
+                message: error.message,
+                data: { will_retry: retries < MAX_RETRIES },
+            });
 
             // Handle retries
             if (retries < MAX_RETRIES) {
@@ -816,13 +890,33 @@ class FileProcessorWorker {
         console.log(`📋 Using extraction method: ${extractionMethod} (from job processing config)`);
 
         // 1. Resolve selected pages (manual > classifier > null)
-        const { usePerSection } = resolveExtractionFlags(jobProcessingConfig);
+        const { useClassifier, usePerSection } = resolveExtractionFlags(jobProcessingConfig);
+
+        // Surface the (often long) classification phase on the timeline. We emit
+        // at phase granularity here; determinate batch progress/ETA is threaded
+        // separately as a follow-up.
+        if (useClassifier && !(Array.isArray(file.selected_pages) && file.selected_pages.length > 0)) {
+            await this.emitProcessingEvent(file.id, file.job_id, {
+                phase: 'classifying', status: 'active',
+                message: 'Classifying pages to find the relevant sections…',
+            });
+        }
+
         const { selectedPages, classifierMeta, detectedSections, classifierFailed, noExtractableContent } = await deriveSelectedPagesAndMeta({
             file,
             jobProcessingConfig,
             s3Service: this.s3Service,
             usePerSection,
         });
+
+        if (useClassifier && detectedSections) {
+            const n = detectedSections.sections?.length ?? 0;
+            await this.emitProcessingEvent(file.id, file.job_id, {
+                phase: 'classifying', status: 'done',
+                message: `${n} section${n === 1 ? '' : 's'} detected`,
+                data: { section_count: n },
+            });
+        }
 
         // Classifier ran but found nothing to extract — skip extraction rather
         // than ingesting the entire document. Handled in processFile's catch as
@@ -855,6 +949,14 @@ class FileProcessorWorker {
         }
 
         // 2. Run extraction with fallback
+        const pageBit = Array.isArray(selectedPages) && selectedPages.length > 0
+            ? `${selectedPages.length} page${selectedPages.length === 1 ? '' : 's'}`
+            : 'the document';
+        await this.emitProcessingEvent(file.id, file.job_id, {
+            phase: 'extracting', status: 'active',
+            message: `Extracting text from ${pageBit} (${extractionMethod})…`,
+        });
+
         let extractionResult;
         if (extractionMethod === 'extendai') {
             extractionResult = await this.extractWithExtendAI(file, extractionOptions, selectedPages);
@@ -874,6 +976,11 @@ class FileProcessorWorker {
         if (!extractionResult.success) {
             throw new Error(`Extraction failed: ${extractionResult.error}`);
         }
+
+        await this.emitProcessingEvent(file.id, file.job_id, {
+            phase: 'extracting', status: 'done',
+            message: 'Text extraction complete',
+        });
 
         // 3. Normalize output
         const pages = extractionResult.pages || [];
