@@ -255,7 +255,11 @@ app.use('/test-db', express.json());
 app.use('/test-redis', express.json());
 app.use('/test-s3', express.json());
 app.use('/storage-stats', express.json());
-app.use('/files', express.json());
+// 10mb: section edits (POST /files/:id/sections/save-and-reextract) send the
+// full detected_sections — sections + per-page classifications — which exceeds
+// the 100kb default on large files (300+ pages). Result-data edits stay small
+// via the per-record PATCH endpoint, so this only loosens the metadata path.
+app.use('/files', express.json({ limit: '10mb' }));
 
 // Health check
 app.get("/health", (req, res) => {
