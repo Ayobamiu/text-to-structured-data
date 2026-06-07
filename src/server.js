@@ -255,11 +255,12 @@ app.use('/test-db', express.json());
 app.use('/test-redis', express.json());
 app.use('/test-s3', express.json());
 app.use('/storage-stats', express.json());
-// 10mb: section edits (POST /files/:id/sections/save-and-reextract) send the
-// full detected_sections — sections + per-page classifications — which exceeds
-// the 100kb default on large files (300+ pages). Result-data edits stay small
-// via the per-record PATCH endpoint, so this only loosens the metadata path.
-app.use('/files', express.json({ limit: '10mb' }));
+// 2mb: section edits (POST /files/:id/sections/save-and-reextract) send the
+// edited `sections` array, which exceeds the 100kb default on large files
+// (hundreds of sections). The full detected_sections metadata is no longer
+// round-tripped (server merges sections in), so this stays well-bounded.
+// Result-data edits use the per-record PATCH endpoint and stay small.
+app.use('/files', express.json({ limit: '2mb' }));
 
 // Health check
 app.get("/health", (req, res) => {
@@ -2515,12 +2516,22 @@ app.post("/files/:id/sections/merge", authenticateToken, async (req, res) => {
 app.post("/files/:id/sections/save-and-reextract", authenticateToken, async (req, res) => {
     try {
         const fileId = req.params.id;
-        const newDetectedSections = req.body?.detected_sections;
+        // Lean payload: the client sends only the edited `sections` array. All
+        // other classifier metadata (pages, page_summaries, grouper, classifier,
+        // record_inventory, …) is preserved server-side — it isn't user-editable
+        // and shouldn't be round-tripped (smaller body, and no risk of the client
+        // staling/dropping it). Back-compat: still accept a legacy full
+        // { detected_sections } body.
+        const incomingSections = Array.isArray(req.body?.sections)
+            ? req.body.sections
+            : (Array.isArray(req.body?.detected_sections?.sections)
+                ? req.body.detected_sections.sections
+                : null);
 
-        if (!newDetectedSections || !Array.isArray(newDetectedSections.sections)) {
+        if (!incomingSections) {
             return res.status(400).json({
                 status: 'error',
-                message: 'detected_sections with a sections array is required',
+                message: 'a sections array is required',
             });
         }
 
@@ -2529,6 +2540,13 @@ app.post("/files/:id/sections/save-and-reextract", authenticateToken, async (req
 
         const file = await loadFileWithSections(fileId, res);
         if (!file) return;
+
+        // Merge: keep stored detected_sections metadata, replace only `sections`.
+        const storedDetected =
+            file.detected_sections && typeof file.detected_sections === 'object'
+                ? file.detected_sections
+                : {};
+        const newDetectedSections = { ...storedDetected, sections: incomingSections };
 
         // Find sections needing extraction (section_result_id === null)
         const sectionIndices = newDetectedSections.sections
