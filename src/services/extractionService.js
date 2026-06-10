@@ -2,6 +2,8 @@ import axios from 'axios';
 import FormData from 'form-data';
 import fs from 'fs';
 import path from 'path';
+import os from 'os';
+import { randomUUID } from 'crypto';
 import { PutObjectCommand } from '@aws-sdk/client-s3';
 import ExtendAIService from './extendAIService.js';
 import { extractPagesFromPdf } from './formationPageDetectionService.js';
@@ -417,6 +419,55 @@ class ExtractionService {
                 fallback_available: true,
                 fallback_method: 'paddleocr'
             };
+        }
+    }
+
+    /**
+     * Extract text for a specific subset of original PDF pages, from S3.
+     *
+     * Used when a reviewer assigns previously-skipped pages to a section and
+     * their text was never stored (only `selected_pages` were extracted at
+     * ingest). Uses the file's original extraction method so the new text
+     * matches the existing pages:
+     *   - extendai  → S3-native; filters the PDF to `pages` server-side.
+     *   - paddleocr → needs a local file, so the original PDF is downloaded
+     *                 from S3 to a temp file, extracted, then cleaned up.
+     *
+     * The returned result follows the standard shape; its `pages` are numbered
+     * 1..k matching the order of `pages` passed in.
+     *
+     * @param {string} filename
+     * @param {string} s3Key
+     * @param {string} method - 'extendai' | 'paddleocr'
+     * @param {Object} options
+     * @param {number[]} pages - original PDF page numbers to extract
+     * @returns {Promise<Object>} Extraction result
+     */
+    async extractScopedText(filename, s3Key, method = DEFAULT_EXTRACTION_METHOD, options = {}, pages = []) {
+        if (method === 'extendai') {
+            const r = await this.extractWithExtendAI(filename, s3Key, options, pages);
+            if (r.success) return r;
+            console.warn(`⚠️ ExtendAI scoped extract failed (${r.error}); falling back to paddleocr`);
+            method = 'paddleocr';
+        }
+
+        // Non-extendai methods need a local file path — download the original
+        // PDF from S3 to a temp file, extract, then always clean up.
+        if (!this.s3Service || typeof this.s3Service.downloadFile !== 'function') {
+            return { success: false, error: 'No S3 service available to download PDF for scoped extraction', method };
+        }
+        let tmpPath = null;
+        try {
+            const buffer = await this.s3Service.downloadFile(s3Key);
+            tmpPath = path.join(os.tmpdir(), `scoped-${randomUUID()}.pdf`);
+            await fs.promises.writeFile(tmpPath, buffer);
+            return await this.extractText(tmpPath, filename, method, options, s3Key, pages);
+        } catch (error) {
+            return { success: false, error: `Scoped extraction failed: ${error.message}`, method };
+        } finally {
+            if (tmpPath) {
+                try { await fs.promises.unlink(tmpPath); } catch { /* best-effort */ }
+            }
         }
     }
 
