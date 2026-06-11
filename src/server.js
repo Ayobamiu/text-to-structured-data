@@ -4558,7 +4558,19 @@ app.post("/extract", authenticateToken, upload.array("files", 20), async (req, r
             return res.status(400).json({ error: "No request body provided" });
         }
 
-        const { schema, schemaName, jobName, extractionMode = 'full_extraction', processingConfig, selected_pages } = req.body;
+        let { schema, schemaName, jobName, extractionMode = 'full_extraction', processingConfig, selected_pages } = req.body;
+
+        // In a multipart upload, processingConfig arrives as a JSON STRING form
+        // field. Parse it to a real object so the default-model logic below and
+        // createJob both operate on an object (prevents double-encoded storage).
+        if (typeof processingConfig === 'string') {
+            try {
+                processingConfig = JSON.parse(processingConfig);
+            } catch (parseError) {
+                console.warn(`⚠️ Upload: invalid processingConfig JSON string, ignoring it: ${parseError.message}`);
+                processingConfig = undefined;
+            }
+        }
 
         if (!req.files || req.files.length === 0) {
             console.error("No files provided in request");
