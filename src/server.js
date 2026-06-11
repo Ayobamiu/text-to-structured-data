@@ -3187,6 +3187,7 @@ app.post("/files/:id/sections/:sectionResultId/qa", authenticateToken, async (re
             sectionResultId,
             findings: qaResult.findings,
             overall_quality: qaResult.overall_quality,
+            summary: qaResult.summary,
             qaModel: qaResult.model,
         });
 
@@ -3241,19 +3242,31 @@ app.post("/files/:id/qa", authenticateToken, async (req, res) => {
             return res.status(400).json({ status: 'error', message: 'No V2 records found — is this a V2 file?' });
         }
 
+        const detected = file.detected_sections?.sections || [];
+        const { runSectionQA, saveQAFindings, getQARuns } = await import('./services/sectionQAService.js');
+
+        // scope=remaining → only QA sections that haven't been QA'd yet (server
+        // decides authoritatively, so the client needn't loop per section).
+        const scope = req.query?.scope ?? req.body?.scope;
+        let records = allRecords;
+        if (scope === 'remaining') {
+            const runs = await getQARuns(fileId);
+            records = allRecords.filter((r) => !runs[r.sectionResultId]);
+            if (!records.length) {
+                return res.json({ status: 'success', fileId, totalSections: 0, results: [], totalFindings: 0 });
+            }
+        }
+
         // Download PDF once for all sections
         const s3 = new S3Service();
         const pdfBuffer = await s3.downloadFile(file.s3_key);
 
-        const detected = file.detected_sections?.sections || [];
-        const { runSectionQA, saveQAFindings } = await import('./services/sectionQAService.js');
-
-        console.log(`🔍 Running QA on all ${allRecords.length} sections of ${file.filename}...`);
+        console.log(`🔍 Running QA on ${records.length}/${allRecords.length} sections of ${file.filename} (scope=${scope || 'all'})...`);
 
         const results = [];
         let totalFindings = 0;
 
-        for (const { slug, record, sectionResultId } of allRecords) {
+        for (const { slug, record, sectionResultId } of records) {
             const section = detected.find(s => s.section_result_id === sectionResultId);
             const pageNumbers = section?.extraction_pages || [];
             if (!pageNumbers.length) {
@@ -3277,6 +3290,7 @@ app.post("/files/:id/qa", authenticateToken, async (req, res) => {
                     sectionResultId,
                     findings: qaResult.findings,
                     overall_quality: qaResult.overall_quality,
+                    summary: qaResult.summary,
                     qaModel: qaResult.model,
                 });
 
@@ -3300,7 +3314,7 @@ app.post("/files/:id/qa", authenticateToken, async (req, res) => {
         res.json({
             status: 'success',
             fileId,
-            totalSections: allRecords.length,
+            totalSections: records.length,
             results,
             totalFindings,
         });
@@ -3319,10 +3333,13 @@ app.get("/files/:id/qa-findings", authenticateToken, async (req, res) => {
         const hasAccess = await checkFileAccess(fileId, req.user, res);
         if (!hasAccess) return;
 
-        const { getQAFindings } = await import('./services/sectionQAService.js');
-        const grouped = await getQAFindings(fileId);
+        const { getQAFindings, getQARuns } = await import('./services/sectionQAService.js');
+        const [grouped, qaRuns] = await Promise.all([
+            getQAFindings(fileId),
+            getQARuns(fileId),
+        ]);
 
-        res.json({ status: 'success', findings: grouped });
+        res.json({ status: 'success', findings: grouped, qaRuns });
     } catch (error) {
         console.error('❌ get QA findings:', error.message);
         res.status(500).json({ status: 'error', message: error.message });
