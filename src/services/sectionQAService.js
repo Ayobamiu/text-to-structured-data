@@ -251,7 +251,7 @@ export async function runSectionQA({ fileId, sectionResultId, slug, pageNumbers,
  * @param {string} params.overall_quality
  * @returns {Promise<object[]>} the saved finding rows
  */
-export async function saveQAFindings({ fileId, sectionResultId, findings, overall_quality, qaModel = QA_MODEL }) {
+export async function saveQAFindings({ fileId, sectionResultId, findings, overall_quality, summary = null, qaModel = QA_MODEL }) {
     const client = await pool.connect();
     try {
         await client.query('BEGIN');
@@ -261,6 +261,23 @@ export async function saveQAFindings({ fileId, sectionResultId, findings, overal
             `DELETE FROM section_qa_findings
              WHERE file_id = $1 AND section_result_id = $2 AND status = 'open'`,
             [fileId, sectionResultId]
+        );
+
+        // Record the run itself (incl. clean passes) so the UI can tell a
+        // QA'd-clean section from a never-QA'd one across reloads.
+        await client.query(
+            `INSERT INTO section_qa_runs
+                (file_id, section_result_id, overall_quality, summary, findings_count, qa_model, last_qa_at, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW())
+             ON CONFLICT (file_id, section_result_id)
+             DO UPDATE SET
+                 overall_quality = EXCLUDED.overall_quality,
+                 summary = EXCLUDED.summary,
+                 findings_count = EXCLUDED.findings_count,
+                 qa_model = EXCLUDED.qa_model,
+                 last_qa_at = NOW(),
+                 updated_at = NOW()`,
+            [fileId, sectionResultId, overall_quality, summary, findings.length, qaModel]
         );
 
         if (findings.length === 0) {
@@ -334,6 +351,24 @@ export async function getQAFindings(fileId) {
 }
 
 /**
+ * Get the QA-run record for each section of a file, keyed by section_result_id.
+ * Present for every section QA has run on (including clean, zero-finding runs).
+ */
+export async function getQARuns(fileId) {
+    const result = await pool.query(
+        `SELECT section_result_id, overall_quality, summary, findings_count, qa_model, last_qa_at
+         FROM section_qa_runs
+         WHERE file_id = $1`,
+        [fileId]
+    );
+    const bySection = {};
+    for (const row of result.rows) {
+        bySection[row.section_result_id] = row;
+    }
+    return bySection;
+}
+
+/**
  * Update a single finding's status (accepted / dismissed).
  */
 export async function updateQAFindingStatus(findingId, fileId, status) {
@@ -351,5 +386,6 @@ export default {
     runSectionQA,
     saveQAFindings,
     getQAFindings,
+    getQARuns,
     updateQAFindingStatus,
 };
