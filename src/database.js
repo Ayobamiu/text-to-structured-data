@@ -58,7 +58,22 @@ export async function createJob(name, schema, schemaName, userId = null, organiz
             processing: { method: 'openai', model: 'gpt-4o', options: {} }
         };
 
-        const finalProcessingConfig = processingConfig || defaultProcessingConfig;
+        // Defensive: some callers (e.g. the multipart upload endpoint) pass
+        // processingConfig as a JSON STRING (a form-field value). Parse it here
+        // so we always store a proper jsonb object rather than a double-encoded
+        // string scalar (JSON.stringify of a string), which would make
+        // processing_config.extraction?.method etc. undefined on read-back.
+        let normalizedProcessingConfig = processingConfig;
+        if (typeof normalizedProcessingConfig === 'string') {
+            try {
+                normalizedProcessingConfig = JSON.parse(normalizedProcessingConfig);
+            } catch (e) {
+                console.warn(`⚠️ createJob: processingConfig was an unparseable string, falling back to defaults: ${e.message}`);
+                normalizedProcessingConfig = null;
+            }
+        }
+
+        const finalProcessingConfig = normalizedProcessingConfig || defaultProcessingConfig;
 
         // Create initial schema data object
         const initialSchemaData = { schema, schemaName: schemaName || 'data_extraction' };
