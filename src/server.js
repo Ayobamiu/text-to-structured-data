@@ -37,7 +37,8 @@ import pool, {
     updateFileDetectedSections,
     userHasJobAccess,
     getFileSkinnyRow,
-    updateFileSelectedPages
+    updateFileSelectedPages,
+    updateFilePages
 } from "./database.js";
 import { getUserById } from "./database/users.js";
 import { getUserOrganizations } from "./database/userOrganizationMemberships.js";
@@ -2610,9 +2611,108 @@ app.post("/files/:id/sections/save-and-reextract", authenticateToken, async (req
         if (jobRow.rows.length === 0) {
             return res.status(404).json({ status: 'error', message: 'Job not found' });
         }
-        const jobProcessingConfig = jobRow.rows[0].processing_config || {};
+        // Some jobs persisted processing_config double-encoded (a JSON string
+        // stored in the jsonb column), so pg returns a string here. Normalize
+        // to an object so processing.method/options resolve instead of silently
+        // falling back to defaults.
+        let jobProcessingConfig = jobRow.rows[0].processing_config || {};
+        if (typeof jobProcessingConfig === 'string') {
+            try {
+                jobProcessingConfig = JSON.parse(jobProcessingConfig) || {};
+            } catch {
+                jobProcessingConfig = {};
+            }
+        }
         const processingMethod = jobProcessingConfig.processing?.method || 'openai';
         const processingOptions = jobProcessingConfig.processing?.options || {};
+
+        // ── Text-aware: pull in pages a reviewer newly assigned to a section
+        // whose text was never stored. `selected_pages[i]` is the original PDF
+        // page number whose text lives at `pages[i]`. A page in a section's
+        // extraction_pages that isn't in selected_pages has no stored text, so
+        // per-section extraction would skip it for "no content". Extract just
+        // those pages from the original PDF (scoped, using the file's original
+        // method) and merge the text into pages + selected_pages at the source.
+        let effectivePages = filePages;
+        let effectiveSelectedPages = file.selected_pages || null;
+        const pagesWithoutText = [];
+
+        if (Array.isArray(effectiveSelectedPages)) {
+            const haveText = new Set(effectiveSelectedPages);
+            const neededPages = new Set();
+            for (const i of sectionIndices) {
+                for (const p of (newDetectedSections.sections[i].extraction_pages || [])) {
+                    neededPages.add(p);
+                }
+            }
+            const missingPages = [...neededPages]
+                .filter(p => typeof p === 'number' && !haveText.has(p))
+                .sort((a, b) => a - b);
+
+            if (missingPages.length > 0) {
+                // Use the method the file was ACTUALLY extracted with (recorded
+                // on the file), so the new pages' text matches the existing
+                // pages. The job's processing_config may not carry an extraction
+                // method; default to extendai (the S3-native extractor) rather
+                // than paddleocr, which needs a running local service.
+                const exMethod = file.extraction_metadata?.extraction_method
+                    || jobProcessingConfig.extraction?.method
+                    || 'extendai';
+                const exOptions = jobProcessingConfig.extraction?.options || {};
+                console.log(
+                    `🔎 ${missingPages.length} newly-assigned page(s) lack stored text ` +
+                    `[${missingPages.join(', ')}] — scoped re-extract via ${exMethod}`
+                );
+
+                const scoped = await extractionService.extractScopedText(
+                    file.filename, file.s3_key, exMethod, exOptions, missingPages
+                );
+                if (!scoped.success) {
+                    return res.status(502).json({
+                        status: 'error',
+                        message: `Could not extract text for newly assigned page(s) [${missingPages.join(', ')}]: ${scoped.error}`,
+                    });
+                }
+
+                // Map returned pages (numbered 1..k within the filtered PDF) back
+                // to the original page via missingPages[n-1]. A page can yield
+                // several chunks, so concatenate text per original page.
+                const textByOriginal = new Map();
+                for (const pg of (scoped.pages || [])) {
+                    const n = typeof pg.page_number === 'number' ? pg.page_number : null;
+                    if (!n || n < 1 || n > missingPages.length) continue;
+                    const orig = missingPages[n - 1];
+                    const txt = (pg.text ?? pg.markdown ?? '').toString();
+                    textByOriginal.set(orig, (textByOriginal.get(orig) || '') + txt);
+                }
+
+                // Merge into the aligned (selected_pages[i] ↔ pages[i]) arrays,
+                // re-sorted by original page number and re-sequenced 1..N.
+                const merged = effectiveSelectedPages.map((orig, i) => ({
+                    orig,
+                    text: (effectivePages[i]?.text ?? effectivePages[i]?.markdown ?? '').toString(),
+                }));
+                for (const orig of missingPages) {
+                    const text = textByOriginal.get(orig) || '';
+                    if (!text.trim()) pagesWithoutText.push(orig);
+                    merged.push({ orig, text });
+                }
+                merged.sort((a, b) => a.orig - b.orig);
+                effectiveSelectedPages = merged.map(m => m.orig);
+                effectivePages = merged.map((m, i) => ({ page_number: i + 1, text: m.text }));
+
+                // Persist the enriched text at the source (not a read-time patch).
+                await updateFilePages(fileId, effectivePages);
+                await updateFileSelectedPages(fileId, effectiveSelectedPages);
+
+                if (pagesWithoutText.length > 0) {
+                    console.log(
+                        `⚠️ No extractable text for page(s) [${pagesWithoutText.join(', ')}] — ` +
+                        `their section(s) may report no content`
+                    );
+                }
+            }
+        }
 
         // Build partial sections blob for extraction
         const partialSections = {
@@ -2633,11 +2733,11 @@ app.post("/files/:id/sections/save-and-reextract", authenticateToken, async (req
 
         const perSection = await extractAndProcessPerSection({
             detectedSections: partialSections,
-            pages: filePages,
+            pages: effectivePages,
             processingService,
             processingMethod,
             processingOptions,
-            selectedPages: file.selected_pages || null,
+            selectedPages: effectiveSelectedPages,
         });
 
         if (!perSection.anySuccess) {
@@ -2731,6 +2831,7 @@ app.post("/files/:id/sections/save-and-reextract", authenticateToken, async (req
             status: 'success',
             detected_sections: finalDetectedSections,
             sectionResults: perSection.sectionResults,
+            pages_without_text: pagesWithoutText,
         });
     } catch (error) {
         console.error('❌ save-and-reextract:', error.message);
@@ -2781,7 +2882,18 @@ app.post("/files/:id/reextract-sections", authenticateToken, async (req, res) =>
         if (jobRow.rows.length === 0) {
             return res.status(404).json({ status: 'error', message: 'Job not found' });
         }
-        const jobProcessingConfig = jobRow.rows[0].processing_config || {};
+        // Some jobs persisted processing_config double-encoded (a JSON string
+        // stored in the jsonb column), so pg returns a string here. Normalize
+        // to an object so processing.method/options resolve instead of silently
+        // falling back to defaults.
+        let jobProcessingConfig = jobRow.rows[0].processing_config || {};
+        if (typeof jobProcessingConfig === 'string') {
+            try {
+                jobProcessingConfig = JSON.parse(jobProcessingConfig) || {};
+            } catch {
+                jobProcessingConfig = {};
+            }
+        }
         const processingMethod = jobProcessingConfig.processing?.method || 'openai';
         const processingOptions = jobProcessingConfig.processing?.options || {};
 

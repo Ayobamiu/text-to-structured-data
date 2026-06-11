@@ -590,6 +590,25 @@ export async function updateFileSelectedPages(fileId, selectedPages) {
     }
 }
 
+// Persist the file's extracted `pages` array (jsonb). Lightweight UPDATE —
+// only touches `pages` so it can run alongside other updates without
+// conflicting. Used when scoped re-extraction enriches the stored text with
+// pages a reviewer newly assigned to a section.
+export async function updateFilePages(fileId, pages) {
+    const client = await pool.connect();
+    try {
+        await client.query(
+            `UPDATE job_files SET pages = $1, updated_at = NOW() WHERE id = $2`,
+            [pages ? JSON.stringify(pages) : null, fileId]
+        );
+    } catch (error) {
+        console.warn(`⚠️ Failed to persist pages for file ${fileId}:`, error.message);
+        throw error; // merged text is required for the re-extract to be correct
+    } finally {
+        client.release();
+    }
+}
+
 // Update file processing status
 export async function updateFileProcessingStatus(fileId, status, result = null, error = null, metadata = null, aiProcessingTimeSeconds = null) {
     const client = await pool.connect();
