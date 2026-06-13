@@ -56,6 +56,12 @@ import { rateLimitConfig } from "./auth.js";
 import logger from "./utils/logger.js";
 import { processWithOpenAI } from "./utils/openaiProcessor.js";
 import ExtractionService from "./services/extractionService.js";
+import {
+    resolveSectionIndex,
+    sliceSectionMarkdown,
+    reextractSectionText,
+    rebuildEnvelopeForSections,
+} from "./services/sectionReprocessService.js";
 import groqService from "./services/groqService.js";
 import { recordCorrections } from "./services/correctionsService.js";
 import { getPdfPageCount } from "./utils/pdfUtils.js";
@@ -3057,6 +3063,204 @@ app.post("/files/:id/reextract-sections", authenticateToken, async (req, res) =>
         });
     } catch (error) {
         console.error('❌ section re-extract:', error.message);
+        res.status(500).json({ status: 'error', message: error.message });
+    }
+});
+
+// GET /files/:id/sections/:sectionResultId/markdown
+// Return just one section's source markdown (its extraction_pages sliced out of
+// the file's stored page text, via selected_pages alignment). Powers the
+// "This section" toggle on the Markdown tab.
+app.get("/files/:id/sections/:sectionResultId/markdown", authenticateToken, async (req, res) => {
+    try {
+        const fileId = req.params.id;
+        const { sectionResultId } = req.params;
+
+        const hasAccess = await checkFileAccess(fileId, req.user, res);
+        if (!hasAccess) return;
+
+        const file = await loadFileWithSections(fileId, res);
+        if (!file) return;
+
+        const idx = resolveSectionIndex(file.detected_sections, sectionResultId);
+        if (idx < 0) {
+            return res.status(404).json({ status: 'error', message: 'Section not found' });
+        }
+        const section = file.detected_sections.sections[idx];
+
+        // pages is a large column omitted by getFileResult — load it directly.
+        const pagesRow = await pool.query(`SELECT pages FROM job_files WHERE id = $1`, [fileId]);
+        const filePages = pagesRow.rows[0]?.pages || [];
+
+        const { markdown, pages } = sliceSectionMarkdown({
+            pages: filePages,
+            selectedPages: file.selected_pages || null,
+            extractionPages: section.extraction_pages || [],
+        });
+
+        res.json({
+            status: 'success',
+            sectionResultId,
+            extraction_pages: section.extraction_pages || [],
+            markdown,
+            pages,
+        });
+    } catch (error) {
+        console.error('❌ section markdown:', error.message);
+        res.status(500).json({ status: 'error', message: error.message });
+    }
+});
+
+// POST /files/:id/sections/:sectionResultId/reprocess
+// Reprocess a SINGLE section: re-extract its text (re-OCR its pages), re-run AI
+// on it, or both — the section-scoped analogue of POST /files/reprocess.
+app.post("/files/:id/sections/:sectionResultId/reprocess", authenticateToken, async (req, res) => {
+    try {
+        const fileId = req.params.id;
+        const { sectionResultId } = req.params;
+        const reExtractText = req.body?.reExtractText === true;
+        const reProcessAi = req.body?.reProcessAi === true;
+
+        if (!reExtractText && !reProcessAi) {
+            return res.status(400).json({
+                status: 'error',
+                message: 'At least one of reExtractText or reProcessAi must be true',
+            });
+        }
+
+        const hasAccess = await checkFileAccess(fileId, req.user, res);
+        if (!hasAccess) return;
+
+        const file = await loadFileWithSections(fileId, res);
+        if (!file) return;
+
+        const sectionIndex = resolveSectionIndex(file.detected_sections, sectionResultId);
+        if (sectionIndex < 0) {
+            return res.status(404).json({ status: 'error', message: 'Section not found' });
+        }
+        const section = file.detected_sections.sections[sectionIndex];
+        const extractionPages = Array.isArray(section.extraction_pages) ? section.extraction_pages : [];
+
+        // pages is a large column omitted by getFileResult — load it directly.
+        const pagesRow = await pool.query(`SELECT pages FROM job_files WHERE id = $1`, [fileId]);
+        let filePages = pagesRow.rows[0]?.pages || [];
+        let selectedPages = file.selected_pages || null;
+
+        // Normalize processing_config (some rows were double-encoded).
+        const jobRow = await pool.query(`SELECT processing_config FROM jobs WHERE id = $1`, [file.job_id]);
+        let jpc = jobRow.rows[0]?.processing_config || {};
+        if (typeof jpc === 'string') { try { jpc = JSON.parse(jpc) || {}; } catch { jpc = {}; } }
+        const processingMethod = jpc.processing?.method || 'openai';
+        const processingOptions = jpc.processing?.options || {};
+
+        emitFilePatch(file.job_id, fileId, { processing_status: 'processing' });
+
+        // 1. Re-extract text (re-OCR the section's pages), persist at the source.
+        if (reExtractText) {
+            if (extractionPages.length === 0) {
+                return res.status(400).json({
+                    status: 'error',
+                    message: 'Section has no extraction_pages to re-extract',
+                });
+            }
+            const exMethod = file.extraction_metadata?.extraction_method
+                || jpc.extraction?.method
+                || 'extendai';
+            const exOptions = jpc.extraction?.options || {};
+            console.log(
+                `🔄 Section reprocess (text) for ${file.filename}: re-extracting pages ` +
+                `[${extractionPages.join(', ')}] via ${exMethod}`
+            );
+            const re = await reextractSectionText({
+                extractionService, file, pages: filePages, selectedPages,
+                pageNumbers: extractionPages, exMethod, exOptions,
+            });
+            if (!re.success) {
+                emitFilePatch(file.job_id, fileId, { processing_status: 'completed' });
+                return res.status(502).json({
+                    status: 'error',
+                    message: `Could not re-extract text for pages [${extractionPages.join(', ')}]: ${re.error}`,
+                });
+            }
+            filePages = re.pages;
+            selectedPages = re.selectedPages;
+            await updateFilePages(fileId, filePages);
+            if (Array.isArray(selectedPages)) await updateFileSelectedPages(fileId, selectedPages);
+        }
+
+        // 2. Re-run AI on the section, rebuild the envelope by section_result_id.
+        let responseResult = file.result;
+        let responseDetectedSections = file.detected_sections;
+        if (reProcessAi) {
+            const partialSections = { ...file.detected_sections, sections: [section] };
+            const { extractAndProcessPerSection } = await import('./services/perSectionExtractor.js');
+            const ProcessingService = (await import('./services/processingService.js')).default;
+            const processingService = new ProcessingService();
+
+            console.log(
+                `🔄 Section reprocess (AI) for ${file.filename}: section ${sectionIndex} ` +
+                `(${section.document_type_slug})`
+            );
+
+            const perSection = await extractAndProcessPerSection({
+                detectedSections: partialSections,
+                pages: filePages,
+                processingService,
+                processingMethod,
+                processingOptions,
+                selectedPages: selectedPages || null,
+            });
+
+            if (!perSection.anySuccess) {
+                const firstError = perSection.sectionResults.find(r => r.error)?.error
+                    || 'No section produced a result';
+                emitFilePatch(file.job_id, fileId, { processing_status: 'completed' });
+                return res.status(500).json({ status: 'error', message: firstError });
+            }
+
+            const rebuilt = rebuildEnvelopeForSections({
+                file, perSection, sectionIndices: [sectionIndex],
+            });
+            const finalMetadata = {
+                ...(file.extraction_metadata || {}),
+                result_envelope: 'v2',
+                section_results: rebuilt.sectionResults,
+                last_reextract: {
+                    section_indices: [sectionIndex],
+                    timestamp: new Date().toISOString(),
+                },
+            };
+
+            await updateFileDetectedSections(fileId, rebuilt.updatedDetectedSections);
+            await updateFileProcessingStatus(
+                fileId, 'completed', rebuilt.mergedResult, null, finalMetadata,
+                perSection.totalAiTimeSeconds || null,
+            );
+
+            responseResult = rebuilt.mergedResult;
+            responseDetectedSections = rebuilt.updatedDetectedSections;
+            emitFilePatch(file.job_id, fileId, {
+                processing_status: 'completed',
+                result: rebuilt.mergedResult,
+                detected_sections: rebuilt.updatedDetectedSections,
+            });
+        } else {
+            // Text-only: result unchanged; the new page text feeds the markdown
+            // view and any future AI run.
+            emitFilePatch(file.job_id, fileId, { processing_status: 'completed' });
+        }
+
+        console.log(`✅ Section reprocess complete for ${file.filename} (section ${sectionIndex})`);
+        res.json({
+            status: 'success',
+            sectionResultId,
+            reExtractText,
+            reProcessAi,
+            result: responseResult,
+            detected_sections: responseDetectedSections,
+        });
+    } catch (error) {
+        console.error('❌ section reprocess:', error.message);
         res.status(500).json({ status: 'error', message: error.message });
     }
 });
