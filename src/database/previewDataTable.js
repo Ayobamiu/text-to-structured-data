@@ -4,6 +4,7 @@
  */
 
 import pool from '../database.js';
+import { flattenRecords, inferSlugFromShape } from '../utils/resultEnvelope.js';
 
 /**
  * Create a new preview data table
@@ -246,6 +247,194 @@ export async function getJobFilesForPreviewPaginated(itemIds, page = 1, pageSize
             page: page,
             pageSize: pageSize
         };
+    } finally {
+        client.release();
+    }
+}
+
+// Expands a preview's files into one row per RECORD, entirely in Postgres:
+//   - V2 files: unnest each slug→array element that has a section_result_id.
+//   - V1 files: the whole result is a single record (slug NULL).
+//   - eff_slug: the V2 slug, else a shape-inferred type for V1 well logs.
+// $1 = item ids. jsonb inputs are guarded so non-object/non-array results don't error.
+const RECORD_EXPAND_CTE = `
+WITH expanded AS (
+    SELECT jf.id AS file_id, jf.filename, jf.created_at, jf.processing_status,
+           jf.admin_verified, jf.review_status, j.name AS job_name,
+           rec.slug, rec.idx, rec.record
+    FROM job_files jf
+    JOIN jobs j ON jf.job_id = j.id
+    CROSS JOIN LATERAL (
+        SELECT ee.key AS slug, (ord - 1)::int AS idx, vv AS record
+        FROM jsonb_each(jf.result) ee
+        CROSS JOIN LATERAL jsonb_array_elements(
+            CASE WHEN jsonb_typeof(ee.value) = 'array' THEN ee.value ELSE '[]'::jsonb END
+        ) WITH ORDINALITY AS arr(vv, ord)
+        WHERE jsonb_typeof(vv) = 'object' AND vv ? 'section_result_id'
+        UNION ALL
+        SELECT NULL::text AS slug, 0 AS idx, jf.result AS record
+        WHERE NOT EXISTS (
+            SELECT 1 FROM jsonb_each(jf.result) e2
+            CROSS JOIN LATERAL jsonb_array_elements(
+                CASE WHEN jsonb_typeof(e2.value) = 'array' THEN e2.value ELSE '[]'::jsonb END
+            ) v2
+            WHERE jsonb_typeof(v2) = 'object' AND v2 ? 'section_result_id'
+        )
+    ) rec
+    WHERE jf.id = ANY($1)
+      AND jf.result IS NOT NULL
+      AND jsonb_typeof(jf.result) = 'object'
+),
+typed AS (
+    SELECT *,
+        COALESCE(slug,
+            CASE WHEN record ? 'formations' OR record ? 'casing'
+                      OR record ? 'perforation_intervals' OR record ? 'pluggings'
+                      OR record ? 'shows_depths' OR record ? 'true_depth'
+                      OR record ? 'measured_depth'
+                 THEN 'mgs_well_log' END) AS eff_slug
+    FROM expanded
+)`;
+
+/**
+ * Record-aware, SQL-paginated preview data. A "row" is a RECORD (V2 files
+ * contribute many; V1 files one). Pagination, counts, search and the type
+ * breakdown all run in Postgres — the app never loads every result into memory.
+ *
+ * Each row keeps the old file-row shape (frontend spreads `row.result`) but
+ * `result` is the single record, plus `slug` + `section_result_id` + unique `id`.
+ * `slug='untyped'` filters the no-type bucket. `slugs` is the full type
+ * distribution for the rail.
+ */
+export async function getRecordsForPreviewPaginated(
+    itemIds,
+    page = 1,
+    pageSize = 20,
+    searchTerm = null,
+    slug = null,
+    fileId = null,
+) {
+    if (!itemIds || itemIds.length === 0) {
+        return { jobFiles: [], total: 0, page, pageSize, slugs: [] };
+    }
+    const client = await pool.connect();
+    try {
+        const offset = (page - 1) * pageSize;
+        const searchParam = searchTerm && searchTerm.trim() ? `%${searchTerm.trim()}%` : null;
+
+        // Page rows + filtered total (one scan via COUNT(*) OVER()).
+        const pageRes = await client.query(
+            `${RECORD_EXPAND_CTE}
+             SELECT file_id, filename, created_at, processing_status,
+                    admin_verified, review_status, job_name, eff_slug, idx, record,
+                    COUNT(*) OVER() AS total_count
+             FROM typed
+             WHERE ($3::text IS NULL
+                    OR ($3 = 'untyped' AND eff_slug IS NULL)
+                    OR ($3 <> 'untyped' AND eff_slug = $3))
+               AND ($4::uuid IS NULL OR file_id = $4::uuid)
+               AND ($2::text IS NULL OR filename ILIKE $2 OR record::text ILIKE $2)
+             ORDER BY created_at DESC, file_id, idx
+             LIMIT $5 OFFSET $6`,
+            [itemIds, searchParam, slug || null, fileId || null, pageSize, offset],
+        );
+
+        // Full type distribution (independent of the active slug/file filter).
+        const slugRes = await client.query(
+            `${RECORD_EXPAND_CTE}
+             SELECT eff_slug AS slug, COUNT(*)::int AS count
+             FROM typed GROUP BY eff_slug ORDER BY count DESC`,
+            [itemIds],
+        );
+
+        const jobFiles = pageRes.rows.map((r) => ({
+            id: r.record?.section_result_id || `${r.file_id}:${r.eff_slug ?? 'untyped'}:${r.idx}`,
+            file_id: r.file_id,
+            filename: r.filename,
+            job_name: r.job_name,
+            created_at: r.created_at,
+            processing_status: r.processing_status,
+            admin_verified: r.admin_verified,
+            review_status: r.review_status,
+            slug: r.eff_slug ?? null,
+            section_result_id: r.record?.section_result_id ?? null,
+            result: r.record,
+        }));
+
+        const total = pageRes.rows[0] ? parseInt(pageRes.rows[0].total_count, 10) : 0;
+        const slugs = slugRes.rows.map((s) => ({ slug: s.slug ?? null, count: s.count }));
+
+        return { jobFiles, total, page, pageSize, slugs };
+    } finally {
+        client.release();
+    }
+}
+
+/**
+ * Per-file summary for the "by file" lens: each file with its record count,
+ * a by-type breakdown ("34 well logs, 4 aquifer tests"), and review status.
+ * V1 types are shape-inferred; unrecognized records fall under slug=null.
+ */
+export async function getFilesSummaryForPreview(
+    itemIds,
+    page = 1,
+    pageSize = 20,
+    searchTerm = null,
+) {
+    if (!itemIds || itemIds.length === 0) {
+        return { files: [], total: 0, page, pageSize };
+    }
+    const client = await pool.connect();
+    try {
+        const offset = (page - 1) * pageSize;
+        const searchParam = searchTerm && searchTerm.trim() ? `%${searchTerm.trim()}%` : null;
+        const where = `WHERE jf.id = ANY($1) AND ($2::text IS NULL OR jf.filename ILIKE $2)`;
+
+        // Paginate FILES in SQL; only the page's results are loaded + flattened.
+        const countRes = await client.query(
+            `SELECT COUNT(*)::int AS total FROM job_files jf ${where}`,
+            [itemIds, searchParam],
+        );
+        const total = countRes.rows[0]?.total ?? 0;
+
+        const res = await client.query(
+            `SELECT jf.id, jf.filename, jf.created_at, jf.processing_status,
+                    jf.admin_verified, jf.review_status, jf.result, j.name AS job_name
+             FROM job_files jf
+             JOIN jobs j ON jf.job_id = j.id
+             ${where}
+             ORDER BY jf.created_at DESC
+             LIMIT $3 OFFSET $4`,
+            [itemIds, searchParam, pageSize, offset],
+        );
+
+        const files = res.rows.map((f) => {
+            const { records } = flattenRecords(f.result);
+            const counts = new Map();
+            let count = 0;
+            for (const { slug: recSlug, record } of records) {
+                if (!record || typeof record !== 'object') continue;
+                count++;
+                const eff = recSlug || inferSlugFromShape(record) || '__untyped__';
+                counts.set(eff, (counts.get(eff) || 0) + 1);
+            }
+            const byType = [...counts.entries()]
+                .sort((a, b) => b[1] - a[1])
+                .map(([s, c]) => ({ slug: s === '__untyped__' ? null : s, count: c }));
+            return {
+                id: f.id,
+                filename: f.filename,
+                job_name: f.job_name,
+                created_at: f.created_at,
+                processing_status: f.processing_status,
+                admin_verified: f.admin_verified,
+                review_status: f.review_status,
+                total_records: count,
+                by_type: byType,
+            };
+        });
+
+        return { files, total, page, pageSize };
     } finally {
         client.release();
     }

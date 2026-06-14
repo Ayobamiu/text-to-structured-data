@@ -20,6 +20,29 @@
  */
 
 /**
+ * V1 records carry no document-type slug, and their job's document_type_slug is
+ * almost always null. ~98% of legacy V1 files are MGS well logs, whose shape is
+ * unmistakable (formations / casing / well geometry). Sniff that so V1 well logs
+ * get a real type bucket (and the wellbore hero) instead of falling into an
+ * "untyped" pile. Returns a slug or null.
+ */
+export function inferSlugFromShape(record) {
+    if (!record || typeof record !== 'object' || Array.isArray(record)) return null;
+    if (
+        record.formations ||
+        record.casing ||
+        record.perforation_intervals ||
+        record.pluggings ||
+        record.shows_depths ||
+        record.true_depth ||
+        record.measured_depth
+    ) {
+        return 'mgs_well_log';
+    }
+    return null;
+}
+
+/**
  * Returns true if `result` looks like a V2 per-section envelope.
  *
  * A V2 envelope has shape: { slug: [ { section_result_id, ...fields } ] }
