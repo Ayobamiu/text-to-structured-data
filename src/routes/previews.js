@@ -17,6 +17,8 @@ import {
     removeItemsFromPreview,
     getJobFilesForPreview,
     getJobFilesForPreviewPaginated,
+    getRecordsForPreviewPaginated,
+    getFilesSummaryForPreview,
     getAvailableJobFiles,
     getPreviewsForFile,
     isFileInPreview,
@@ -152,8 +154,8 @@ router.get('/:id/statistics', async (req, res) => {
 router.get('/:id/data', async (req, res) => {
     try {
         const { id } = req.params;
-        const { page = '1', pageSize = '20', search = null } = req.query;
-        
+        const { page = '1', pageSize = '20', search = null, slug = null, fileId = null } = req.query;
+
         const preview = await getPreviewDataTableById(id);
 
         if (!preview) {
@@ -181,19 +183,22 @@ router.get('/:id/data', async (req, res) => {
             });
         }
 
-        // Get paginated job files data
-        const result = await getJobFilesForPreviewPaginated(
+        // Get paginated data — one row per RECORD (V2-aware; V1 files = one record).
+        const result = await getRecordsForPreviewPaginated(
             preview.items_ids || [],
             pageNum,
             pageSizeNum,
-            search || null
+            search || null,
+            slug || null,
+            fileId || null
         );
 
         res.json({
             success: true,
             data: {
                 preview,
-                jobFiles: result.files,
+                jobFiles: result.jobFiles,
+                slugs: result.slugs,
                 pagination: {
                     total: result.total,
                     page: result.page,
@@ -207,6 +212,53 @@ router.get('/:id/data', async (req, res) => {
         res.status(500).json({
             success: false,
             message: 'Failed to fetch preview data',
+            error: error.message
+        });
+    }
+});
+
+/**
+ * GET /previews/:id/files
+ * "By file" lens: one row per file with a by-type record summary + review status.
+ */
+router.get('/:id/files', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { page = '1', pageSize = '20', search = null } = req.query;
+
+        const preview = await getPreviewDataTableById(id);
+        if (!preview) {
+            return res.status(404).json({ success: false, message: 'Preview not found' });
+        }
+
+        const pageNum = Math.max(parseInt(page, 10) || 1, 1);
+        const pageSizeNum = Math.min(Math.max(parseInt(pageSize, 10) || 20, 1), 100);
+
+        const result = await getFilesSummaryForPreview(
+            preview.items_ids || [],
+            pageNum,
+            pageSizeNum,
+            search || null
+        );
+
+        res.json({
+            success: true,
+            data: {
+                preview,
+                files: result.files,
+                pagination: {
+                    total: result.total,
+                    page: result.page,
+                    pageSize: result.pageSize,
+                    totalPages: Math.ceil(result.total / result.pageSize)
+                }
+            }
+        });
+    } catch (error) {
+        console.error('Error fetching preview files:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Failed to fetch preview files',
             error: error.message
         });
     }
