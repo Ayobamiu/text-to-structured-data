@@ -18,6 +18,7 @@ import {
     getJobFilesForPreview,
     getJobFilesForPreviewPaginated,
     getRecordsForPreviewPaginated,
+    getAllRecordsForSlug,
     getFilesSummaryForPreview,
     getAvailableJobFiles,
     getPreviewsForFile,
@@ -25,6 +26,13 @@ import {
     getPreviewStatistics
 } from '../database/previewDataTable.js';
 import mgsDataService from '../services/mgsDataService.js';
+import { getActiveSchema } from '../services/schemaRegistry.js';
+import {
+    buildColumnsFromSchema,
+    augmentColumnsFromData,
+    csvHeaderLine,
+    csvRowLine,
+} from '../utils/gisCsvExport.js';
 import { isV2Envelope, mapRecords, readField } from '../utils/resultEnvelope.js';
 import { authenticateToken, requireRole } from '../middleware/auth.js';
 import {
@@ -261,6 +269,80 @@ router.get('/:id/files', async (req, res) => {
             message: 'Failed to fetch preview files',
             error: error.message
         });
+    }
+});
+
+/**
+ * GET /previews/:id/export?slug=<type>&format=csv
+ * GIS-ready, flat CSV export for ONE document type across the whole preview
+ * (all records of that type, not just the current page). Streams the response
+ * row-by-row. One clean row per record; scalars + one level of nested objects
+ * become real snake_case columns; arrays/internal keys are excluded.
+ */
+router.get('/:id/export', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { slug = null, format = 'csv' } = req.query;
+
+        if (format !== 'csv') {
+            return res.status(400).json({
+                success: false,
+                message: `Unsupported export format '${format}'. Only 'csv' is supported.`,
+            });
+        }
+        if (!slug || !String(slug).trim()) {
+            return res.status(400).json({
+                success: false,
+                message: 'A document type (slug) is required for GIS export.',
+            });
+        }
+
+        const preview = await getPreviewDataTableById(id);
+        if (!preview) {
+            return res.status(404).json({ success: false, message: 'Preview not found' });
+        }
+
+        const records = await getAllRecordsForSlug(preview.items_ids || [], slug);
+
+        // Columns: schema order first (so location columns are present even when
+        // empty), then any scalar fields seen in the data but not the schema.
+        const active = slug === 'untyped' ? null : await getActiveSchema(slug);
+        let columns = buildColumnsFromSchema(active?.schema || null);
+        columns = augmentColumnsFromData(columns, records);
+
+        if (columns.length === 0) {
+            return res.status(422).json({
+                success: false,
+                message: `No exportable columns for type '${slug}'. No active schema and no scalar fields found in the records.`,
+            });
+        }
+
+        const safeName = (preview.name || 'preview')
+            .replace(/[^a-z0-9._-]+/gi, '_')
+            .replace(/^_+|_+$/g, '') || 'preview';
+        const filename = `${slug}_${safeName}.csv`;
+
+        res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+        res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+
+        res.write(`${csvHeaderLine(columns)}\n`);
+        for (const record of records) {
+            res.write(`${csvRowLine(record, columns)}\n`);
+        }
+        res.end();
+    } catch (error) {
+        console.error('Error exporting preview CSV:', error);
+        // If we haven't sent headers yet, return a JSON error; otherwise the
+        // stream is already committed, so just terminate it.
+        if (!res.headersSent) {
+            res.status(500).json({
+                success: false,
+                message: 'Failed to export preview data',
+                error: error.message,
+            });
+        } else {
+            res.end();
+        }
     }
 });
 

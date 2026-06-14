@@ -371,6 +371,38 @@ export async function getRecordsForPreviewPaginated(
 }
 
 /**
+ * All records of a given type across a preview's files — for the GIS CSV export.
+ * Reuses RECORD_EXPAND_CTE (same V1/V2 + slug-filter semantics as the paginated
+ * data endpoint) but drops pagination and selects only the record payload.
+ *
+ * Scoped to one preview's files (a bounded set), so the caller can stream the
+ * CSV response row-by-row without an unbounded scan of the whole table.
+ *
+ * @param {string[]} itemIds - the preview's job file ids
+ * @param {string} slug - document type slug ('untyped' = the no-type bucket)
+ * @returns {Promise<Array<Object>>} record objects, in stable display order
+ */
+export async function getAllRecordsForSlug(itemIds, slug) {
+    if (!itemIds || itemIds.length === 0) return [];
+    const client = await pool.connect();
+    try {
+        const res = await client.query(
+            `${RECORD_EXPAND_CTE}
+             SELECT record
+             FROM typed
+             WHERE ($2::text IS NULL
+                    OR ($2 = 'untyped' AND eff_slug IS NULL)
+                    OR ($2 <> 'untyped' AND eff_slug = $2))
+             ORDER BY created_at DESC, file_id, idx`,
+            [itemIds, slug || null],
+        );
+        return res.rows.map((r) => r.record);
+    } finally {
+        client.release();
+    }
+}
+
+/**
  * Per-file summary for the "by file" lens: each file with its record count,
  * a by-type breakdown ("34 well logs, 4 aquifer tests"), and review status.
  * V1 types are shape-inferred; unrecognized records fall under slug=null.
