@@ -18,6 +18,7 @@ import {
     getJobFilesForPreview,
     getJobFilesForPreviewPaginated,
     getRecordsForPreviewPaginated,
+    getAllRecordsForPreviewSlug,
     getFilesSummaryForPreview,
     getAvailableJobFiles,
     getPreviewsForFile,
@@ -26,6 +27,8 @@ import {
 } from '../database/previewDataTable.js';
 import mgsDataService from '../services/mgsDataService.js';
 import { isV2Envelope, mapRecords, readField } from '../utils/resultEnvelope.js';
+import { streamRecordsAsCsv } from '../utils/gisCsvExport.js';
+import { getActiveSchema } from '../services/schemaRegistry.js';
 import { authenticateToken, requireRole } from '../middleware/auth.js';
 import {
     extractPreviewClientMeta,
@@ -213,6 +216,66 @@ router.get('/:id/data', async (req, res) => {
             success: false,
             message: 'Failed to fetch preview data',
             error: error.message
+        });
+    }
+});
+
+/**
+ * GET /previews/:id/export?slug=<slug>&format=csv
+ *
+ * GIS-ready attribute-table export: one flat row per record of the given slug
+ * across all of the preview's files (not just the current page). Columns are
+ * scalars + one level of nested-object leaves, GIS-safe snake_case, `well_id`
+ * first. Arrays are excluded (phase-2 related tables). Streams CSV.
+ *
+ * Public, matching GET /:id/data — preview links are shareable.
+ */
+router.get('/:id/export', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { slug = null, format = 'csv' } = req.query;
+
+        if (!slug || typeof slug !== 'string') {
+            return res.status(400).json({ success: false, message: 'slug query param is required' });
+        }
+        if (format !== 'csv') {
+            return res.status(400).json({ success: false, message: `Unsupported format '${format}' (only 'csv')` });
+        }
+
+        const preview = await getPreviewDataTableById(id);
+        if (!preview) {
+            return res.status(404).json({ success: false, message: 'Preview not found' });
+        }
+
+        // Fetch all records for the slug and the schema (for column order) BEFORE
+        // writing any bytes — once we send the 200 + headers we can't change status.
+        const records = await getAllRecordsForPreviewSlug(preview.items_ids || [], slug);
+
+        let schema = null;
+        try {
+            const active = await getActiveSchema(slug);
+            schema = active?.schema || null;
+        } catch (e) {
+            console.warn(`⚠️ GIS export: no active schema for '${slug}': ${e.message}`);
+        }
+
+        const stamp = new Date().toISOString().slice(0, 10);
+        const safeSlug = slug.replace(/[^a-z0-9_]+/gi, '_');
+        const filename = `${safeSlug}_gis_export_${stamp}.csv`;
+
+        res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+        res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+        res.status(200);
+
+        streamRecordsAsCsv(res, records, schema);
+    } catch (error) {
+        console.error('Error exporting preview CSV:', error);
+        // If headers were already sent (mid-stream), just terminate the response.
+        if (res.headersSent) return res.end();
+        res.status(500).json({
+            success: false,
+            message: 'Failed to export preview',
+            error: error.message,
         });
     }
 });
