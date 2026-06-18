@@ -9,14 +9,14 @@ import {
     updateFileExtractionStatus,
     updateFileProcessingStatus,
     updateJobStatus,
-    updateFileSelectedPages,
-    updateFileDetectedSections
+    updateFileSelectedPages
 } from './database.js';
 import S3Service from './s3Service.js';
 import ExtractionService from './services/extractionService.js';
 import ProcessingService from './services/processingService.js';
 import { deriveSelectedPagesAndMeta, resolveExtractionFlags } from './services/visualClassifierWiring.js';
 import { extractAndProcessPerSection } from './services/perSectionExtractor.js';
+import { persistPerSectionResult } from './services/persistPerSectionResult.js';
 import { buildExtractionMetadata } from './services/fileProcessingContext.js';
 import { recordProcessingEvent } from './services/processingEventsService.js';
 dotenv.config();
@@ -78,6 +78,22 @@ class FileProcessorWorker {
                 timestamp: new Date().toISOString()
             });
             console.log(`📡 Emitted file-status-update: ${fileId} - ${extractionStatus}/${processingStatus}`);
+        }
+    }
+
+    /**
+     * Push an updated detected_sections blob as a file-status-update patch. The
+     * server relay folds any non-reserved field into the client patch, so this
+     * refreshes the routing tab (e.g. clears "needs extraction" once
+     * section_result_id is stamped) without a manual page refresh.
+     */
+    emitDetectedSectionsPatch(jobId, fileId, detectedSections) {
+        if (this.socket && this.socket.connected) {
+            this.socket.emit('file-status-update', {
+                jobId,
+                fileId,
+                detected_sections: detectedSections,
+            });
         }
     }
 
@@ -622,39 +638,21 @@ class FileProcessorWorker {
                     throw new Error(`Per-section extraction failed: ${firstError}`);
                 }
 
-                // Write section_result_ids back to detected_sections so each
-                // section carries a stable link to its extraction record.
-                // This enables ID-based matching in split/merge/re-extract.
-                for (const sr of perSection.sectionResults) {
-                    if (sr.status === 'success' && sr.section_result_id) {
-                        const sec = detectedSections.sections[sr.section_index];
-                        if (sec) sec.section_result_id = sr.section_result_id;
-                    }
-                }
-                await updateFileDetectedSections(file.id, detectedSections);
+                // Persist the result: stamp section_result_id back onto
+                // detected_sections (the link routing/QA use) and write the v2
+                // envelope + metadata. Shared with the inline /extract and
+                // save & re-extract paths so they can't drift apart.
+                await persistPerSectionResult({
+                    fileId: file.id,
+                    detectedSections,
+                    perSection,
+                    baseMetadata: preProcessingMetadata,
+                });
 
-                const finalMetadata = {
-                    ...preProcessingMetadata,
-                    result_envelope: 'v2',
-                    section_results: perSection.sectionResults,
-                    schemas_used: perSection.schemasUsed,
-                    per_section_extraction: {
-                        section_count: perSection.sectionResults.length,
-                        success_count: successCount,
-                        failed_count: failedCount,
-                        skipped_count: skippedCount,
-                        total_ai_time_seconds: perSection.totalAiTimeSeconds,
-                    },
-                };
+                // Live badge refresh: push the freshly stamped detected_sections
+                // so the routing tab clears "needs extraction" without a refresh.
+                this.emitDetectedSectionsPatch(jobId, file.id, detectedSections);
 
-                await updateFileProcessingStatus(
-                    file.id,
-                    'completed',
-                    perSection.resultEnvelope,
-                    null,
-                    finalMetadata,
-                    perSection.totalAiTimeSeconds || null
-                );
                 console.log(`✅ File ${file.filename} per-section processing completed (v2 envelope)`);
 
                 this.emitFileStatusUpdate(

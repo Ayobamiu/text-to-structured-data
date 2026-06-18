@@ -64,6 +64,8 @@ import {
 } from "./services/sectionReprocessService.js";
 import groqService from "./services/groqService.js";
 import { recordCorrections } from "./services/correctionsService.js";
+import { persistPerSectionResult } from "./services/persistPerSectionResult.js";
+import { recordProcessingEvent } from "./services/processingEventsService.js";
 import { getPdfPageCount } from "./utils/pdfUtils.js";
 import { computeFlags } from "./services/constraintsService.js";
 import { decrementTotal } from "./database/jobFileStats.js";
@@ -250,6 +252,32 @@ async function emitFileFullPatch(jobId, fileId, fallbackPatch = {}) {
     } catch (err) {
         console.warn(`⚠️ emitFileFullPatch failed for ${fileId}:`, err.message);
         emitFilePatch(jobId, fileId, fallbackPatch);
+    }
+}
+
+/**
+ * Persist + broadcast a curated processing-timeline event from the inline
+ * /extract background path. Mirrors the worker's emitProcessingEvent so the
+ * Processing tab gets activity for jobs that run through /extract (not just the
+ * queue worker). Never throws — telemetry must not break extraction.
+ *
+ * @param {string} fileId
+ * @param {string|null} jobId
+ * @param {object} evt  { phase, step?, status?, progress?, message?, level?, data? }
+ */
+async function emitServerProcessingEvent(fileId, jobId, evt) {
+    try {
+        const saved = await recordProcessingEvent({ fileId, jobId, ...evt });
+        io.to(`job-${jobId}`).emit('file-processing-event', {
+            fileId,
+            jobId,
+            id: saved?.id,
+            seq: saved?.seq,
+            created_at: saved?.created_at || new Date().toISOString(),
+            ...evt,
+        });
+    } catch (err) {
+        console.warn(`⚠️ emitServerProcessingEvent failed for ${fileId}: ${err.message}`);
     }
 }
 
@@ -4467,10 +4495,17 @@ async function processFilesAsync(job, files, schema, schemaName, processingConfi
                     );
 
                     if (usePerSection && hasExtractableSections && Array.isArray(pages)) {
+                        const sectionTotal = visualDetectedSections.sections.length;
                         console.log(
-                            `🧩 Per-section extraction: ${visualDetectedSections.sections.length} section(s) ` +
+                            `🧩 Per-section extraction: ${sectionTotal} section(s) ` +
                             `for ${file.originalname} (envelope v2)`
                         );
+
+                        await emitServerProcessingEvent(fileRecord.id, job.id, {
+                            phase: 'ai_extraction', status: 'active',
+                            progress: { current: 0, total: sectionTotal },
+                            message: `Extracting structured data from ${sectionTotal} section${sectionTotal === 1 ? '' : 's'}…`,
+                        });
 
                         // Lazy imports keep the per-section path fully optional
                         // so the existing v1 path has no new module-load cost.
@@ -4512,39 +4547,49 @@ async function processFilesAsync(job, files, schema, schemaName, processingConfi
                             `(envelope keys: ${Object.keys(perSection.resultEnvelope).join(', ') || '—'})`
                         );
 
+                        await emitServerProcessingEvent(fileRecord.id, job.id, {
+                            phase: 'ai_extraction', status: 'done',
+                            progress: { current: sectionTotal, total: sectionTotal },
+                            message: `${successCount} of ${sectionTotal} section${sectionTotal === 1 ? '' : 's'} extracted`
+                                + (failedCount ? `, ${failedCount} failed` : '')
+                                + (skippedCount ? `, ${skippedCount} skipped` : ''),
+                            data: { successCount, failedCount, skippedCount },
+                        });
+
                         if (!perSection.anySuccess) {
                             const firstError = perSection.sectionResults.find((r) => r.error)?.error
                                 || 'No section produced an extractable result';
                             throw new Error(`Per-section extraction failed: ${firstError}`);
                         }
 
-                        const finalMetadata = {
-                            ...preProcessingMetadata,
-                            result_envelope: 'v2',
-                            section_results: perSection.sectionResults,
-                            schemas_used: perSection.schemasUsed,
-                            per_section_extraction: {
-                                section_count: perSection.sectionResults.length,
-                                success_count: successCount,
-                                failed_count: failedCount,
-                                skipped_count: skippedCount,
-                                total_ai_time_seconds: perSection.totalAiTimeSeconds,
-                            },
-                        };
+                        // Persist via the shared helper: this stamps
+                        // section_result_id back onto detected_sections (the link
+                        // routing/QA rely on — previously missing here) and writes
+                        // the v2 envelope + metadata, identically to the worker.
+                        await persistPerSectionResult({
+                            fileId: fileRecord.id,
+                            detectedSections: visualDetectedSections,
+                            perSection,
+                            baseMetadata: preProcessingMetadata,
+                        });
 
-                        await updateFileProcessingStatus(
-                            fileRecord.id,
-                            'completed',
-                            perSection.resultEnvelope,
-                            null,
-                            finalMetadata,
-                            perSection.totalAiTimeSeconds || null
-                        );
+                        // Live badge refresh: push the freshly stamped
+                        // detected_sections so the routing tab clears
+                        // "needs extraction" without a manual page refresh.
+                        // (getFileSkinnyRow doesn't carry detected_sections, so
+                        // emitFileFullPatch alone won't update it.)
+                        emitFilePatch(job.id, fileRecord.id, {
+                            detected_sections: visualDetectedSections,
+                        });
 
                         await emitFileFullPatch(job.id, fileRecord.id, {
                             extraction_status: 'completed',
                             processing_status: 'completed',
                             has_result: true,
+                        });
+
+                        await emitServerProcessingEvent(fileRecord.id, job.id, {
+                            phase: 'done', status: 'done', message: 'Processing complete',
                         });
 
                         // Skip the v1 single-schema path below.
