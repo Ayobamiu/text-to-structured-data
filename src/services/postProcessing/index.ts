@@ -8,6 +8,7 @@
 
 import { registerService, getService, listServices } from './registry.ts';
 import mgsEnrich from './services/mgsEnrich.ts';
+import geocodeLocations from './services/geocodeLocations.ts';
 
 let registered = false;
 
@@ -15,7 +16,7 @@ let registered = false;
 export function registerBuiltInServices(): void {
     if (registered) return;
     registerService(mgsEnrich);
-    // D2 will add: registerService(geocodeLocations);
+    registerService(geocodeLocations);
     registered = true;
 }
 

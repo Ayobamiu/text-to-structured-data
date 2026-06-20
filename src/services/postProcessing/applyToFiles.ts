@@ -74,6 +74,8 @@ export interface ApplyResult {
     recordsMatched: number;
     summary: RunSummary;
     sideEffects: number;
+    /** record_geocodes precision-tier distribution (for the geocoding dry-run report). */
+    precisionTiers: Record<string, number>;
 }
 
 /** Merge two run summaries (accumulate counts per service/status). */
@@ -101,6 +103,7 @@ export async function applyServicesToPreview({
         recordsMatched: 0,
         summary: {},
         sideEffects: 0,
+        precisionTiers: {},
     };
     if (!itemIds || itemIds.length === 0) return out;
 
@@ -139,6 +142,12 @@ export async function applyServicesToPreview({
             });
             mergeSummary(out.summary, run.summary);
             out.sideEffects += run.sideEffects.length;
+            for (const se of run.sideEffects) {
+                if (se.table === 'record_geocodes') {
+                    const tier = String((se.row as Record<string, unknown>).precision_tier ?? 'unknown');
+                    out.precisionTiers[tier] = (out.precisionTiers[tier] || 0) + 1;
+                }
+            }
 
             if (!apply) continue;
 
@@ -179,19 +188,53 @@ export async function applyServicesToPreview({
     }
 }
 
+/** A pg client (or pool) — only query() is used here. */
+interface Queryable {
+    query: (text: string, params?: unknown[]) => Promise<unknown>;
+}
+
+const RECORD_GEOCODE_COLS = [
+    'section_result_id', 'file_id', 'slug', 'latitude', 'longitude',
+    'precision_tier', 'strategy', 'provider', 'provider_location_type',
+    'source_query', 'confidence', 'needs_review', 'raw_response', 'geocoder_version',
+];
+
 /**
- * Persist side effects to their target tables (upsert by primary key so re-runs
- * never duplicate). Currently a no-op seam: no built-in service emits side
- * effects yet — D2's geocoder will, against record_geocodes. Throws on an
- * unknown table so a misconfigured service fails loudly rather than silently.
+ * Persist collected side effects, upserting by primary key so re-runs never
+ * duplicate. Handles the tables the built-in services emit; throws on an unknown
+ * table so a misconfigured service fails loudly.
  */
-async function persistSideEffects(_client: unknown, sideEffects: SideEffect[]): Promise<void> {
+async function persistSideEffects(client: Queryable, sideEffects: SideEffect[]): Promise<void> {
     if (!sideEffects || sideEffects.length === 0) return;
-    const tables = new Set(sideEffects.map((s) => s.table));
-    throw new Error(
-        `persistSideEffects: no handler registered for table(s) [${[...tables].join(', ')}] ` +
-        `(wired in D2 with record_geocodes)`,
-    );
+    for (const se of sideEffects) {
+        if (se.table === 'record_geocodes') {
+            const row = se.row as Record<string, unknown>;
+            const vals = RECORD_GEOCODE_COLS.map((c) =>
+                c === 'raw_response' && row[c] !== undefined && row[c] !== null
+                    ? JSON.stringify(row[c]) : (row[c] ?? null));
+            const placeholders = RECORD_GEOCODE_COLS.map((_, i) => `$${i + 1}`).join(', ');
+            const updates = RECORD_GEOCODE_COLS.filter((c) => c !== 'section_result_id')
+                .map((c) => `${c} = EXCLUDED.${c}`).join(', ');
+            await client.query(
+                `INSERT INTO record_geocodes (${RECORD_GEOCODE_COLS.join(', ')})
+                 VALUES (${placeholders})
+                 ON CONFLICT (section_result_id) DO UPDATE SET ${updates}, geocoded_at = NOW()`,
+                vals,
+            );
+        } else if (se.table === 'plss_section_centroids') {
+            const r = se.row as Record<string, unknown>;
+            await client.query(
+                `INSERT INTO plss_section_centroids (town, range, section, latitude, longitude, n_wells, source)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7)
+                 ON CONFLICT (town, range, section) DO UPDATE SET
+                   latitude = EXCLUDED.latitude, longitude = EXCLUDED.longitude,
+                   n_wells = EXCLUDED.n_wells, source = EXCLUDED.source, computed_at = NOW()`,
+                [r.town, r.range, r.section, r.latitude ?? null, r.longitude ?? null, r.n_wells ?? null, r.source ?? 'wellogic'],
+            );
+        } else {
+            throw new Error(`persistSideEffects: no handler for table "${se.table}"`);
+        }
+    }
 }
 
 export default { applyServicesToPreview, mergeUpdatedRecordsIntoResult };
