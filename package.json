@@ -44,7 +44,8 @@
     "nodemon": "^3.0.2",
     "supertest": "^6.3.3",
     "tsx": "^4.19.4",
-    "typescript": "^5.8.3"
+    "typescript": "^5.8.3",
+    "vitest": "^4.1.9"
   },
   "scripts": {
     "start": "tsx src/server.js",

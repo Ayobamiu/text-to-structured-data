@@ -26,6 +26,8 @@ import {
     getPreviewStatistics
 } from '../database/previewDataTable.js';
 import mgsDataService from '../services/mgsDataService.js';
+import { getService, listServices } from '../services/postProcessing/index.ts';
+import { applyServicesToPreview } from '../services/postProcessing/applyToFiles.ts';
 import { getActiveSchema } from '../services/schemaRegistry.js';
 import {
     buildColumnsFromSchema,
@@ -89,6 +91,16 @@ router.get('/', async (req, res) => {
             error: error.message
         });
     }
+});
+
+/**
+ * GET /previews/services
+ * List the registered post-processing services (for the frontend services panel).
+ * Defined before GET /:id so "services" isn't captured as an :id.
+ */
+router.get('/services', async (req, res) => {
+    const services = listServices().map((s) => ({ name: s.name, version: s.version }));
+    res.json({ success: true, data: { services } });
 });
 
 /**
@@ -343,6 +355,57 @@ router.get('/:id/export', async (req, res) => {
         } else {
             res.end();
         }
+    }
+});
+
+/**
+ * POST /previews/:id/run-service
+ * Run a post-processing service over all records of a type in this preview.
+ * Body: { name, slug, options?, apply?, force? }. apply=false (default) is a
+ * dry-run: services execute and counts are returned, but nothing is persisted.
+ * Generalizes the old /enrich-with-mgs routes.
+ */
+router.post('/:id/run-service', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { name, slug, options = {}, apply = false, force = false } = req.body || {};
+
+        if (!name || !slug) {
+            return res.status(400).json({
+                success: false,
+                message: 'Both "name" (service) and "slug" (document type) are required.',
+            });
+        }
+        const service = getService(name);
+        if (!service) {
+            return res.status(404).json({
+                success: false,
+                message: `Unknown service "${name}". Available: ${listServices().map((s) => s.name).join(', ') || 'none'}.`,
+            });
+        }
+
+        const preview = await getPreviewDataTableById(id);
+        if (!preview) {
+            return res.status(404).json({ success: false, message: 'Preview not found' });
+        }
+
+        const result = await applyServicesToPreview({
+            itemIds: preview.items_ids || [],
+            slug,
+            services: [service],
+            optionsByService: { [name]: options },
+            apply: Boolean(apply),
+            force: Boolean(force),
+        });
+
+        res.json({ success: true, data: result });
+    } catch (error) {
+        console.error('Error running post-processing service:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Failed to run post-processing service',
+            error: error.message,
+        });
     }
 });
 
