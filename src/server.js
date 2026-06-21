@@ -49,6 +49,8 @@ import queueService from "./queue.js";
 import authRoutes from "./routes/auth.js";
 import organizationRoutes from "./routes/organizations.js";
 import previewRoutes, { setWebSocketInstance } from "./routes/previews.js";
+import { applyServicesToPreview } from "./services/postProcessing/applyToFiles.ts";
+import { getService, listServices } from "./services/postProcessing/index.ts";
 import mgsRoutes from "./routes/mgs.js";
 import healthRoutes from "./routes/health.js";
 import { authenticateToken, optionalAuth, securityHeaders, requireRole } from "./middleware/auth.js";
@@ -901,6 +903,31 @@ app.put("/jobs/:id/config", authenticateToken, async (req, res) => {
                 });
             }
 
+            // Validate postProcessing overrides if provided: array of {name, enabled}.
+            if (processing_config.postProcessing !== undefined) {
+                if (!Array.isArray(processing_config.postProcessing)) {
+                    return res.status(400).json({
+                        status: "error",
+                        message: "processing_config.postProcessing must be an array of { name, enabled, options? }",
+                    });
+                }
+                const known = new Set(listServices().map((s) => s.name));
+                for (const entry of processing_config.postProcessing) {
+                    if (!entry || typeof entry.name !== 'string' || !known.has(entry.name)) {
+                        return res.status(400).json({
+                            status: "error",
+                            message: `Invalid postProcessing entry. Each needs a known service "name". Available: ${[...known].join(', ') || 'none'}.`,
+                        });
+                    }
+                    if (entry.enabled !== undefined && typeof entry.enabled !== 'boolean') {
+                        return res.status(400).json({
+                            status: "error",
+                            message: `postProcessing entry "${entry.name}".enabled must be a boolean.`,
+                        });
+                    }
+                }
+            }
+
             // Validate processing method if provided
             if (processing_config.processing?.method) {
                 if (!ALL_PROCESSING_METHODS.includes(processing_config.processing.method)) {
@@ -995,6 +1022,81 @@ app.put("/jobs/:id/config", authenticateToken, async (req, res) => {
             status: "error",
             message: error.message
         });
+    }
+});
+
+/**
+ * GET /jobs/:id/services
+ * List the registered post-processing services (for the job settings UI to
+ * render activation toggles). Mirrors GET /previews/services but job-scoped.
+ */
+app.get("/jobs/:id/services", authenticateToken, async (req, res) => {
+    try {
+        const { id } = req.params;
+        const hasAccess = await checkJobAccess(id, req.user, res);
+        if (!hasAccess) return;
+
+        const services = listServices().map((s) => ({
+            name: s.name,
+            version: s.version,
+        }));
+        res.json({ status: "success", data: { services } });
+    } catch (error) {
+        console.error('❌ Error listing post-processing services:', error.message);
+        res.status(500).json({ status: "error", message: error.message });
+    }
+});
+
+/**
+ * POST /jobs/:id/run-service
+ * Run a post-processing service (backfill) over this job's completed files.
+ * This is the operator "run now" trigger — the chosen surface is the job
+ * settings page (NOT the client preview). Body: { name, slug, options?, apply?, force? }.
+ * apply=false (default) is a dry-run: services execute, counts return, nothing persists.
+ */
+app.post("/jobs/:id/run-service", authenticateToken, async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { name, slug, options = {}, apply = false, force = false } = req.body || {};
+
+        if (!name || !slug) {
+            return res.status(400).json({
+                status: "error",
+                message: 'Both "name" (service) and "slug" (document type) are required.',
+            });
+        }
+
+        const hasAccess = await checkJobAccess(id, req.user, res);
+        if (!hasAccess) return;
+
+        const service = getService(name);
+        if (!service) {
+            return res.status(404).json({
+                status: "error",
+                message: `Unknown service "${name}". Available: ${listServices().map((s) => s.name).join(', ') || 'none'}.`,
+            });
+        }
+
+        // Gather this job's completed files (records only exist for completed files).
+        const filesRes = await pool.query(
+            `SELECT id FROM job_files WHERE job_id = $1 AND processing_status = 'completed'`,
+            [id],
+        );
+        const itemIds = filesRes.rows.map((r) => r.id);
+
+        const result = await applyServicesToPreview({
+            itemIds,
+            slug,
+            services: [service],
+            optionsByService: { [name]: options },
+            apply: Boolean(apply),
+            force: Boolean(force),
+        });
+
+        res.json({ status: "success", data: result });
+    } catch (error) {
+        console.error('❌ Error running post-processing service for job:', error.message);
+        res.status(500).json({ status: "error", message: error.message });
     }
 });
 
@@ -1233,6 +1335,7 @@ app.get("/registry/document-types/:slug/detail", registryAdmin, async (req, res)
                 routing_confidence_threshold: detail.routing_confidence_threshold,
                 status: detail.status,
                 classifier_hints: detail.classifier_hints,
+                post_processing_defaults: detail.post_processing_defaults,
                 created_at: detail.created_at,
                 updated_at: detail.updated_at,
                 current_schema_version_id: detail.current_schema_version_id,
@@ -1422,6 +1525,57 @@ app.put("/registry/document-types/:slug/classifier-hints", registryAdmin, async 
         res.json({ status: 'success', classifier_hints: row.classifier_hints, updated_at: row.updated_at });
     } catch (error) {
         console.error('❌ registry classifier-hints:', error.message);
+        res.status(400).json({ status: 'error', message: error.message });
+    }
+});
+
+/**
+ * GET /registry/services
+ * List registered post-processing services, for the document-type Post-processing
+ * tab to render its default toggles.
+ */
+app.get("/registry/services", registryAdmin, async (req, res) => {
+    try {
+        const services = listServices().map((s) => ({ name: s.name, version: s.version }));
+        res.json({ status: 'success', services });
+    } catch (error) {
+        console.error('❌ registry services:', error.message);
+        res.status(500).json({ status: 'error', message: error.message });
+    }
+});
+
+/**
+ * PUT /registry/document-types/:slug/post-processing-defaults
+ * Replace the per-document-type post-processing defaults (services that auto-run
+ * for this slug unless a job overrides them). Body: { defaults: [{name, enabled, options?}] }.
+ */
+app.put("/registry/document-types/:slug/post-processing-defaults", registryAdmin, async (req, res) => {
+    try {
+        const { slug } = req.params;
+        if (!validateRegistrySlug(slug, res)) return;
+
+        const defaults = req.body?.defaults;
+        if (!Array.isArray(defaults)) {
+            return res.status(400).json({
+                status: 'error',
+                message: 'body.defaults must be an array of { name, enabled, options? }',
+            });
+        }
+        const known = new Set(listServices().map((s) => s.name));
+        for (const entry of defaults) {
+            if (!entry || typeof entry.name !== 'string' || !known.has(entry.name)) {
+                return res.status(400).json({
+                    status: 'error',
+                    message: `Each default needs a known service "name". Available: ${[...known].join(', ') || 'none'}.`,
+                });
+            }
+        }
+
+        const svc = await import('./services/schemaRegistry.js');
+        const row = await svc.setPostProcessingDefaults(slug, defaults);
+        res.json({ status: 'success', post_processing_defaults: row.post_processing_defaults, updated_at: row.updated_at });
+    } catch (error) {
+        console.error('❌ registry post-processing-defaults:', error.message);
         res.status(400).json({ status: 'error', message: error.message });
     }
 });

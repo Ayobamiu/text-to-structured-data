@@ -257,7 +257,7 @@ export async function getJobFilesForPreviewPaginated(itemIds, page = 1, pageSize
 //   - V1 files: the whole result is a single record (slug NULL).
 //   - eff_slug: the V2 slug, else a shape-inferred type for V1 well logs.
 // $1 = item ids. jsonb inputs are guarded so non-object/non-array results don't error.
-const RECORD_EXPAND_CTE = `
+export const RECORD_EXPAND_CTE = `
 WITH expanded AS (
     SELECT jf.id AS file_id, jf.filename, jf.created_at, jf.processing_status,
            jf.admin_verified, jf.review_status, j.name AS job_name,

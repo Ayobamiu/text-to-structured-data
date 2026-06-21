@@ -440,6 +440,49 @@ export async function setClassifierHints(slug, hints) {
 }
 
 /**
+ * Set (replace) the per-document-type post-processing defaults — the list of
+ * services that auto-run during processing for this slug unless a job overrides
+ * them. Replace (not merge), same reasoning as classifier hints: the authored
+ * array is exactly what runs, so removing an entry actually disables it.
+ *
+ * @param {string} slug
+ * @param {Array<{name:string, enabled?:boolean, options?:object}>} defaults
+ * @returns {Promise<{ slug, post_processing_defaults, updated_at }>}
+ */
+export async function setPostProcessingDefaults(slug, defaults) {
+    if (!slug) throw new Error('setPostProcessingDefaults requires slug');
+    if (!Array.isArray(defaults)) {
+        throw new Error('setPostProcessingDefaults requires an array');
+    }
+    for (const entry of defaults) {
+        if (!entry || typeof entry.name !== 'string' || !entry.name) {
+            throw new Error('each post-processing default needs a string "name"');
+        }
+        if (entry.enabled !== undefined && typeof entry.enabled !== 'boolean') {
+            throw new Error(`post-processing default "${entry.name}".enabled must be a boolean`);
+        }
+    }
+
+    const client = await pool.connect();
+    try {
+        const result = await client.query(
+            `UPDATE document_types
+             SET post_processing_defaults = $1::jsonb, updated_at = NOW()
+             WHERE slug = $2
+             RETURNING slug, post_processing_defaults, updated_at`,
+            [JSON.stringify(defaults), slug]
+        );
+        if (result.rows.length === 0) {
+            throw new Error(`document_type '${slug}' not found`);
+        }
+        bustCache();
+        return result.rows[0];
+    } finally {
+        client.release();
+    }
+}
+
+/**
  * Promote a draft (or older active) schema version to current_schema_version.
  * Useful when a draft schema has been validated against held-out files and
  * is ready to take over from the previous active version.
@@ -461,6 +504,7 @@ export async function getDocumentTypeDetail(slug) {
                     dt.routing_confidence_threshold,
                     dt.status,
                     dt.classifier_hints,
+                    dt.post_processing_defaults,
                     dt.created_at,
                     dt.updated_at,
                     dt.current_schema_version_id,
@@ -656,6 +700,7 @@ export default {
     registerSchema,
     setClassifierHints,
     clearClassifierHints,
+    setPostProcessingDefaults,
     setCurrentSchemaVersion,
     getDocumentTypeDetail,
     listSchemaVersionsForSlug,
