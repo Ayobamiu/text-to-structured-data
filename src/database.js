@@ -625,6 +625,51 @@ export async function updateFilePages(fileId, pages) {
 }
 
 // Update file processing status
+/**
+ * Resolve the post-processing config for a job's files, for the auto-run stage.
+ * Returns the per-job overrides (jobs.processing_config.postProcessing) and the
+ * per-document-type defaults keyed by slug (document_types.post_processing_defaults).
+ * The stage merges these per-slug (job override wins). Best-effort: any failure
+ * yields empty config so post-processing simply no-ops rather than breaking saves.
+ *
+ * @param {import('pg').PoolClient} client
+ * @param {string} jobId
+ * @returns {Promise<{jobOverrides: Array, slugDefaultsBySlug: Object}>}
+ */
+async function loadPostProcessingConfig(client, jobId) {
+    const empty = { jobOverrides: [], slugDefaultsBySlug: {} };
+    try {
+        let jobOverrides = [];
+        if (jobId) {
+            const jobRes = await client.query(`SELECT processing_config FROM jobs WHERE id = $1`, [jobId]);
+            let cfg = jobRes.rows[0]?.processing_config || null;
+            if (typeof cfg === 'string') {
+                try { cfg = JSON.parse(cfg); } catch { cfg = null; }
+            }
+            if (cfg && Array.isArray(cfg.postProcessing)) jobOverrides = cfg.postProcessing;
+        }
+
+        const slugDefaultsBySlug = {};
+        const dtRes = await client.query(
+            `SELECT slug, post_processing_defaults FROM document_types
+              WHERE post_processing_defaults IS NOT NULL
+                AND post_processing_defaults <> '[]'::jsonb`,
+        );
+        for (const row of dtRes.rows) {
+            let defaults = row.post_processing_defaults;
+            if (typeof defaults === 'string') {
+                try { defaults = JSON.parse(defaults); } catch { defaults = []; }
+            }
+            if (Array.isArray(defaults) && defaults.length > 0) slugDefaultsBySlug[row.slug] = defaults;
+        }
+
+        return { jobOverrides, slugDefaultsBySlug };
+    } catch (err) {
+        console.warn(`⚠️ loadPostProcessingConfig failed for job ${jobId}:`, err.message);
+        return empty;
+    }
+}
+
 export async function updateFileProcessingStatus(fileId, status, result = null, error = null, metadata = null, aiProcessingTimeSeconds = null) {
     const client = await pool.connect();
     try {
@@ -697,6 +742,11 @@ export async function updateFileProcessingStatus(fileId, status, result = null, 
                         }
                     }
 
+                    // Resolve post-processing config (auto-run stage): per-job
+                    // overrides + per-document-type defaults. Job entry wins over
+                    // the slug default (resolved per-slug in the stage).
+                    const postProcessing = await loadPostProcessingConfig(client, fileInfo.job_id);
+
                     // Create pipeline context
                     const pipelineContext = {
                         fileId: fileId,
@@ -706,6 +756,7 @@ export async function updateFileProcessingStatus(fileId, status, result = null, 
                         status: status,
                         fileInfo: fileInfo,
                         pages: pages,
+                        postProcessing,
                         metadata: metadata ? (typeof metadata === 'string' ? JSON.parse(metadata) : metadata) : {}
                     };
 
