@@ -101,6 +101,36 @@ export async function googleGeocode(
     throw new Error(`googleGeocode: ${data.status}${data.error_message ? ` — ${data.error_message}` : ''}`);
 }
 
+export interface AddressParts {
+    county: string | null;
+    township: string | null; // civil township name (Wellogic TOWNSHIP), not PLSS TOWN
+    city: string | null;
+    state: string | null;
+    postalCode: string | null;
+}
+
+/**
+ * Pull county/township/city/state/zip out of a Google result's address_components
+ * so we don't waste the data the geocode already returned. County's " County"
+ * suffix is stripped to match Wellogic's bare county names ("Ottawa County" → "Ottawa").
+ */
+export function parseAddressComponents(raw: unknown): AddressParts {
+    const comps: any[] = (raw as any)?.address_components || [];
+    const pick = (type: string, field: 'long_name' | 'short_name' = 'long_name'): string | null => {
+        const c = comps.find((x) => Array.isArray(x?.types) && x.types.includes(type));
+        const v = c ? c[field] : null;
+        return typeof v === 'string' && v.trim() ? v.trim() : null;
+    };
+    const county = pick('administrative_area_level_2');
+    return {
+        county: county ? county.replace(/\s+County$/i, '').trim() : null,
+        township: pick('administrative_area_level_3'),
+        city: pick('locality'),
+        state: pick('administrative_area_level_1', 'short_name'),
+        postalCode: pick('postal_code'),
+    };
+}
+
 export interface SectionCentroid {
     lat: number;
     lng: number;
@@ -139,4 +169,4 @@ export async function wellogicSectionCentroid(
     return { lat, lng, nWells: pts.length };
 }
 
-export default { extractStreetAddress, tierForLocationType, googleGeocode, wellogicSectionCentroid };
+export default { extractStreetAddress, tierForLocationType, googleGeocode, wellogicSectionCentroid, parseAddressComponents };

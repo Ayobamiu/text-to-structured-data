@@ -16,6 +16,7 @@ import {
     extractStreetAddress,
     normalizePlss,
     tierForLocationType,
+    parseAddressComponents,
     googleGeocode as defaultGoogleGeocode,
     wellogicSectionCentroid as defaultWellogicCentroid,
     type GoogleGeocodeResult,
@@ -81,6 +82,17 @@ const geocodeLocations: PostProcessingService = {
             row: { ...base, ...extra },
         });
 
+        // Derived address fields from a Google result (county/township/city/zip) —
+        // stored so we don't waste what the geocode already returned.
+        const googleAddressFields = (g: GoogleGeocodeResult) => {
+            const p = parseAddressComponents(g.raw);
+            return {
+                geocoded_county: p.county, geocoded_township: p.township, geocoded_city: p.city,
+                geocoded_state: p.state, geocoded_postal_code: p.postalCode,
+                formatted_address: g.formattedAddress,
+            };
+        };
+
         // 1. Explicit document coordinates — ground truth.
         const lat = toNum(si.latitude_dd);
         const lng = toNum(si.longitude_dd);
@@ -113,6 +125,7 @@ const geocodeLocations: PostProcessingService = {
                             strategy: tier === 'exact' ? 'address_rooftop' : 'address_interp',
                             provider: 'google', provider_location_type: g.locationType,
                             source_query: query, raw_response: g.raw, needs_review: false,
+                            ...googleAddressFields(g),
                         })],
                     };
                 }
@@ -155,6 +168,7 @@ const geocodeLocations: PostProcessingService = {
                     latitude: weak.g.lat, longitude: weak.g.lng, precision_tier: 'approx',
                     strategy: 'address_approx', provider: 'google', provider_location_type: weak.g.locationType,
                     source_query: weak.query, raw_response: weak.g.raw, needs_review: true,
+                    ...googleAddressFields(weak.g),
                 })],
             };
         }

@@ -197,6 +197,9 @@ const RECORD_GEOCODE_COLS = [
     'section_result_id', 'file_id', 'slug', 'latitude', 'longitude',
     'precision_tier', 'strategy', 'provider', 'provider_location_type',
     'source_query', 'confidence', 'needs_review', 'raw_response', 'geocoder_version',
+    // geocoder-derived address parts (don't waste the Google response)
+    'geocoded_county', 'geocoded_township', 'geocoded_city', 'geocoded_state',
+    'geocoded_postal_code', 'formatted_address',
 ];
 
 /**
