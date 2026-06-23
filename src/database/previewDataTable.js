@@ -378,6 +378,11 @@ export async function getRecordsForPreviewPaginated(
  * Scoped to one preview's files (a bounded set), so the caller can stream the
  * CSV response row-by-row without an unbounded scan of the whole table.
  *
+ * Each returned record is augmented with `_src_file` (source filename) and
+ * `_file_id` (job_files id) so the GIS export can surface a path back to the
+ * original document. The column builder treats these as internal and exposes
+ * them explicitly as `src_file` / `file_id` (see gisCsvExport).
+ *
  * @param {string[]} itemIds - the preview's job file ids
  * @param {string} slug - document type slug ('untyped' = the no-type bucket)
  * @returns {Promise<Array<Object>>} record objects, in stable display order
@@ -388,7 +393,7 @@ export async function getAllRecordsForSlug(itemIds, slug) {
     try {
         const res = await client.query(
             `${RECORD_EXPAND_CTE}
-             SELECT record
+             SELECT record || jsonb_build_object('_src_file', filename, '_file_id', file_id) AS record
              FROM typed
              WHERE ($2::text IS NULL
                     OR ($2 = 'untyped' AND eff_slug IS NULL)

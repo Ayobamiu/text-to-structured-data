@@ -29,8 +29,13 @@ export function formatGrainSize(grain: unknown): string {
 }
 
 // ── Wells tab ────────────────────────────────────────────────────────────────
+// WELLID is the section_result_id (globally unique, stable, never null) so ArcGIS
+// Joins/Relates have a safe key — the extracted boring_well_id collides badly
+// (~36% of records share a label like "MW-1"). The original label is kept as
+// WELL_LABEL for display, and SRC_FILE/FILE_ID point back to the source document.
 const WELL_COLUMNS = [
-    'WELLID', 'COUNTY', 'TOWNSHIP', 'TOWN', 'RANGE', 'SECTION',
+    'WELLID', 'WELL_LABEL', 'SRC_FILE', 'FILE_ID',
+    'COUNTY', 'TOWNSHIP', 'TOWN', 'RANGE', 'SECTION',
     'WELL_ADDR', 'WELL_CITY', 'WELL_ZIP',
     'LATITUDE', 'LONGITUDE', 'COORD_PRECISION', 'COORD_SOURCE',
     'WELL_DEPTH', 'LOG_DATE', 'DRILL_METH', 'CASE_DIA', 'CASE_DEPTH', 'SCREEN_FRM', 'SCREEN_TO',
@@ -38,7 +43,10 @@ const WELL_COLUMNS = [
 
 const WELLS_SQL = `${RECORD_EXPAND_CTE}
 SELECT
-    record->'site_identification'->>'boring_well_id'                              AS wellid,
+    typed.record->>'section_result_id'                                          AS wellid,
+    record->'site_identification'->>'boring_well_id'                             AS well_label,
+    typed.filename                                                               AS src_file,
+    typed.file_id                                                                AS file_id,
     COALESCE(NULLIF(record->'site_identification'->>'county',''), g.geocoded_county) AS county,
     g.geocoded_township                                                          AS township,
     record->'site_identification'->>'township'                                   AS town,
@@ -113,7 +121,8 @@ function intervalSql(tab: IntervalTab): string {
         .map((c) => `x.elem->${c.jsonb ? '' : '>'}'${c.json}' AS ${c.key}`)
         .join(', ');
     return `${RECORD_EXPAND_CTE}
-SELECT record->'site_identification'->>'boring_well_id' AS wellid, ${selects}
+SELECT record->>'section_result_id' AS wellid,
+       record->'site_identification'->>'boring_well_id' AS well_label, ${selects}
 FROM typed
 CROSS JOIN LATERAL jsonb_array_elements(
     CASE WHEN jsonb_typeof(record->'${tab.arrayKey}') = 'array'
@@ -161,7 +170,11 @@ export async function writeWellogicWorkbook(data: WellogicData, stream: Writable
 
     for (const tab of data.tabs) {
         const ws = wb.addWorksheet(tab.sheet);
-        ws.columns = [{ header: 'WELLID', key: 'wellid' }, ...tab.columns];
+        ws.columns = [
+            { header: 'WELLID', key: 'wellid' },
+            { header: 'WELL_LABEL', key: 'well_label' },
+            ...tab.columns,
+        ];
         ws.getRow(1).font = { bold: true };
         for (const row of tab.rows) ws.addRow(row).commit();
         ws.commit();
