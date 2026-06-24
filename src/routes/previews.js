@@ -31,6 +31,7 @@ import { applyServicesToPreview } from '../services/postProcessing/applyToFiles.
 import { getWellogicExportData, writeWellogicWorkbook } from '../services/wellogicExport.ts';
 import { getActiveSchema } from '../services/schemaRegistry.js';
 import {
+    buildIdentityColumns,
     buildColumnsFromSchema,
     augmentColumnsFromData,
     csvHeaderLine,
@@ -317,11 +318,17 @@ router.get('/:id/export', async (req, res) => {
 
         const records = await getAllRecordsForSlug(preview.items_ids || [], slug);
 
-        // Columns: schema order first (so location columns are present even when
-        // empty), then any scalar fields seen in the data but not the schema.
+        // Columns: identity columns first (unique join key well_id = section id,
+        // human label, source file), then schema order (so location columns are
+        // present even when empty), then any scalar fields seen only in the data.
         const active = slug === 'untyped' ? null : await getActiveSchema(slug);
+        const identity = buildIdentityColumns();
         let columns = buildColumnsFromSchema(active?.schema || null);
         columns = augmentColumnsFromData(columns, records);
+        // Prepend identity columns, dropping any later column that duplicates one
+        // of their headers (e.g. the well_label produced from boring_well_id).
+        const identityHeaders = new Set(identity.map((c) => c.header));
+        columns = [...identity, ...columns.filter((c) => !identityHeaders.has(c.header))];
 
         if (columns.length === 0) {
             return res.status(422).json({
