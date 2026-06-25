@@ -9,6 +9,7 @@
 import { registerService, getService, listServices } from './registry.ts';
 import mgsEnrich from './services/mgsEnrich.ts';
 import geocodeLocations from './services/geocodeLocations.ts';
+import projectRecords from './services/projectRecords.ts';
 
 let registered = false;
 
@@ -17,6 +18,7 @@ export function registerBuiltInServices(): void {
     if (registered) return;
     registerService(mgsEnrich);
     registerService(geocodeLocations);
+    registerService(projectRecords);
     registered = true;
 }
 

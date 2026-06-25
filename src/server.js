@@ -52,6 +52,7 @@ import previewRoutes, { setWebSocketInstance } from "./routes/previews.js";
 import { applyServicesToPreview } from "./services/postProcessing/applyToFiles.ts";
 import { getService, listServices } from "./services/postProcessing/index.ts";
 import mgsRoutes from "./routes/mgs.js";
+import nlqueryRoutes from "./routes/nlquery.js";
 import healthRoutes from "./routes/health.js";
 import { authenticateToken, optionalAuth, securityHeaders, requireRole } from "./middleware/auth.js";
 import { rateLimitConfig } from "./auth.js";
@@ -156,6 +157,9 @@ app.use('/previews', previewRoutes);
 
 app.use('/mgs', express.json());
 app.use('/mgs', authenticateToken, mgsRoutes);
+
+app.use('/nlquery', express.json());
+app.use('/nlquery', authenticateToken, nlqueryRoutes);
 
 // Health check routes (no auth required)
 app.use('/', healthRoutes);
