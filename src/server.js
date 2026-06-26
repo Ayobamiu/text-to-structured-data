@@ -1336,6 +1336,7 @@ app.get("/registry/document-types/:slug/detail", registryAdmin, async (req, res)
                 status: detail.status,
                 classifier_hints: detail.classifier_hints,
                 post_processing_defaults: detail.post_processing_defaults,
+                identifier_fields: detail.identifier_fields,
                 created_at: detail.created_at,
                 updated_at: detail.updated_at,
                 current_schema_version_id: detail.current_schema_version_id,
@@ -1525,6 +1526,34 @@ app.put("/registry/document-types/:slug/classifier-hints", registryAdmin, async 
         res.json({ status: 'success', classifier_hints: row.classifier_hints, updated_at: row.updated_at });
     } catch (error) {
         console.error('❌ registry classifier-hints:', error.message);
+        res.status(400).json({ status: 'error', message: error.message });
+    }
+});
+
+/**
+ * PUT /registry/document-types/:slug/identifier-fields
+ * Replace the per-document-type identifier dot-paths used to label a record in
+ * the preview ID column / drawer header. Body: { fields: string[] } (ordered
+ * dot-paths; [] clears, falling back to the frontend heuristic).
+ */
+app.put("/registry/document-types/:slug/identifier-fields", registryAdmin, async (req, res) => {
+    try {
+        const { slug } = req.params;
+        if (!validateRegistrySlug(slug, res)) return;
+
+        const fields = req.body?.fields;
+        if (!Array.isArray(fields) || !fields.every((f) => typeof f === 'string')) {
+            return res.status(400).json({
+                status: 'error',
+                message: 'body.fields must be an array of dot-path strings (use [] to clear)',
+            });
+        }
+
+        const svc = await import('./services/schemaRegistry.js');
+        const row = await svc.setIdentifierFields(slug, fields.map((f) => f.trim()).filter(Boolean));
+        res.json({ status: 'success', identifier_fields: row.identifier_fields, updated_at: row.updated_at });
+    } catch (error) {
+        console.error('❌ registry identifier-fields:', error.message);
         res.status(400).json({ status: 'error', message: error.message });
     }
 });
