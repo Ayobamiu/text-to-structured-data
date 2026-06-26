@@ -287,6 +287,60 @@ router.get('/:id/files', async (req, res) => {
 });
 
 /**
+ * GET /previews/:id/files/:fileId/download
+ * PUBLIC, preview-scoped signed PDF URL for the side-by-side viewer on the
+ * (unauthenticated) preview page. Mirrors /files/:id/download but authorizes by
+ * preview membership instead of a user token: the file must belong to THIS
+ * preview's items_ids. Returns JSON { success, url } (or 302 to the signed URL
+ * when JSON isn't requested).
+ */
+router.get('/:id/files/:fileId/download', async (req, res) => {
+    try {
+        const { id, fileId } = req.params;
+
+        // Authorize by preview membership (no user token on public preview links).
+        const inPreview = await isFileInPreview(fileId, id);
+        if (!inPreview) {
+            return res.status(404).json({ success: false, message: 'File not found in this preview' });
+        }
+
+        const client = await pool.connect();
+        try {
+            const result = await client.query(
+                `SELECT id, filename, s3_key, storage_type FROM job_files WHERE id = $1`,
+                [fileId],
+            );
+            const file = result.rows[0];
+            if (!file) {
+                return res.status(404).json({ success: false, message: 'File not found' });
+            }
+
+            if (file.s3_key && file.storage_type === 's3' && s3Service.isCloudStorageEnabled()) {
+                const signedUrl = await s3Service.generateSignedUrl(file.s3_key, 3600);
+                if (req.query.format === 'json' || req.headers.accept?.includes('application/json')) {
+                    return res.json({ success: true, url: signedUrl, filename: file.filename });
+                }
+                return res.redirect(signedUrl);
+            }
+
+            return res.status(404).json({
+                success: false,
+                message: 'File is not available for download (not stored in S3)',
+            });
+        } finally {
+            client.release();
+        }
+    } catch (error) {
+        console.error('Error generating preview file download URL:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Failed to get file download URL',
+            error: error.message,
+        });
+    }
+});
+
+/**
  * GET /previews/:id/export?slug=<type>&format=csv
  * GIS-ready, flat CSV export for ONE document type across the whole preview
  * (all records of that type, not just the current page). Streams the response
