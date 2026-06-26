@@ -323,10 +323,32 @@ export async function getRecordsForPreviewPaginated(
         const searchParam = searchTerm && searchTerm.trim() ? `%${searchTerm.trim()}%` : null;
 
         // Page rows + filtered total (one scan via COUNT(*) OVER()).
+        // source_page = the 1-based PDF page a record came from, resolved from
+        // the file's detected_sections by matching section_result_id (min of the
+        // section's extraction_pages, falling back to page_range[0]). NULL for V1
+        // whole-doc records (no section_result_id) → the viewer opens page 1.
         const pageRes = await client.query(
             `${RECORD_EXPAND_CTE}
              SELECT file_id, filename, created_at, processing_status,
                     admin_verified, review_status, job_name, eff_slug, idx, record,
+                    (
+                        SELECT COALESCE(
+                            MIN((pg)::int),
+                            MIN((sec->'page_range'->>0)::int)
+                        )
+                        FROM job_files djf
+                        CROSS JOIN LATERAL jsonb_array_elements(
+                            CASE WHEN jsonb_typeof(djf.detected_sections->'sections') = 'array'
+                                 THEN djf.detected_sections->'sections' ELSE '[]'::jsonb END
+                        ) sec
+                        LEFT JOIN LATERAL jsonb_array_elements_text(
+                            CASE WHEN jsonb_typeof(sec->'extraction_pages') = 'array'
+                                 THEN sec->'extraction_pages' ELSE '[]'::jsonb END
+                        ) pg ON true
+                        WHERE djf.id = typed.file_id
+                          AND typed.record ? 'section_result_id'
+                          AND sec->>'section_result_id' = typed.record->>'section_result_id'
+                    ) AS source_page,
                     COUNT(*) OVER() AS total_count
              FROM typed
              WHERE ($3::text IS NULL
@@ -358,6 +380,7 @@ export async function getRecordsForPreviewPaginated(
             review_status: r.review_status,
             slug: r.eff_slug ?? null,
             section_result_id: r.record?.section_result_id ?? null,
+            source_page: r.source_page != null ? Number(r.source_page) : null,
             result: r.record,
         }));
 
