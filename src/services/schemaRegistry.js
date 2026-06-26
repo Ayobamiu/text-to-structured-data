@@ -53,7 +53,7 @@ export async function listDocumentTypes({ includeDeprecated = false } = {}) {
         const result = await client.query(
             `SELECT id, slug, display_name, description, default_extractor,
                     routing_confidence_threshold, current_schema_version_id,
-                    classifier_hints,
+                    classifier_hints, identifier_fields,
                     status, created_at, updated_at
              FROM document_types
              ${includeDeprecated ? '' : "WHERE status = 'active'"}
@@ -135,7 +135,7 @@ export async function getDocumentTypeBySlug(slug) {
         const result = await client.query(
             `SELECT id, slug, display_name, description, default_extractor,
                     routing_confidence_threshold, current_schema_version_id,
-                    classifier_hints,
+                    classifier_hints, identifier_fields,
                     status, created_at, updated_at
              FROM document_types
              WHERE slug = $1`,
@@ -483,6 +483,47 @@ export async function setPostProcessingDefaults(slug, defaults) {
 }
 
 /**
+ * Set (replace) the per-document-type identifier field paths — the ordered list
+ * of dot-paths used to label a record in the preview ID column / drawer header.
+ * Replace (not merge), same reasoning as classifier hints / post-processing
+ * defaults: the authored array is exactly what's used.
+ *
+ * @param {string} slug
+ * @param {string[]} fields  Ordered dot-paths, e.g. ['site_identification.boring_well_id'].
+ *                           First non-empty scalar at preview time wins.
+ * @returns {Promise<{ slug, identifier_fields, updated_at }>}
+ */
+export async function setIdentifierFields(slug, fields) {
+    if (!slug) throw new Error('setIdentifierFields requires slug');
+    if (!Array.isArray(fields)) {
+        throw new Error('setIdentifierFields requires an array of dot-path strings');
+    }
+    for (const f of fields) {
+        if (typeof f !== 'string' || !f.trim()) {
+            throw new Error('each identifier field must be a non-empty string (dot-path)');
+        }
+    }
+
+    const client = await pool.connect();
+    try {
+        const result = await client.query(
+            `UPDATE document_types
+             SET identifier_fields = $1::jsonb, updated_at = NOW()
+             WHERE slug = $2
+             RETURNING slug, identifier_fields, updated_at`,
+            [JSON.stringify(fields), slug]
+        );
+        if (result.rows.length === 0) {
+            throw new Error(`document_type '${slug}' not found`);
+        }
+        bustCache();
+        return result.rows[0];
+    } finally {
+        client.release();
+    }
+}
+
+/**
  * Promote a draft (or older active) schema version to current_schema_version.
  * Useful when a draft schema has been validated against held-out files and
  * is ready to take over from the previous active version.
@@ -505,6 +546,7 @@ export async function getDocumentTypeDetail(slug) {
                     dt.status,
                     dt.classifier_hints,
                     dt.post_processing_defaults,
+                    dt.identifier_fields,
                     dt.created_at,
                     dt.updated_at,
                     dt.current_schema_version_id,
