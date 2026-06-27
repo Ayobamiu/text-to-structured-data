@@ -1,6 +1,17 @@
 import { describe, it, expect } from 'vitest';
-import projectRecords, { toDate } from '../services/projectRecords.ts';
+import projectRecords, { toDate, normalizeCounty } from '../services/projectRecords.ts';
 import type { RunArgs, SideEffect } from '../types.ts';
+
+describe('normalizeCounty', () => {
+    it('collapses case + "County" suffix variants to one canonical form', () => {
+        expect(normalizeCounty('JACKSON')).toBe('Jackson');
+        expect(normalizeCounty('jackson')).toBe('Jackson');
+        expect(normalizeCounty('Jackson County')).toBe('Jackson');
+        expect(normalizeCounty('  st. clair ')).toBe('St. Clair');
+        expect(normalizeCounty('')).toBeNull();
+        expect(normalizeCounty(null)).toBeNull();
+    });
+});
 
 const run = (record: Record<string, unknown>, slug: string | null, fileId: string | null = 'file-1') =>
     projectRecords.run({ record, slug, fileId, options: {}, cache: new Map(), deps: {} } as RunArgs);

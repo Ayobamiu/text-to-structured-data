@@ -18,7 +18,9 @@
 
 import type { PostProcessingService, RunArgs, RunResult, SideEffect, RecordObject } from '../types.ts';
 
-export const PROJECTOR_VERSION = '1.0.0';
+// 1.1.0: county promoted column is normalized (case + " County" suffix) so filters
+// and GROUP BY collapse dirty variants. Bumped to re-project existing records.
+export const PROJECTOR_VERSION = '1.1.0';
 
 // Field-name candidates (lowercased) for each promoted dimension.
 const LAT = ['latitude', 'latitude_dd', 'surface_latitude', 'lat'];
@@ -76,6 +78,18 @@ const toStr = (v: unknown): string | null => {
     return s || null;
 };
 
+/**
+ * Canonicalize a county so filters and GROUP BY collapse dirty variants:
+ * "JACKSON" / "jackson" / "Jackson County" all become "Jackson".
+ */
+export function normalizeCounty(v: unknown): string | null {
+    const s = toStr(v);
+    if (!s) return null;
+    const stripped = s.replace(/\s+county$/i, '').trim();
+    if (!stripped) return null;
+    return stripped.toLowerCase().replace(/\b[a-z]/g, (c) => c.toUpperCase());
+}
+
 /** Loose date → 'YYYY-MM-DD' | null. A bare year becomes Jan 1. */
 export function toDate(v: unknown): string | null {
     const s = toStr(v);
@@ -96,7 +110,7 @@ function recordDims(record: RecordObject) {
     return {
         latitude: toNum(findField(record, LAT)),
         longitude: toNum(findField(record, LON)),
-        county: toStr(findField(record, COUNTY)),
+        county: normalizeCounty(findField(record, COUNTY)),
         state: toStr(findField(record, STATE)),
         record_label: toStr(findField(record, LABEL)),
     };
