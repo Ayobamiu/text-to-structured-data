@@ -33,6 +33,14 @@ export function describeSpec(spec: FilterSpec): string {
     });
     if (spec.geo) conds.push(`within ${spec.geo.withinMiles} mi of (${spec.geo.lat}, ${spec.geo.lon})`);
     const where = conds.length ? ` where ${conds.join(' AND ')}` : '';
+
+    if (spec.aggregates && spec.aggregates.length > 0) {
+        const aggText = spec.aggregates
+            .map((a) => (a.fn === 'count' && !a.field ? 'count' : `${a.fn}(${a.field})`))
+            .join(', ');
+        const by = spec.groupBy && spec.groupBy.length ? ` by ${spec.groupBy.join(', ')}` : '';
+        return `Showing ${aggText} of ${parts.join(', ')}${where}${by}`;
+    }
     return `Showing ${parts.join(', ')}${where}`;
 }
 

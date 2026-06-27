@@ -55,6 +55,25 @@ const FILTER_SPEC_SCHEMA = {
             required: ['withinMiles', 'lat', 'lon'],
         },
         limit: { type: 'integer' },
+        groupBy: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'Fields to group by, for "count by X" / "per X" questions.',
+        },
+        aggregates: {
+            type: 'array',
+            description: 'Set for "how many" / "average/total/min/max" questions. Omit for list/"show me" questions.',
+            items: {
+                type: 'object',
+                additionalProperties: false,
+                properties: {
+                    fn: { type: 'string', enum: ['count', 'avg', 'sum', 'min', 'max'] },
+                    field: { type: 'string', description: 'Required for avg/sum/min/max; omit for count.' },
+                    alias: { type: 'string' },
+                },
+                required: ['fn'],
+            },
+        },
     },
     required: ['section', 'where'],
 } as const;
@@ -86,6 +105,14 @@ Rules:
 - A yes/no attribute named as a noun/adjective maps to that boolean field = true, NOT a text search. E.g. "injection wells" → { field:"injection_well", op:"eq", value:true }; "H2S present" → { field:"h2s_present", op:"eq", value:true }; "fractured wells" → { field:"fractured", op:"eq", value:true }. Only do this when such a boolean field exists in the catalog.
 - "within N miles of LAT, LON" → set geo, not a where condition.
 - Default section to "_root" unless the question is clearly about an array section (e.g. lithology, samples, perforations).
+Aggregation vs list:
+- "show / list / which / find" → a LIST: set "where" only, no "aggregates".
+- "how many / count" → aggregates: [{ fn: "count" }].
+- "average/total/sum/min/max of FIELD" → aggregates: [{ fn: "avg"|"sum"|"min"|"max", field: "FIELD" }].
+- "count by X" / "per X" / "grouped by X" → groupBy: ["X"] together with aggregates: [{ fn:"count" }] (or the requested aggregate).
+- Filters and aggregates combine: "average depth of Jackson wells" → where county=Jackson AND aggregates avg(depth_bottom).
+Follow-ups:
+- If a "Previous query" is provided and the question refines it ("of those…", "and deeper than…"), KEEP the previous conditions and add/adjust as needed; otherwise start fresh.
 - Return ONLY the structured object.`;
 
 export interface TranslateDeps {
@@ -93,6 +120,8 @@ export interface TranslateDeps {
     complete?: (args: { system: string; user: string; schema: object }) => Promise<string>;
     apiKey?: string;
     model?: string;
+    /** Previous FilterSpec, for follow-up composition ("of those…"). */
+    priorSpec?: FilterSpec;
 }
 
 async function defaultComplete(
@@ -124,6 +153,7 @@ export async function translate(nl: string, catalog: SlugCatalog, deps: Translat
         ``,
         catalogText(catalog),
         ``,
+        ...(deps.priorSpec ? [`Previous query: ${JSON.stringify({ where: deps.priorSpec.where, geo: deps.priorSpec.geo, groupBy: deps.priorSpec.groupBy, aggregates: deps.priorSpec.aggregates })}`, ``] : []),
         `Question: ${nl}`,
     ].join('\n');
 
@@ -144,6 +174,8 @@ export async function translate(nl: string, catalog: SlugCatalog, deps: Translat
         geo: parsed.geo,
         orderBy: parsed.orderBy,
         limit: parsed.limit,
+        groupBy: parsed.groupBy,
+        aggregates: parsed.aggregates,
     };
 }
 

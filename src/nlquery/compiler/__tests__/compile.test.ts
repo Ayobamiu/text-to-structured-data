@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import compile, { CompileError, DEFAULT_LIMIT, MAX_LIMIT } from '../compile.ts';
+import compile, { CompileError, DEFAULT_LIMIT, MAX_LIMIT, renderLiteralSql, compileSummary } from '../compile.ts';
 import type { SlugCatalog, FilterSpec } from '../../types.ts';
 
 const catalog: SlugCatalog = {
@@ -24,6 +24,40 @@ describe('compile — safety & structure', () => {
         expect(q.sql).toMatch(/FROM extracted_records WHERE slug = \$1 AND section_key = \$2/);
         expect(q.params.slice(0, 2)).toEqual(['mgs_well_log', '_root']);
         expect(q.sql).toMatch(new RegExp(`LIMIT ${DEFAULT_LIMIT}$`));
+    });
+
+    it('injects file_id scope (data-context) as a bound array', () => {
+        const q = C({ slug: 'mgs_well_log' }, { fileIds: ['f1', 'f2'] });
+        expect(q.sql).toMatch(/file_id = ANY\(\$3\)/);
+        expect(q.params).toContainEqual(['f1', 'f2']);
+    });
+
+    it('injects record_uid scope (single-record context)', () => {
+        const q = C({ slug: 'mgs_well_log' }, { recordUids: ['rec-1'] });
+        expect(q.sql).toMatch(/record_uid = ANY\(\$3\)/);
+        expect(q.params).toContainEqual(['rec-1']);
+    });
+
+    it('compiles preview scope BY REFERENCE (subquery, not inlined ids)', () => {
+        const q = C({ slug: 'mgs_well_log' }, { previewId: 'prev-1' });
+        expect(q.sql).toContain('file_id IN (SELECT unnest(items_ids) FROM preview_data_table WHERE id = $3)');
+        expect(q.params).toContain('prev-1');
+    });
+
+    it('scope.sectionKey overrides the section filter (section-level scope)', () => {
+        const q = C({ slug: 'mgs_well_log' }, { sectionKey: 'pluggings' });
+        expect(q.params.slice(0, 2)).toEqual(['mgs_well_log', 'pluggings']); // section_key = pluggings
+    });
+
+    it('renderLiteralSql inlines params safely (quotes escaped, arrays expanded)', () => {
+        const q = C(
+            { slug: 'mgs_well_log', where: [{ field: 'county', op: 'eq', value: "O'Brien" }] },
+            { fileIds: ['f1', 'f2'] },
+        );
+        const literal = renderLiteralSql(q);
+        expect(literal).not.toMatch(/\$\d/);                       // no placeholders left
+        expect(literal).toContain("'O''Brien'");                   // quote escaped
+        expect(literal).toContain("ANY(ARRAY['f1', 'f2'])");       // array expanded
     });
 
     it('injects org/job scope when provided', () => {
@@ -90,6 +124,39 @@ describe('compile — field resolution', () => {
         expect(q.sql).toContain('3958.8 * acos');
         expect(q.sql).toContain('<= ');
         expect(q.params).toEqual(expect.arrayContaining([43.6, -84.2, 5]));
+    });
+});
+
+describe('compileSummary — count & aggregates', () => {
+    it('list mode → count(*)', () => {
+        const q = compileSummary({ slug: 'mgs_well_log', where: [{ field: 'county', op: 'eq', value: 'Jackson' }] }, catalog);
+        expect(q.sql).toMatch(/^SELECT count\(\*\)::int AS count FROM extracted_records WHERE/);
+        expect(q.sql).not.toContain('GROUP BY');
+    });
+
+    it('scalar aggregate → avg(field), no group by', () => {
+        const q = compileSummary({ slug: 'mgs_well_log', aggregates: [{ fn: 'avg', field: 'measured_depth' }] }, catalog);
+        expect(q.sql).toContain('avg(depth_bottom) AS "avg_measured_depth"');
+        expect(q.sql).not.toContain('GROUP BY');
+    });
+
+    it('group-by count → grouped + ordered by the aggregate DESC', () => {
+        const q = compileSummary({ slug: 'mgs_well_log', groupBy: ['county'], aggregates: [{ fn: 'count' }] }, catalog);
+        expect(q.sql).toContain('county AS "county"');
+        expect(q.sql).toContain('count(*) AS "count"');
+        expect(q.sql).toContain('GROUP BY county');
+        expect(q.sql).toMatch(/ORDER BY "count" DESC/);
+    });
+
+    it('detail (compile) ignores aggregates — always raw rows', () => {
+        const q = compile({ slug: 'mgs_well_log', groupBy: ['county'], aggregates: [{ fn: 'count' }] }, catalog);
+        expect(q.sql).not.toContain('GROUP BY');
+        expect(q.sql).toContain('LIMIT');
+    });
+
+    it('list detail has a deterministic ORDER BY for stable pagination', () => {
+        const q = compile({ slug: 'mgs_well_log' }, catalog);
+        expect(q.sql).toContain('ORDER BY record_uid, section_key, row_index');
     });
 });
 

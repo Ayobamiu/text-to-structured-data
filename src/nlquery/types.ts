@@ -56,6 +56,16 @@ export interface GeoFilter {
     lon: number;
 }
 
+export type AggFn = 'count' | 'avg' | 'sum' | 'min' | 'max';
+
+export interface Aggregation {
+    fn: AggFn;
+    /** Required for avg/sum/min/max; omit for count → count(*). */
+    field?: string;
+    /** Output column name; defaults to e.g. "count" / "avg_depth_bottom". */
+    alias?: string;
+}
+
 /** The structured query the translator emits and the compiler consumes. */
 export interface FilterSpec {
     slug: string;
@@ -67,6 +77,10 @@ export interface FilterSpec {
     geo?: GeoFilter;
     orderBy?: { field: string; dir: 'asc' | 'desc' };
     limit?: number;
+    /** Group-by fields (aggregate mode). */
+    groupBy?: string[];
+    /** Presence flips the query to aggregate mode (rollup). */
+    aggregates?: Aggregation[];
 }
 
 export interface CompiledQuery {
@@ -74,8 +88,16 @@ export interface CompiledQuery {
     params: unknown[];
 }
 
-/** Server-side tenancy scope, injected by the compiler — never trusted to the model. */
+/** Server-side scope, injected by the compiler — never trusted to the model. */
 export interface QueryScope {
     orgId?: string | null;
     jobId?: string | null;
+    /** Restrict to specific job_files (data-context scoping, e.g. "talk to file A"). */
+    fileIds?: string[] | null;
+    /** A preview = a saved list of files; compiled by reference (subquery) so it never drifts. */
+    previewId?: string | null;
+    /** Restrict to specific records (record_uid) — e.g. "talk to this one record". */
+    recordUids?: string[] | null;
+    /** Restrict to a section type within the records (e.g. 'lithology_intervals'); default '_root'. */
+    sectionKey?: string | null;
 }
