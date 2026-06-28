@@ -4,25 +4,31 @@
  * Usage (all key=value, all optional except you need some scope):
  *   npx tsx src/nlquery/cli.ts slug=mgs_well_log file_id=<uuid>
  *   npx tsx src/nlquery/cli.ts job_id=<uuid> query="wells deeper than 1500 feet"
+ *   npx tsx src/nlquery/cli.ts job_id=<uuid> chat=on        # conversational agent REPL
  *
- * Keys: slug=  file_id=  job_id=  preview=  query=
- *   - no query=  → scope-only: the records touched by the context
- *   - with query= → scope + the translated NL filter
+ * Keys: slug=  file_id=  job_id=  preview=  query=  chat=
+ *   - no query=, no chat=  → scope-only: the records touched by the context
+ *   - with query=          → scope + the translated NL filter (one-shot)
+ *   - with chat=on         → conversational agent REPL over query_generator, persisted
+ *                            to conversations/messages (resumes on the same scope+user)
  *
  * Prints: the resolved scope, the interpreted filter, and a pasteable SQL string
  * (params inlined as literals). Then runs it and shows the row count + a sample,
  * so we can confirm the result is accurate.
  */
 
+import readline from 'node:readline';
 import pool from '../database.js';
 import resolveScope from './scope/resolveScope.ts';
 import ensureProjected from './scope/ensureProjected.ts';
 import buildCatalog from './catalog/buildCatalog.ts';
 import compile, { renderLiteralSql } from './compiler/compile.ts';
 import generateQuery from './query/generate.ts';
+import runAgentTurn from './agent/runAgentTurn.ts';
+import { resolveOrgId, getOrCreateConversation } from './agent/persistence.ts';
 import type { QueryScope } from './types.ts';
 
-const KEYS = ['slug', 'file_id', 'job_id', 'preview', 'record', 'section', 'query', 'project'] as const;
+const KEYS = ['slug', 'file_id', 'job_id', 'preview', 'record', 'section', 'query', 'project', 'chat', 'user_id'] as const;
 
 /** Parse `key=value` argv; the query value absorbs any trailing unkeyed tokens. */
 function parseArgs(argv: string[]): Record<string, string> {
@@ -72,6 +78,11 @@ async function main() {
     console.log(`Scope:       ${resolved.label}  (${resolved.recordCount} records)`);
     console.log(`Scope hash:  ${resolved.scopeHash}`);
 
+    if (args.chat === 'on') {
+        await runChat(resolved.slug, scope, resolved.scopeHash, resolved.label, args.user_id);
+        return;
+    }
+
     if (!hasQuery) {
         // Scope-only: just list the records in scope.
         const catalog = await buildCatalog(resolved.slug);
@@ -104,6 +115,42 @@ async function main() {
     const dres = await pool.query(gen.detail.sql, gen.detail.params);
     console.log(`▶ Detail would return ${dres.rows.length} rows` +
         (projectionMs ? ` (+ ${projectionMs} ms first-time projection).` : '.'));
+}
+
+/** Conversational agent REPL — resumes/persists to conversations+messages. */
+async function runChat(slug: string, scope: QueryScope, scopeHash: string, scopeLabel: string, userId?: string): Promise<void> {
+    const orgId = await resolveOrgId(scope, slug);
+    const conversation = await getOrCreateConversation({ orgId, userId: userId ?? null, slug, scopeHash, scope, scopeLabel });
+    console.log(`Conversation: ${conversation.id}  (org ${orgId.slice(0, 8)}…)`);
+    console.log('──────────────────────────────────────────────');
+    console.log('Type a question (or "exit"):\n');
+
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout, prompt: 'you> ' });
+    rl.prompt();
+    rl.on('line', async (line) => {
+        const question = line.trim();
+        if (!question) { rl.prompt(); return; }
+        if (question === 'exit' || question === 'quit') { rl.close(); return; }
+        try {
+            const result = await runAgentTurn({ conversationId: conversation.id, question, slug, scope, scopeHash });
+            console.log(`\nagent> ${result.reply}`);
+            if (result.resultSummary) {
+                const rs = result.resultSummary;
+                const detail = rs.mode === 'aggregate' ? `rollupRows=${rs.summaryRows?.length ?? 0}` : `rowCount=${rs.rowCount}`;
+                console.log(`        [${rs.mode}, ${detail}, ${rs.sample.length} sample row(s)]`);
+            }
+            if (result.renderView && result.detail) {
+                const view = await pool.query(result.detail.sql, result.detail.params);
+                console.log(`\n[render_view — ${view.rows.length} row(s)]`);
+                console.table(view.rows.slice(0, 20));
+            }
+            console.log();
+        } catch (e) {
+            console.error('agent error:', (e as Error)?.message || e);
+        }
+        rl.prompt();
+    });
+    await new Promise<void>((resolve) => rl.on('close', resolve));
 }
 
 main()
