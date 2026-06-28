@@ -16,6 +16,7 @@ import { flattenRecords, inferSlugFromShape } from '../../utils/resultEnvelope.j
 import { runServices, type RunSummary } from './runner.ts';
 import { mergeUpdatedRecordsIntoResult } from './applyToFiles.ts';
 import { resolvePostProcessing, type ServiceConfigEntry } from './resolvePostProcessing.ts';
+import projectRecords from './services/projectRecords.ts';
 import type { PostProcessingService, RecordObject, SideEffect } from './types.ts';
 
 /** Effective slug of a record: its envelope slug, else shape-inferred (V1). */
@@ -91,12 +92,18 @@ export async function runConfiguredServicesOverResult({
             jobOverrides,
             registry,
         });
-        if (services.length === 0) continue;
+        // Projection is infrastructure (always-on for any known slug), not an opt-in
+        // service — append it LAST so it captures any enrichment the configured
+        // services applied. Untyped records (no slug) can't be partitioned, so skip.
+        const effectiveServices = realSlug
+            ? [...services.filter((s) => s.name !== projectRecords.name), projectRecords]
+            : services;
+        if (effectiveServices.length === 0) continue;
 
         out.slugsRun.push(slug);
         const run = await runServices({
             records: slugRecords,
-            services,
+            services: effectiveServices,
             slugOf: () => realSlug,
             fileId,
             optionsByService,

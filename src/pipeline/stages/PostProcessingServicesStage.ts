@@ -46,12 +46,9 @@ export class PostProcessingServicesStage extends PipelineStage {
 
     shouldRun(context: PipelineContext): boolean {
         if (!super.shouldRun(context)) return false;
-        if (context.status !== 'completed' || !context.result) return false;
-        const cfg = context.postProcessing;
-        if (!cfg) return false;
-        const hasJob = Array.isArray(cfg.jobOverrides) && cfg.jobOverrides.length > 0;
-        const hasSlug = cfg.slugDefaultsBySlug && Object.keys(cfg.slugDefaultsBySlug).length > 0;
-        return Boolean(hasJob || hasSlug);
+        // Run on every completed extraction: projection (extracted_records) is always-on
+        // infrastructure; configured services (geocode, etc.) additionally run when present.
+        return Boolean(context.status === 'completed' && context.result);
     }
 
     async execute(context: PipelineContext): Promise<PipelineContext> {
