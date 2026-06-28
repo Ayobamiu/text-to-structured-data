@@ -90,7 +90,8 @@ export interface CompiledQuery {
 
 /** Server-side scope, injected by the compiler — never trusted to the model. */
 export interface QueryScope {
-    orgId?: string | null;
+    /** A single org, or the caller's full org membership (compiled as org_id = ANY(...)). */
+    orgId?: string | string[] | null;
     jobId?: string | null;
     /** Restrict to specific job_files (data-context scoping, e.g. "talk to file A"). */
     fileIds?: string[] | null;

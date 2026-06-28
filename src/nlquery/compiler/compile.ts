@@ -144,7 +144,12 @@ function buildWhere(spec: FilterSpec, catalog: SlugCatalog, scope: QueryScope, p
         `section_key = ${params.p(section)}`,
     ];
     // Server-side scope — always applied when present.
-    if (scope.orgId) where.push(`org_id = ${params.p(scope.orgId)}`);
+    if (Array.isArray(scope.orgId)) {
+        if (scope.orgId.length === 0) throw new CompileError('scope.orgId is an empty array — refusing an unscoped query');
+        where.push(`org_id = ANY(${params.p(scope.orgId)})`);
+    } else if (scope.orgId) {
+        where.push(`org_id = ${params.p(scope.orgId)}`);
+    }
     if (scope.jobId) where.push(`job_id = ${params.p(scope.jobId)}`);
     if (scope.fileIds && scope.fileIds.length > 0) where.push(`file_id = ANY(${params.p(scope.fileIds)})`);
     // Preview is scoped BY REFERENCE: re-select its files at query time so it never drifts.
