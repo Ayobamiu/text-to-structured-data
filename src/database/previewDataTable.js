@@ -362,10 +362,17 @@ export async function getRecordsForPreviewPaginated(
         );
 
         // Full type distribution (independent of the active slug/file filter).
+        // LEFT JOIN document_types to carry each type's configured identifier
+        // dot-paths so the frontend can label record rows by the right field
+        // (NULL for untyped / unconfigured types → frontend heuristic fallback).
         const slugRes = await client.query(
             `${RECORD_EXPAND_CTE}
-             SELECT eff_slug AS slug, COUNT(*)::int AS count
-             FROM typed GROUP BY eff_slug ORDER BY count DESC`,
+             SELECT typed.eff_slug AS slug, COUNT(*)::int AS count,
+                    dt.identifier_fields AS identifier_fields
+             FROM typed
+             LEFT JOIN document_types dt ON dt.slug = typed.eff_slug
+             GROUP BY typed.eff_slug, dt.identifier_fields
+             ORDER BY count DESC`,
             [itemIds],
         );
 
@@ -385,7 +392,11 @@ export async function getRecordsForPreviewPaginated(
         }));
 
         const total = pageRes.rows[0] ? parseInt(pageRes.rows[0].total_count, 10) : 0;
-        const slugs = slugRes.rows.map((s) => ({ slug: s.slug ?? null, count: s.count }));
+        const slugs = slugRes.rows.map((s) => ({
+            slug: s.slug ?? null,
+            count: s.count,
+            identifier_fields: Array.isArray(s.identifier_fields) ? s.identifier_fields : null,
+        }));
 
         return { jobFiles, total, page, pageSize, slugs };
     } finally {
