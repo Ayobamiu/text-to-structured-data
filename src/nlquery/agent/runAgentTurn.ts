@@ -137,6 +137,21 @@ export async function runAgentTurn(args: RunAgentTurnArgs): Promise<TurnResult> 
     let turnDetail: TurnResult['detail'] = lastDetail;
     let renderView = false;
 
+    // Persist the assistant turn and shape the result — reads the turn state at call time.
+    const finalize = async (reply: string): Promise<TurnResult> => {
+        await appendMessage({
+            conversationId,
+            role: 'assistant',
+            content: reply,
+            filterSpec: turnFilterSpec ?? null,
+            queryHash: turnQueryHash ?? null,
+            resultSummary: turnSummary ?? null,
+            renderedView: renderView,
+            deps: { db },
+        });
+        return { reply, filterSpec: turnFilterSpec, queryHash: turnQueryHash, resultSummary: turnSummary, renderView, detail: turnDetail };
+    };
+
     // Tool-use loop: the model may call query_generator and/or render_view before replying in text.
     for (let i = 0; i < 4; i++) {
         const res = await createMessage({
@@ -150,18 +165,7 @@ export async function runAgentTurn(args: RunAgentTurnArgs): Promise<TurnResult> 
         const toolUses = res.content.filter((b): b is Anthropic.ToolUseBlock => b.type === 'tool_use');
         if (toolUses.length === 0) {
             const text = res.content.find((b): b is Anthropic.TextBlock => b.type === 'text');
-            const reply = text?.text ?? '';
-            await appendMessage({
-                conversationId,
-                role: 'assistant',
-                content: reply,
-                filterSpec: turnFilterSpec ?? null,
-                queryHash: turnQueryHash ?? null,
-                resultSummary: turnSummary ?? null,
-                renderedView: renderView,
-                deps: { db },
-            });
-            return { reply, filterSpec: turnFilterSpec, queryHash: turnQueryHash, resultSummary: turnSummary, renderView, detail: turnDetail };
+            return finalize(text?.text ?? '');
         }
 
         messages.push({ role: 'assistant', content: res.content });
@@ -211,7 +215,15 @@ export async function runAgentTurn(args: RunAgentTurnArgs): Promise<TurnResult> 
         messages.push({ role: 'user', content: toolResults });
     }
 
-    throw new Error('runAgentTurn: exceeded tool-use loop limit');
+    // Tool budget exhausted without the model settling on a text answer. Rather than
+    // throw an internal error at the user, force one final reply with NO tools available
+    // so the model must summarize from what it already gathered this turn.
+    const finalRes = await createMessage({ model, max_tokens: 1024, system: SYSTEM, messages });
+    const finalText = finalRes.content.find((b): b is Anthropic.TextBlock => b.type === 'text')?.text ?? '';
+    return finalize(
+        finalText ||
+            'I wasn’t able to fully work through that one — could you rephrase it or narrow it down a bit?',
+    );
 }
 
 export default runAgentTurn;

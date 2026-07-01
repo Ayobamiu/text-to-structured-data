@@ -96,6 +96,22 @@ export async function getOrCreateConversation(args: GetOrCreateArgs): Promise<Co
     return created.rows[0] as unknown as ConversationRow;
 }
 
+/** Look up the conversation for (org, user, scope) WITHOUT creating one (panel open). */
+export async function findConversation(
+    args: { orgId: string; userId?: string | null; scopeHash: string; deps?: { db?: Queryable } },
+): Promise<ConversationRow | null> {
+    const { orgId, userId = null, scopeHash } = args;
+    const db = args.deps?.db ?? (pool as unknown as Queryable);
+    const res = await db.query(
+        `SELECT id, org_id, user_id, slug, scope_hash, scope, scope_label, title
+         FROM conversations
+         WHERE org_id = $1 AND scope_hash = $2 AND (user_id = $3 OR ($3 IS NULL AND user_id IS NULL))
+         ORDER BY created_at DESC LIMIT 1`,
+        [orgId, scopeHash, userId],
+    );
+    return (res.rows[0] as unknown as ConversationRow) ?? null;
+}
+
 export interface AppendMessageArgs {
     conversationId: string;
     role: 'user' | 'assistant';
