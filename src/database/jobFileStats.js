@@ -6,11 +6,12 @@
  */
 import pg from 'pg';
 import dotenv from 'dotenv';
+import { getDatabaseUrl } from '../utils/pgConnection.js';
 
 dotenv.config();
 
 const { Pool } = pg;
-const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+const pool = new Pool({ connectionString: getDatabaseUrl() });
 
 /**
  * Ensure a stats row exists for the given job. Inserts with zeros if missing.

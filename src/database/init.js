@@ -1,5 +1,5 @@
 import pg from 'pg';
-import { resolvePgPoolConfig } from '../utils/pgConnection.js';
+import { resolvePgPoolConfig, getDatabaseUrl } from '../utils/pgConnection.js';
 
 const { Pool } = pg;
 
@@ -10,9 +10,10 @@ export async function initializeDatabase() {
     // Debug environment variables
     console.log('🔍 Environment check:');
     console.log('  DATABASE_URL:', process.env.DATABASE_URL ? 'SET' : 'NOT SET');
+    console.log('  DEV_DATABASE_URL:', process.env.DEV_DATABASE_URL ? 'SET (using this locally)' : 'NOT SET');
     console.log('  NODE_ENV:', process.env.NODE_ENV);
 
-    const connectionString = process.env.DATABASE_URL || 'postgresql://postgres:password@localhost:5432/batch_processor';
+    const connectionString = getDatabaseUrl('postgresql://postgres:password@localhost:5432/batch_processor');
     console.log('🔗 Using connection string:', connectionString.replace(/:[^:@]*@/, ':***@'));
 
     const pool = new Pool(
@@ -268,9 +269,9 @@ ON CONFLICT (id) DO NOTHING;
         console.error('  Error code:', error.code);
         console.error('  Error details:', error);
 
-        if (!process.env.DATABASE_URL) {
-            console.error('⚠️  DATABASE_URL environment variable is not set!');
-            console.error('   Please set DATABASE_URL in your production environment.');
+        if (!process.env.DATABASE_URL && !process.env.DEV_DATABASE_URL) {
+            console.error('⚠️  No database URL set (DATABASE_URL or DEV_DATABASE_URL)!');
+            console.error('   Set DATABASE_URL in production, or DEV_DATABASE_URL for local dev.');
             console.error('   Example: DATABASE_URL=postgresql://postgres:password@host:5432/db');
         }
 

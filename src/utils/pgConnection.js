@@ -4,6 +4,17 @@ import { URL } from 'url';
 // Prefer IPv4 for all lookups in this process (helps some Node/pg combos)
 dns.setDefaultResultOrder('ipv4first');
 
+/**
+ * The Postgres URL to connect with. DEV_DATABASE_URL wins when set — it's only
+ * present in a local .env (never in production), so it's the "working locally"
+ * override. Point it at the Supabase session pooler (IPv4-reachable) so local dev
+ * works on networks without IPv6 / that block the direct db.<ref>.supabase.co host.
+ * Falls back to DATABASE_URL (prod), then the provided default.
+ */
+export function getDatabaseUrl(fallback) {
+    return process.env.DEV_DATABASE_URL || process.env.DATABASE_URL || fallback;
+}
+
 function isIPv4Host(hostname) {
     return /^\d{1,3}(\.\d{1,3}){3}$/.test(hostname);
 }
