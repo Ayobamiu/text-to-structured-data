@@ -2,7 +2,7 @@ import pg from 'pg';
 import { v4 as uuidv4 } from 'uuid';
 import dotenv from 'dotenv';
 import { FileProcessingPipeline } from './pipeline/FileProcessingPipeline.js';
-import { resolvePgPoolConfig } from './utils/pgConnection.js';
+import { resolvePgPoolConfig, getDatabaseUrl } from './utils/pgConnection.js';
 import { computeFlags } from './services/constraintsService.js';
 import { incrementTotal, adjustExtractionStatus, adjustProcessingStatus, decrementTotal, getStats } from './database/jobFileStats.js';
 
@@ -17,7 +17,7 @@ const defaultDbUrl = 'postgresql://postgres:password@localhost:5432/batch_proces
 
 // Database connection pool (IPv4 + TLS SNI when needed — see resolvePgPoolConfig)
 const pool = new Pool(
-    await resolvePgPoolConfig(process.env.DATABASE_URL || defaultDbUrl, {
+    await resolvePgPoolConfig(getDatabaseUrl(defaultDbUrl), {
         max: 20,
         idleTimeoutMillis: 30000,
         connectionTimeoutMillis: 10000,

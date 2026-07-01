@@ -7,6 +7,7 @@
 import pg from 'pg';
 import dotenv from 'dotenv';
 import { hashPassword, comparePassword, generateSecureToken } from '../auth.js';
+import { getDatabaseUrl } from '../utils/pgConnection.js';
 
 // Only load .env file in development
 if (process.env.NODE_ENV !== 'production') {
@@ -16,7 +17,7 @@ if (process.env.NODE_ENV !== 'production') {
 const { Pool } = pg;
 
 const pool = new Pool({
-    connectionString: process.env.DATABASE_URL || 'postgresql://postgres:password@localhost:5432/batch_processor',
+    connectionString: getDatabaseUrl('postgresql://postgres:password@localhost:5432/batch_processor'),
     // Force IPv4 to avoid Railway IPv6 issues
     family: 4,
     max: 20,
