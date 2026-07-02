@@ -1249,6 +1249,7 @@ app.get("/document-types", authenticateToken, async (req, res) => {
                 routing_confidence_threshold: t.routing_confidence_threshold,
                 status: t.status,
                 has_classifier_hints: t.classifier_hints != null,
+                has_qa_hints: t.qa_hints != null && Object.keys(t.qa_hints).length > 0,
             })),
         });
     } catch (error) {
@@ -1335,6 +1336,7 @@ app.get("/registry/document-types/:slug/detail", registryAdmin, async (req, res)
                 routing_confidence_threshold: detail.routing_confidence_threshold,
                 status: detail.status,
                 classifier_hints: detail.classifier_hints,
+                qa_hints: detail.qa_hints,
                 post_processing_defaults: detail.post_processing_defaults,
                 identifier_fields: detail.identifier_fields,
                 created_at: detail.created_at,
@@ -1526,6 +1528,33 @@ app.put("/registry/document-types/:slug/classifier-hints", registryAdmin, async 
         res.json({ status: 'success', classifier_hints: row.classifier_hints, updated_at: row.updated_at });
     } catch (error) {
         console.error('❌ registry classifier-hints:', error.message);
+        res.status(400).json({ status: 'error', message: error.message });
+    }
+});
+
+app.put("/registry/document-types/:slug/qa-hints", registryAdmin, async (req, res) => {
+    try {
+        const { slug } = req.params;
+        if (!validateRegistrySlug(slug, res)) return;
+
+        const hints = req.body?.hints;
+        const svc = await import('./services/schemaRegistry.js');
+
+        let row;
+        if (hints === null || hints === undefined) {
+            row = await svc.clearQAHints(slug);
+        } else if (hints && typeof hints === 'object' && !Array.isArray(hints)) {
+            row = await svc.setQAHints(slug, hints);
+        } else {
+            return res.status(400).json({
+                status: 'error',
+                message: 'body.hints must be a JSON object, or omit / null to clear',
+            });
+        }
+
+        res.json({ status: 'success', qa_hints: row.qa_hints, updated_at: row.updated_at });
+    } catch (error) {
+        console.error('❌ registry qa-hints:', error.message);
         res.status(400).json({ status: 'error', message: error.message });
     }
 });

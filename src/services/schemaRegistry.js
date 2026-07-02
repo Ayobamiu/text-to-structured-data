@@ -53,7 +53,7 @@ export async function listDocumentTypes({ includeDeprecated = false } = {}) {
         const result = await client.query(
             `SELECT id, slug, display_name, description, default_extractor,
                     routing_confidence_threshold, current_schema_version_id,
-                    classifier_hints, identifier_fields,
+                    classifier_hints, qa_hints, identifier_fields,
                     status, created_at, updated_at
              FROM document_types
              ${includeDeprecated ? '' : "WHERE status = 'active'"}
@@ -135,7 +135,7 @@ export async function getDocumentTypeBySlug(slug) {
         const result = await client.query(
             `SELECT id, slug, display_name, description, default_extractor,
                     routing_confidence_threshold, current_schema_version_id,
-                    classifier_hints, identifier_fields,
+                    classifier_hints, qa_hints, identifier_fields,
                     status, created_at, updated_at
              FROM document_types
              WHERE slug = $1`,
@@ -545,6 +545,7 @@ export async function getDocumentTypeDetail(slug) {
                     dt.routing_confidence_threshold,
                     dt.status,
                     dt.classifier_hints,
+                    dt.qa_hints,
                     dt.post_processing_defaults,
                     dt.identifier_fields,
                     dt.created_at,
@@ -696,6 +697,91 @@ export async function clearClassifierHints(slug) {
     }
 }
 
+/**
+ * Get the qa_hints object for a document type (used by sectionQAService to
+ * splice per-field-group priority/ignore guidance into the QA system prompt).
+ * @param {string} slug
+ * @returns {Promise<Object>} the qa_hints object, or {} if the type is unknown
+ *   or has none set — QA should degrade to its generic prompt, not fail.
+ */
+export async function getQAHints(slug) {
+    if (!slug) return {};
+    const client = await pool.connect();
+    try {
+        const result = await client.query(
+            `SELECT qa_hints FROM document_types WHERE slug = $1`,
+            [slug]
+        );
+        return result.rows[0]?.qa_hints || {};
+    } finally {
+        client.release();
+    }
+}
+
+/**
+ * Set (replace) the qa_hints object on a document type. Replace, not merge —
+ * same reasoning as setClassifierHints: the authored object is exactly what's
+ * used, so a removed group's guidance actually stops applying.
+ *
+ * @param {string} slug
+ * @param {Object} hints  Keyed by top-level schema field-group name, e.g.
+ *                        { lithology_intervals: { priority: 'critical', notes: '...' } }.
+ *                        See migrations/add_qa_hints_to_document_types.js for shape.
+ * @returns {Promise<{ slug, qa_hints, updated_at }>}
+ */
+export async function setQAHints(slug, hints) {
+    if (!slug) throw new Error('setQAHints requires slug');
+    if (!hints || typeof hints !== 'object' || Array.isArray(hints)) {
+        throw new Error('setQAHints requires a plain object for hints');
+    }
+
+    const client = await pool.connect();
+    try {
+        const result = await client.query(
+            `UPDATE document_types
+             SET qa_hints = $1::jsonb, updated_at = NOW()
+             WHERE slug = $2
+             RETURNING slug, qa_hints, updated_at`,
+            [JSON.stringify(hints), slug]
+        );
+        if (result.rows.length === 0) {
+            throw new Error(`document_type '${slug}' not found`);
+        }
+        bustCache();
+        return result.rows[0];
+    } finally {
+        client.release();
+    }
+}
+
+/**
+ * Clear qa_hints back to the empty-object default (not NULL — the column is
+ * NOT NULL DEFAULT '{}'::jsonb).
+ * @param {string} slug
+ * @returns {Promise<{ slug, qa_hints, updated_at }>}
+ */
+export async function clearQAHints(slug) {
+    if (!slug) throw new Error('clearQAHints requires slug');
+
+    const client = await pool.connect();
+    try {
+        const result = await client.query(
+            `UPDATE document_types
+             SET qa_hints = '{}'::jsonb, updated_at = NOW()
+             WHERE slug = $1
+             RETURNING slug, qa_hints, updated_at`,
+            [slug]
+        );
+        if (result.rows.length === 0) {
+            throw new Error(`document_type '${slug}' not found`);
+        }
+        bustCache();
+        return result.rows[0];
+    } finally {
+        client.release();
+    }
+}
+
 export async function setCurrentSchemaVersion(documentTypeSlug, version) {
     const client = await pool.connect();
     try {
@@ -742,6 +828,9 @@ export default {
     registerSchema,
     setClassifierHints,
     clearClassifierHints,
+    getQAHints,
+    setQAHints,
+    clearQAHints,
     setPostProcessingDefaults,
     setCurrentSchemaVersion,
     getDocumentTypeDetail,
