@@ -40,9 +40,11 @@ class ExtendAIService {
      * Parse file using ExtendAI API via URL
      * @param {string} fileUrl - Publicly accessible URL to the PDF file
      * @param {string} filename - Original filename
+     * @param {Object} [parseOptions] - Forwarded to getExtendAIConfig
+     *   (e.g. { returnOcrWords: true } for depth-geometry recovery).
      * @returns {Promise<Object>} Extraction result in standardized format
      */
-    async parseFromUrl(fileUrl, filename) {
+    async parseFromUrl(fileUrl, filename, parseOptions = {}) {
         try {
             if (!this.isConfigured() || !this.client) {
                 throw new Error('ExtendAI API key not configured');
@@ -57,7 +59,7 @@ class ExtendAIService {
                 file: {
                     fileName: filename,
                     fileUrl: fileUrl
-                }, config: getExtendAIConfig()
+                }, config: getExtendAIConfig(parseOptions)
             });
 
             // Log response for debugging
@@ -166,12 +168,20 @@ class ExtendAIService {
             fullText = fullText.trim();
             fullMarkdown = fullMarkdown.trim();
 
+            // Word-level OCR geometry (present only when requested via
+            // returnOcrWords). Consumed by depthGeometryService; never
+            // persisted to the DB (it's large).
+            const ocrWords = Array.isArray(extendAIResponse.ocr?.words)
+                ? extendAIResponse.ocr.words
+                : null;
+
             return {
                 success: true,
                 text: fullText,
                 markdown: fullMarkdown,
                 pages: pages,
                 tables: tables,
+                ...(ocrWords ? { ocrWords } : {}),
                 method: 'extendai',
                 extraction_time_seconds: extractionTimeSeconds,
                 metadata: {
@@ -199,9 +209,10 @@ class ExtendAIService {
      * @param {string} s3Key - S3 key of the file
      * @param {string} filename - Original filename
      * @param {Function} getSignedUrlFn - Function to generate signed URL: (s3Key) => Promise<string>
+     * @param {Object} [parseOptions] - Forwarded to parseFromUrl/getExtendAIConfig.
      * @returns {Promise<Object>} Extraction result
      */
-    async extractFromS3(s3Key, filename, getSignedUrlFn) {
+    async extractFromS3(s3Key, filename, getSignedUrlFn, parseOptions = {}) {
         try {
             console.log(`📦 Generating signed URL for S3 file: ${s3Key}`);
 
@@ -211,7 +222,7 @@ class ExtendAIService {
             console.log(`✅ Signed URL generated, calling ExtendAI...`);
 
             // Parse using ExtendAI
-            return await this.parseFromUrl(signedUrl, filename);
+            return await this.parseFromUrl(signedUrl, filename, parseOptions);
 
         } catch (error) {
             console.error(`❌ Error extracting from S3 with ExtendAI:`, error.message);

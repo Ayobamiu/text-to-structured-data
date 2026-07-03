@@ -305,7 +305,12 @@ export function isValidModel(method, model) {
 }
 
 
-export function getExtendAIConfig() {
+/**
+ * @param {Object} [options]
+ * @param {boolean} [options.returnOcrWords] - Ask Extend for word-level OCR
+ *   geometry (used by depth-geometry recovery; see depthGeometryService.ts).
+ */
+export function getExtendAIConfig(options = {}) {
     return {
         "engine": "parse_performance",
         "target": "markdown",
@@ -343,7 +348,7 @@ export function getExtendAIConfig() {
         "engineVersion": "2.0.0-beta",
         "advancedOptions": {
             "returnOcr": {
-                "words": false
+                "words": options.returnOcrWords === true
             },
             "pageRanges": [],
             "parallelism": 1,

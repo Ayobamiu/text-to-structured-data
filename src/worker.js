@@ -19,6 +19,8 @@ import { deriveSelectedPagesAndMeta, resolveExtractionFlags } from './services/v
 import { extractAndProcessPerSection } from './services/perSectionExtractor.js';
 import { buildExtractionMetadata } from './services/fileProcessingContext.js';
 import { recordProcessingEvent } from './services/processingEventsService.js';
+import { isDepthGeometryEnabled, recoverDepthGeometry } from './services/depthGeometryService.ts';
+import { refineExtractionData } from './services/depthRefinementService.ts';
 dotenv.config();
 
 
@@ -336,12 +338,21 @@ class FileProcessorWorker {
                 // the per-section extractor needs Array.isArray(pages) === true,
                 // so guard once more here.
                 const reprocessPages = Array.isArray(file.pages) ? file.pages : [];
+
+                // Rehydrate depth geometry persisted at extraction time so
+                // AI-only reprocess still injects the recovered depths.
+                let storedExtractionMeta = file.extraction_metadata || null;
+                if (typeof storedExtractionMeta === 'string') {
+                    try { storedExtractionMeta = JSON.parse(storedExtractionMeta); } catch { storedExtractionMeta = null; }
+                }
+
                 extractionResult = {
                     success: true,
                     text: file.extracted_text || '',
                     tables: Array.isArray(file.extracted_tables) ? file.extracted_tables : [],
                     markdown: file.markdown || '',
                     pages: reprocessPages,
+                    ...(storedExtractionMeta?.depth_geometry ? { depthGeometry: storedExtractionMeta.depth_geometry } : {}),
                 };
 
                 console.log(
@@ -559,6 +570,7 @@ class FileProcessorWorker {
                     processingMethod,
                     processingOptions: finalProcessingOptions,
                     selectedPages: file.selected_pages || null,
+                    depthGeometry: (isDepthGeometryEnabled(jobProcessingConfig) && extractionResult.depthGeometry) || null,
                     onSectionComplete: (info) => {
                         sectionsDone += 1;
                         // Surface per-section progress + quality signals on the
@@ -744,10 +756,25 @@ class FileProcessorWorker {
                     processingResult.ai_processing_time_seconds ||
                     null;
 
+                // Depth refinement (v1 path): reconcile the extracted rows with
+                // the measured geometry in a focused second pass. Mutates
+                // processingResult.data in place; fails open per group (any
+                // refiner error / rejected ops keeps the extracted rows).
+                let depthRefinementReports = null;
+                if (isDepthGeometryEnabled(jobProcessingConfig) && extractionResult.depthGeometry) {
+                    depthRefinementReports = await refineExtractionData({
+                        data: processingResult.data,
+                        geometry: extractionResult.depthGeometry,
+                        schema: schemaData,
+                        model: finalProcessingOptions?.model,
+                    });
+                }
+
                 // Merge pre-processing metadata with processing metadata
                 const finalMetadata = {
                     ...processingResult.metadata,
                     ...preProcessingMetadata, // Include comprehensive page detection metadata
+                    ...(depthRefinementReports?.length ? { depth_refinement: depthRefinementReports } : {}),
                     // Flag degraded result when per-section was requested but fell through to v1
                     ...(v1FallbackReason ? {
                         result_envelope: 'v1_fallback',
@@ -979,8 +1006,13 @@ class FileProcessorWorker {
         });
 
         let extractionResult;
+        const depthGeometryEnabled = isDepthGeometryEnabled(jobProcessingConfig);
         if (extractionMethod === 'extendai') {
-            extractionResult = await this.extractWithExtendAI(file, extractionOptions, selectedPages);
+            extractionResult = await this.extractWithExtendAI(
+                file,
+                depthGeometryEnabled ? { ...extractionOptions, returnOcrWords: true } : extractionOptions,
+                selectedPages
+            );
             if (!extractionResult.success) {
                 console.log(`⚠️ ExtendAI failed: ${extractionResult.error}`);
                 console.log(`🔄 Falling back to paddleocr for ${file.filename}`);
@@ -1003,6 +1035,26 @@ class FileProcessorWorker {
             message: 'Text extraction complete',
         });
 
+        // Depth-geometry recovery (borehole logs): calibrate the graphical
+        // depth ruler from the OCR word geometry and recover true sample
+        // depths + lithology contact tops. Fails open — when nothing can be
+        // calibrated (no ruler, paddleocr fallback, words missing) the
+        // geometry is simply absent and processing proceeds unchanged.
+        if (depthGeometryEnabled && Array.isArray(extractionResult.ocrWords)) {
+            const geometry = recoverDepthGeometry(extractionResult.ocrWords);
+            if (geometry) {
+                extractionResult.depthGeometry = geometry;
+                console.log(
+                    `📐 Depth geometry recovered for ${file.filename}: ` +
+                    `${geometry.samples.length} sample depth(s), ${geometry.lithologyLines.length} description line(s)` +
+                    `${geometry.lithologyLines.length === 0 && geometry.contacts.length > 0 ? ` (fallback: ${geometry.contacts.length} USCS contact(s))` : ''} ` +
+                    `across ${geometry.calibrated_pages} calibrated page(s)`
+                );
+            } else {
+                console.log(`📐 Depth geometry enabled but nothing recoverable for ${file.filename} (no ruler found) — continuing without it`);
+            }
+        }
+
         // 3. Normalize output
         const pages = extractionResult.pages || [];
         const tables = extractionResult.tables || [];
@@ -1024,6 +1076,12 @@ class FileProcessorWorker {
             classifierMeta,
             pageCount,
         });
+        // Persist recovered depth geometry (small: ids + numbers, NOT the raw
+        // OCR words) so AI-only reprocess can rebuild the prompt appendix
+        // without re-running text extraction.
+        if (extractionResult.depthGeometry) {
+            extractionMetadata.depth_geometry = extractionResult.depthGeometry;
+        }
 
         // 5. Persist to DB
         await updateFileExtractionStatus(
