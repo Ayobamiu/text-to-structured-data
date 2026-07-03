@@ -28,9 +28,13 @@ const DESC_X = 438;  // material description column (USCS codes)
 
 // Page with a MATERIAL DESCRIPTION header → exercises the primary transcript
 // path. Same ruler fit as pilotPage1 (ticks 5/10/15 at Y 793/1056/1318 →
-// depth = 0.01905*Y - 10.108), so the description lines land at ~1/2/10 ft.
-// A right-neighbour header ("LL") bounds the column; "(GC)" sits inside a
-// description line to prove the transcript is preferred over USCS contacts.
+// depth = 0.01905*Y - 10.108). Line depths anchor at the words' TOP edge
+// (word() builds top = yc - 5), so lines at yc 583/635/1055 → 0.9/1.9/9.9 ft.
+// Neighbour headers bound the column on BOTH sides by their edges:
+// LITHOLOGY (xc 366, right edge 381) and LL (xc 980, left edge 965).
+// "(GC)" sits inside a description line to prove the transcript is
+// preferred over USCS contacts; the word at x 420 (left of the old
+// centre-minus-pad bound) proves edge-to-edge coverage.
 const MAT_X = 630;
 const DESCH_X = 730;
 function descPage(): OcrWord[] {
@@ -40,10 +44,13 @@ function descPage(): OcrWord[] {
         word('5', 1, 793, DEPTH_X),
         word('10', 1, 1056, DEPTH_X),
         word('15', 1, 1318, DEPTH_X),
+        word('LITHOLOGY', 1, 460, 366), // left neighbour → left edge of the band
         word('MATERIAL', 1, 460, MAT_X),
         word('DESCRIPTION', 1, 460, DESCH_X),
-        word('LL', 1, 460, 980), // next column's header → right edge of the band
-        // un-coded surfacing layer (the case USCS contacts were blind to)
+        word('LL', 1, 460, 980), // right neighbour → right edge of the band
+        // un-coded surfacing layer starting at the column's left rule, well
+        // left of the MATERIAL header (the job 9cdfe109 truncation case)
+        word("0.5'", 1, 583, 420),
         word('Aggregate', 1, 583, 650),
         word('Base', 1, 583, 700),
         // coded layer — "(GC)" rides along in the transcript line
@@ -145,16 +152,44 @@ describe('recoverDepthGeometry', () => {
     it('recovers a depth-tagged description transcript (primary lithology path)', () => {
         const geo = recoverDepthGeometry(descPage())!;
         expect(geo.calibrated_pages).toBe(1);
-        // one line per material row, tagged with its measured depth, in order —
-        // including the un-coded "Aggregate Base" surfacing layer USCS missed
+        // one line per material row, depth = the line's TOP edge, in order —
+        // full text edge-to-edge (incl. the "0.5'" word left of the header)
+        // and the un-coded surfacing layer USCS matching missed
         expect(geo.lithologyLines).toEqual([
-            { text: 'Aggregate Base', depth: 1, page: 1 },
-            { text: 'Clayey Gravel (GC)', depth: 2, page: 1 },
-            { text: 'Fat Clay', depth: 10, page: 1 },
+            { text: "0.5' Aggregate Base", depth: 0.9, page: 1 },
+            { text: 'Clayey Gravel (GC)', depth: 1.9, page: 1 },
+            { text: 'Fat Clay', depth: 9.9, page: 1 },
         ]);
-        // the USCS "(GC)" is still picked up as a (fallback) contact, but the
-        // transcript is what the appendix will use
+        // the USCS "(GC)" is still picked up as secondary-evidence contact
+        // (contacts keep centre anchoring: 2.0)
         expect(geo.contacts).toEqual([{ code: 'GC', top: 2, page: 1 }]);
+    });
+
+    it('drops cross-page verbatim boilerplate (keep first) and above-surface lines', () => {
+        // legend above 0 ft on page 1, repeated verbatim on page 2 in-range;
+        // a real layer line is unique per page and survives
+        const page2 = [
+            word('DEPTH', 2, 460, DEPTH_X),
+            word('25', 2, 703, DEPTH_X),
+            word('LITHOLOGY', 2, 460, 366),
+            word('MATERIAL', 2, 460, MAT_X),
+            word('DESCRIPTION', 2, 460, DESCH_X),
+            word('LL', 2, 460, 980),
+            word('(Stratification', 2, 520, 650),
+            word('lines)', 2, 520, 760),
+            word('Silty', 2, 700, 650),
+            word('Sand', 2, 700, 710),
+        ];
+        const page1 = [
+            ...descPage(),
+            word('(Stratification', 1, 490, 650), // depth ≈ -0.87 → above surface
+            word('lines)', 1, 490, 760),
+        ];
+        const geo = recoverDepthGeometry([...page1, ...page2])!;
+        const texts = geo.lithologyLines.map((l) => `${l.page}:${l.text}`);
+        expect(texts).not.toContain('1:(Stratification lines)'); // above surface
+        expect(texts).not.toContain('2:(Stratification lines)'); // verbatim repeat of page 1
+        expect(texts).toContain('2:Silty Sand');
     });
 
     it('reuses the global slope on a single-tick page and filters "(continued)" labels', () => {

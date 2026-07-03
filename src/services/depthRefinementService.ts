@@ -100,9 +100,9 @@ const GROUPS: Record<string, GroupConfig> = {
             'set_top corrects a layer\'s TOP depth (depth_from_ft). Bottoms are recomputed automatically ' +
             'from the next layer\'s top — NEVER propose an op to fix depth_to_ft.',
             'One row = one MATERIAL, not one line of text. A row whose description merely continues the ' +
-            'previous row\'s sentence (wrapped text, added detail, "(Roadway Fill)", "fragments") is NOT ' +
-            'its own layer → merge_rows with the row it continues (first row survives, texts join). ' +
-            'Setting a top on such a row is wrong — merge it instead.',
+            'previous row\'s sentence — wrapped text, or added detail like colour, moisture, grain size, ' +
+            'inclusions, or a parenthetical qualifier — is NOT its own layer → merge_rows with the row it ' +
+            'continues (first row survives, texts join). Setting a top on such a row is wrong — merge it instead.',
             'A layer marked "(continued)" on a later page is the SAME layer; if it was extracted as an ' +
             'extra row, delete_row the duplicate.',
             'If the evidence shows a distinct material that no row has AS ITS OWN LAYER, add_row it — ' +
@@ -115,8 +115,13 @@ const GROUPS: Record<string, GroupConfig> = {
             'materials: never set a boundary at one and never add a row for one. EXCEPTION: the bottom-of-' +
             'hole / end-of-boring line is not a material but MUST exist as the final row (eob=true, ' +
             'depth_from = depth_to = the depth its own text states) — add_row it if extraction omitted it.',
-            'When a row\'s own text states its depth explicitly (e.g. "Bottom of hole at 45.5 feet"), that ' +
-            'stated number is authoritative over a nearby measured value.',
+            'Extracted row depths are often rounded to the ruler gridlines — a row\'s depth being several ' +
+            'feet away from its matching evidence line is EXPECTED and is exactly what set_top corrects. ' +
+            'Match rows to evidence lines by TEXT, then trust the measured depth.',
+            'Numbers STATED in the document text beat measured values (measurements carry a small reading ' +
+            'tolerance). Explicit depths: "Bottom of hole at N feet" → N. Stated thicknesses: a description ' +
+            'giving its own thicknesses (e.g. "X\' Asphalt over Y\' Base Course") puts that layer\'s bottom ' +
+            '— and the next layer\'s top — at their sum.',
         ],
     },
     samples_collected: {

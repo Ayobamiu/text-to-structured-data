@@ -90,14 +90,15 @@ const isSampleId = (s: string): boolean => SAMPLE_RE.test(s.replace(/\s/g, ''));
 // the description band for the (primary) depth-tagged transcript.
 const DESC_HDR_RE = /^(MATERIAL|DESCRIPTION)$/i;
 
-// Description-band geometry (all in OCR pixels, using word x-centres):
+// Description-band geometry (all in OCR pixels):
 const HEADER_ROW_PX = 30;       // words within this Y of the desc header = same header row
-const DESC_LEFT_PAD_PX = 50;    // extend left of the header to catch text starting slightly left
-const MIN_COL_GAP_PX = 40;      // a header word this far right of the desc header starts a new column
-const RIGHT_NEIGHBOR_PAD_PX = 30; // pull the right edge just inside the next column's header
-const DESC_DEFAULT_WIDTH_PX = 250; // fallback right edge when no neighbouring header is found
+const MIN_COL_GAP_PX = 40;      // a header word this far from the desc header (by centre) = another column
+const COL_EDGE_PAD_PX = 6;      // step just inside a neighbouring header's edge
+const DESC_LEFT_PAD_PX = 50;    // fallback left bound when no left-neighbour header exists
+const DESC_DEFAULT_WIDTH_PX = 250; // fallback right bound when no right-neighbour header exists
 const HEADER_CLEARANCE_PX = 10; // content must sit below the header by this much
 const LINE_GROUP_PX = 12;       // words within this Y are the same transcript line
+const MIN_LINE_DEPTH_FT = -0.3; // lines above ground surface are header-block text, not log content
 
 // USCS group symbols as printed in material descriptions: "(GC)", "(CH)", …
 // (secondary evidence — see RecoveredContact).
@@ -115,6 +116,10 @@ interface Word {
     t: string;
     yc: number;
     xc: number;
+    /** bounding-box edges — column bounds use x0/x1, line depth uses top */
+    x0: number;
+    x1: number;
+    top: number;
     page: number;
 }
 
@@ -154,14 +159,20 @@ function recoverDescriptionLines(W: Word[], depthAt: (y: number) => number, page
     const headerYc = descHdrs.reduce((a, w) => a + w.yc, 0) / descHdrs.length;
     const headerRow = W.filter((w) => Math.abs(w.yc - headerYc) < HEADER_ROW_PX);
 
-    // Right edge: first header word beyond a column gap = the next column's header.
-    const rightNeighborXc = headerRow
+    // The column spans the whole gap between its neighbouring columns: from
+    // the RIGHT EDGE of the nearest header on the left to the LEFT EDGE of
+    // the nearest header on the right. Bounding off the desc header's own
+    // centre truncated wide columns — the header is centred over the column,
+    // but description text starts at the column's left rule (job 9cdfe109:
+    // "0.7' Plantmix over 0.4' " was cut off "… Aggregate Base").
+    const leftNeighborX1 = headerRow
+        .filter((w) => w.xc < descMinXc - MIN_COL_GAP_PX)
+        .reduce<number | null>((max, w) => (max == null || w.x1 > max ? w.x1 : max), null);
+    const rightNeighborX0 = headerRow
         .filter((w) => w.xc > descMaxXc + MIN_COL_GAP_PX)
-        .reduce<number | null>((min, w) => (min == null || w.xc < min ? w.xc : min), null);
-    const rightBound = rightNeighborXc != null
-        ? rightNeighborXc - RIGHT_NEIGHBOR_PAD_PX
-        : descMaxXc + DESC_DEFAULT_WIDTH_PX;
-    const leftBound = descMinXc - DESC_LEFT_PAD_PX;
+        .reduce<number | null>((min, w) => (min == null || w.x0 < min ? w.x0 : min), null);
+    const leftBound = leftNeighborX1 != null ? leftNeighborX1 + COL_EDGE_PAD_PX : descMinXc - DESC_LEFT_PAD_PX;
+    const rightBound = rightNeighborX0 != null ? rightNeighborX0 - COL_EDGE_PAD_PX : descMaxXc + DESC_DEFAULT_WIDTH_PX;
     const headerBottom = Math.max(...descHdrs.map((w) => w.yc)) + HEADER_CLEARANCE_PX;
 
     const content = W
@@ -176,9 +187,14 @@ function recoverDescriptionLines(W: Word[], depthAt: (y: number) => number, page
         else lines.push({ yc: w.yc, words: [w] });
     }
 
+    // Depth = the line's TOP edge, not its vertical centre. A description
+    // line starts just below its drawn contact, so the top edge is the
+    // physically correct anchor — centre-anchoring carried a systematic
+    // +0.2 ft bias (measured 10.25/26.22/38.22 vs true 10/26/38 on the
+    // pilot; top-edge measures 10.05/26.02/38.01).
     return lines.map((L) => ({
         text: L.words.sort((a, b) => a.xc - b.xc).map((w) => w.t).join(' '),
-        depth: depthAt(L.yc),
+        depth: depthAt(Math.min(...L.words.map((w) => w.top))),
         page,
     }));
 }
@@ -220,6 +236,9 @@ export function recoverDepthGeometry(ocrWords: OcrWord[] | null | undefined): De
             t: (w.content || '').trim(),
             yc: (bb.top + bb.bottom) / 2,
             xc: (bb.left + bb.right) / 2,
+            x0: bb.left,
+            x1: bb.right,
+            top: bb.top,
             page: w.pageNumber,
         });
     }
@@ -285,15 +304,30 @@ export function recoverDepthGeometry(ocrWords: OcrWord[] | null | undefined): De
         }
     }
 
-    if (calibratedPages === 0 || (samples.length === 0 && lithologyLines.length === 0 && contacts.length === 0)) {
+    // Transcript hygiene (lithologyLines arrive in page order here):
+    //  - text repeating VERBATIM on a later page is per-page boilerplate (the
+    //    "(Stratification lines represent…)" legend) or a page-break
+    //    restatement of a continuing layer — keep the first occurrence only
+    //    (real "(continued)" carryover lines differ by their suffix and survive);
+    //  - lines above the ground surface are header-block text, not log content.
+    const seenText = new Map<string, number>();
+    const cleanLines = lithologyLines.filter((l) => {
+        const key = l.text.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+        const firstPage = seenText.get(key);
+        if (firstPage != null && firstPage !== l.page) return false;
+        seenText.set(key, l.page);
+        return l.depth >= MIN_LINE_DEPTH_FT;
+    });
+
+    if (calibratedPages === 0 || (samples.length === 0 && cleanLines.length === 0 && contacts.length === 0)) {
         return null; // fail open
     }
 
     // Document order (page, then vertical position ≈ depth).
     samples.sort((a, b) => a.page - b.page || a.depth - b.depth);
-    lithologyLines.sort((a, b) => a.page - b.page || a.depth - b.depth);
+    cleanLines.sort((a, b) => a.page - b.page || a.depth - b.depth);
     contacts.sort((a, b) => a.page - b.page || a.top - b.top);
-    return { samples, lithologyLines, contacts, calibrated_pages: calibratedPages };
+    return { samples, lithologyLines: cleanLines, contacts, calibrated_pages: calibratedPages };
 }
 
 /**
