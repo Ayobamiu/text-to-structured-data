@@ -99,6 +99,10 @@ const GROUPS: Record<string, GroupConfig> = {
         instructions: [
             'set_top corrects a layer\'s TOP depth (depth_from_ft). Bottoms are recomputed automatically ' +
             'from the next layer\'s top — NEVER propose an op to fix depth_to_ft.',
+            'Check EVERY row, top to bottom, against the evidence — this overrides minimality: for each ' +
+            'row whose description matches an evidence line but whose depth_from_ft differs from that ' +
+            'line\'s measured depth, propose set_top. Correcting one row does not complete the job; a row ' +
+            'left at a rounded/gridline depth when its matching line shows a precise depth is an error.',
             'One row = one MATERIAL, not one line of text. A row whose description merely continues the ' +
             'previous row\'s sentence — wrapped text, or added detail like colour, moisture, grain size, ' +
             'inclusions, or a parenthetical qualifier — is NOT its own layer → merge_rows with the row it ' +
