@@ -3,8 +3,11 @@ import {
     applyOps,
     checkInvariants,
     findGroupItemSchema,
+    correctSamplesDeterministically,
+    snapLithologyTops,
     type RefinementOp,
 } from '../depthRefinementService.ts';
+import type { DepthGeometry } from '../depthGeometryService.ts';
 
 // ── fixtures ────────────────────────────────────────────────────────────────
 // Lithology rows mirroring the pilot's over-segmented extraction (job/file
@@ -195,6 +198,183 @@ describe('checkInvariants', () => {
     });
 });
 
+// ── deterministic corrections ───────────────────────────────────────────────
+// Geometry mirrors the pilot (file 9cdfe109) after the evidence-quality
+// fixes: full-text lines at top-edge depths.
+
+const pilotGeometry: DepthGeometry = {
+    samples: [
+        { id: 'RS-1', depth: 9.2, page: 1 },
+        { id: 'SPT-2', depth: 10.8, page: 1 },
+        { id: 'SPT-2', depth: 13.7, page: 1 },
+        { id: 'RC-1', depth: 43, page: 3 },
+    ],
+    lithologyLines: [
+        { text: "0.7' Plantmix over 0.4' Aggregate Base", depth: 0, page: 1 },
+        { text: '(GC) Loose to medium dense, slightly moist, brown, Clayey Gravel with', depth: 1.2, page: 1 },
+        { text: "Grinding on boulder from 4.5' to 6.0'", depth: 4.5, page: 1 },
+        { text: '(CH) Soft to stiff, very moist to wet, brown, Sandy Fat Clay with scattered', depth: 10, page: 1 },
+        { text: '(RK) Hard, strong, dark gray vesicular Basalt', depth: 38, page: 2 },
+        { text: 'Bottom of hole at 45.5 feet.', depth: 45.6, page: 3 },
+    ],
+    contacts: [],
+    calibrated_pages: 3,
+};
+
+describe('correctSamplesDeterministically', () => {
+    it('sets depths by id (duplicates in document order), adds missing, never deletes', () => {
+        const rows = [
+            { sample_id: 'SPT-2', depth_ft: 10, sample_type: null },   // 1st SPT-2 → 10.8
+            { sample_id: 'SPT-2', depth_ft: 15, sample_type: null },   // 2nd SPT-2 → 13.7
+            { sample_id: 'GHOST-9', depth_ft: 99, sample_type: null }, // not measured → untouched, kept
+        ];
+        const { rows: out, changes } = correctSamplesDeterministically(rows, pilotGeometry);
+        expect(out.map((r) => `${r.sample_id}@${r.depth_ft}`)).toEqual([
+            'RS-1@9.2',      // added, inserted by depth
+            'SPT-2@10.8',
+            'SPT-2@13.7',
+            'RC-1@43',       // added, inserted by depth
+            'GHOST-9@99',    // never deleted
+        ]);
+        expect(changes).toHaveLength(4); // 2 sets + 2 adds
+        // added rows are template-shaped
+        expect(out[0]).toHaveProperty('sample_type', null);
+    });
+
+    it('reports no changes when everything already matches', () => {
+        const rows = pilotGeometry.samples.map((s) => ({ sample_id: s.id, depth_ft: s.depth }));
+        const { changes } = correctSamplesDeterministically(rows, pilotGeometry);
+        expect(changes).toEqual([]);
+    });
+
+    it('an added row is never re-matched by a later measured sample with the same id', () => {
+        // baseline has NO SPT-2 rows; both measured SPT-2s must be added as
+        // separate rows (live bug: the 10.8 add got overwritten to 13.7)
+        const rows = [{ sample_id: 'RS-1', depth_ft: 5, sample_type: null }];
+        const { rows: out } = correctSamplesDeterministically(rows, pilotGeometry);
+        expect(out.map((r) => `${r.sample_id}@${r.depth_ft}`)).toEqual([
+            'RS-1@9.2', 'SPT-2@10.8', 'SPT-2@13.7', 'RC-1@43',
+        ]);
+    });
+});
+
+describe('snapLithologyTops', () => {
+    it('snaps each row to its matching line by normalized prefix (either direction), in order', () => {
+        const rows = [
+            // row longer than line (extraction concatenated wrapped lines)
+            { depth_from_ft: 0, depth_to_ft: 5, description_raw: '(GC) Loose to medium dense, slightly moist, brown, Clayey Gravel with cobble and boulder size basalt rock fragments (Roadway Fill)', eob: false },
+            // row shorter than line (extraction truncated)
+            { depth_from_ft: 5, depth_to_ft: 25, description_raw: '(CH) Soft to stiff, very moist to wet, brown', eob: false },
+            { depth_from_ft: 35, depth_to_ft: 45, description_raw: '(RK) Hard, strong, dark gray vesicular Basalt', eob: false },
+        ];
+        const { rows: out, changes } = snapLithologyTops(rows, pilotGeometry);
+        // 3 snapped tops + the deterministically added EOB row (45.6 → stated 45.5)
+        expect(out.map((r) => r.depth_from_ft)).toEqual([1.2, 10, 38, 45.5]);
+        expect(changes.filter((c) => c.startsWith('snap top'))).toHaveLength(3);
+    });
+
+    it('note lines and short texts never anchor a row', () => {
+        const rows = [
+            // "Grinding on boulder…" line must not capture this row even though
+            // the row is between GC and CH — no textual prefix relation
+            { depth_from_ft: 5, depth_to_ft: 25, description_raw: '(CH) Soft to stiff, very moist to wet, brown, Sandy Fat Clay', eob: false },
+            { depth_from_ft: 30, depth_to_ft: 45, description_raw: 'Fill', eob: false }, // too short to match
+        ];
+        const { rows: out } = snapLithologyTops(rows, pilotGeometry);
+        expect(out[0].depth_from_ft).toBe(10);
+        expect(out[1].depth_from_ft).toBe(30); // untouched
+    });
+
+    it('stated EOB depth beats the measured line depth (within tolerance)', () => {
+        const rows = [
+            { depth_from_ft: 45, depth_to_ft: 45, description_raw: 'Bottom of hole at 45.5 feet.', eob: true },
+        ];
+        const { rows: out, changes } = snapLithologyTops(rows, pilotGeometry);
+        // snapped to measured 45.6 first, then stated 45.5 wins
+        expect(out[0].depth_from_ft).toBe(45.5);
+        expect(changes.some((c) => c.includes('stated EOB'))).toBe(true);
+    });
+
+    it('adds the EOB row from evidence when extraction omitted it (live bug)', () => {
+        const rows = [
+            { depth_from_ft: 35, depth_to_ft: 45, description_raw: '(RK) Hard, strong, dark gray vesicular Basalt', eob: false },
+        ];
+        const { rows: out, changes } = snapLithologyTops(rows, pilotGeometry);
+        const eob = out.find((r) => r.eob === true)!;
+        expect(eob).toBeTruthy();
+        expect(eob.depth_from_ft).toBe(45.5); // line @45.6, stated 45.5 wins
+        expect(changes.some((c) => c.includes('add EOB row'))).toBe(true);
+        // and never added twice
+        const again = snapLithologyTops(out, pilotGeometry);
+        expect(again.rows.filter((r) => r.eob === true)).toHaveLength(1);
+    });
+
+    it('stated surfacing thickness fixes the next top when it agrees with the measurement', () => {
+        const rows = [
+            { depth_from_ft: 0, depth_to_ft: 5, description_raw: "0.7' Plantmix over 0.4' Aggregate Base", eob: false },
+            { depth_from_ft: 5, depth_to_ft: 25, description_raw: '(GC) Loose to medium dense, slightly moist, brown, Clayey Gravel with', eob: false },
+        ];
+        const { rows: out } = snapLithologyTops(rows, pilotGeometry);
+        // GC snapped to measured 1.2, then stated 0.7 + 0.4 = 1.1 wins (|1.1-1.2| ≤ tol)
+        expect(out[0].depth_from_ft).toBe(0);
+        expect(out[1].depth_from_ft).toBe(1.1);
+    });
+
+    it('splits an absorbed surface layer with a clean text cut, snaps both parts', () => {
+        const rows = [
+            { depth_from_ft: 0, depth_to_ft: 10, description_raw: "0.7' Plantmix over 0.4' Aggregate Base (GC) Loose to medium dense, slightly moist, brown, Clayey Gravel with cobble", uscs_symbol: 'GC', eob: false },
+            { depth_from_ft: 10, depth_to_ft: 26, description_raw: '(CH) Soft to stiff, very moist to wet, brown, Sandy Fat Clay with scattered', uscs_symbol: 'CH', eob: false },
+        ];
+        const { rows: out, changes } = snapLithologyTops(rows, pilotGeometry);
+        expect(out).toHaveLength(4); // split pair + CH + added EOB row
+        expect(out[0].description_raw).toBe("0.7' Plantmix over 0.4' Aggregate Base");
+        expect(out[0].depth_from_ft).toBe(0);
+        expect(out[0].uscs_symbol).toBeNull(); // template row, not GC
+        expect((out[1].description_raw as string).startsWith('(GC) Loose to medium dense')).toBe(true);
+        expect(out[1].depth_from_ft).toBe(1.1); // snapped to 1.2, stated 0.7+0.4 wins
+        expect(out[1].uscs_symbol).toBe('GC'); // kept from merged row
+        expect(out[2].depth_from_ft).toBe(10);
+        expect(changes.some((c) => c.includes('split absorbed'))).toBe(true);
+    });
+
+    it('does not split wrapped lines (small gap) or when the surfacing row already exists', () => {
+        // gap between first two lines below the split threshold → no split
+        const wrappedGeo: DepthGeometry = {
+            ...pilotGeometry,
+            lithologyLines: [
+                { text: '(CH) Soft to stiff, very moist to wet, brown, Sandy Fat Clay with scattered', depth: 10, page: 1 },
+                { text: 'subangular basalt rock fragments and cobbles', depth: 10.4, page: 1 },
+            ],
+        };
+        const merged = [{ depth_from_ft: 10, depth_to_ft: 26, description_raw: '(CH) Soft to stiff, very moist to wet, brown, Sandy Fat Clay with scattered subangular basalt rock fragments and cobbles', eob: false }];
+        expect(snapLithologyTops(merged, wrappedGeo).rows).toHaveLength(1);
+
+        // surfacing already its own row → no second split
+        const already = [
+            { depth_from_ft: 0, depth_to_ft: 1.1, description_raw: "0.7' Plantmix over 0.4' Aggregate Base", eob: false },
+            { depth_from_ft: 1.1, depth_to_ft: 10, description_raw: '(GC) Loose to medium dense, slightly moist, brown, Clayey Gravel with', eob: false },
+        ];
+        const rowsOut = snapLithologyTops(already, pilotGeometry).rows;
+        expect(rowsOut.filter((r) => r.eob !== true)).toHaveLength(2); // no re-split (EOB add is separate)
+    });
+
+    it('stated thickness is ignored when it disagrees with the measurement', () => {
+        const geo: DepthGeometry = {
+            ...pilotGeometry,
+            lithologyLines: [
+                { text: "3.0' Asphalt over 3.0' Base Course of gravel", depth: 0, page: 1 },
+                { text: '(CH) Soft to stiff, very moist to wet, brown, Sandy Fat Clay with scattered', depth: 10, page: 1 },
+            ],
+        };
+        const rows = [
+            { depth_from_ft: 0, depth_to_ft: 10, description_raw: "3.0' Asphalt over 3.0' Base Course of gravel", eob: false },
+            { depth_from_ft: 10, depth_to_ft: 20, description_raw: '(CH) Soft to stiff, very moist to wet, brown, Sandy Fat Clay with scattered', eob: false },
+        ];
+        const { rows: out } = snapLithologyTops(rows, geo);
+        expect(out[1].depth_from_ft).toBe(10); // stated 6.0 is 4 ft off measured 10 → rejected
+    });
+});
+
 // ── schema fragment lookup ──────────────────────────────────────────────────
 
 describe('findGroupItemSchema', () => {
@@ -220,5 +400,75 @@ describe('findGroupItemSchema', () => {
         expect(item).toBeTruthy();
         expect((item as any).properties.depth_from_ft).toBeTruthy();
         expect(findGroupItemSchema(schema, 'samples_collected')).toBeNull();
+    });
+});
+
+describe('splitAbsorbedSurfacing — USCS backfill', () => {
+    it('fills the soil part\'s uscs_symbol from its opening "(XX)" when the merged row had none', () => {
+        const rows = [
+            { depth_from_ft: 0, depth_to_ft: 10, description_raw: "0.7' Plantmix over 0.4' Aggregate Base (GC) Loose to medium dense, slightly moist, brown, Clayey Gravel with cobble", uscs_symbol: null, uscs_source: 'not_present', eob: false },
+        ];
+        const { rows: out } = snapLithologyTops(rows, pilotGeometry);
+        const soil = out.find((r) => (r.description_raw as string || '').startsWith('(GC)'))!;
+        expect(soil.uscs_symbol).toBe('GC');
+        expect(soil.uscs_source).toBe('inline_parenthetical');
+    });
+});
+
+describe('splitAbsorbedSurfacing — coexistence with a model-added surfacing row', () => {
+    it('trims the still-merged row instead of creating a second surfacing row', () => {
+        const rows = [
+            { depth_from_ft: 0, depth_to_ft: null, description_raw: "0.7' Plantmix over 0.4' Aggregate Base", uscs_symbol: null, eob: false }, // model-added
+            { depth_from_ft: 0, depth_to_ft: 10, description_raw: "0.7' Plantmix over 0.4' Aggregate Base (GC) Loose to medium dense, slightly moist, brown, Clayey Gravel with cobble", uscs_symbol: null, eob: false },
+            { depth_from_ft: 10, depth_to_ft: 26, description_raw: '(CH) Soft to stiff, very moist to wet, brown, Sandy Fat Clay with scattered', uscs_symbol: 'CH', eob: false },
+        ];
+        const { rows: out } = snapLithologyTops(rows, pilotGeometry);
+        const surfacings = out.filter((r) => normLike(r.description_raw as string) === normLike("0.7' Plantmix over 0.4' Aggregate Base"));
+        expect(surfacings).toHaveLength(1); // no duplicate
+        const soil = out.find((r) => (r.description_raw as string || '').startsWith('(GC)'))!;
+        expect(soil.depth_from_ft).toBe(1.1); // trimmed + snapped + stated thickness
+        expect(soil.uscs_symbol).toBe('GC');
+    });
+});
+
+function normLike(s: string): string {
+    return s.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+}
+
+describe('snapLithologyTops — messy-baseline hardening (live run findings)', () => {
+    it('thickness override works on UNSORTED input (model-added surfacing after the soil row)', () => {
+        const rows = [
+            { depth_from_ft: 0, depth_to_ft: 10, description_raw: "0.7' Plantmix over 0.4' Aggregate Base (GC) Loose to medium dense, slightly moist, brown, Clayey Gravel with cobble", uscs_symbol: null, eob: false },
+            { depth_from_ft: 0, depth_to_ft: null, description_raw: "0.7' Plantmix over 0.4' Aggregate Base", uscs_symbol: null, eob: false },
+        ];
+        const { rows: out } = snapLithologyTops(rows, pilotGeometry);
+        const soil = out.find((r) => (r.description_raw as string || '').startsWith('(GC)'))!;
+        expect(soil.depth_from_ft).toBe(1.1); // trimmed → snapped 1.2 → stated 1.1
+    });
+
+    it('drops an unmatched page-break duplicate row (identical text, "(continued)" variants too)', () => {
+        const rows = [
+            { depth_from_ft: 5, depth_to_ft: 25, description_raw: '(CH) Soft to stiff, very moist to wet, brown, Sandy Fat Clay with scattered', uscs_symbol: 'CH', eob: false },
+            { depth_from_ft: 25, depth_to_ft: 26, description_raw: '(CH) Soft to stiff, very moist to wet, brown, Sandy Fat Clay with scattered', uscs_symbol: 'CH', eob: false },
+            { depth_from_ft: 35, depth_to_ft: 45, description_raw: '(RK) Hard, strong, dark gray vesicular Basalt', uscs_symbol: 'RK', eob: false },
+            { depth_from_ft: 45, depth_to_ft: 45.5, description_raw: '(RK) Hard, strong, dark gray vesicular Basalt (continued)', uscs_symbol: 'RK', eob: false },
+        ];
+        const { rows: out, changes } = snapLithologyTops(rows, pilotGeometry);
+        const ch = out.filter((r) => r.uscs_symbol === 'CH');
+        const rk = out.filter((r) => r.uscs_symbol === 'RK');
+        expect(ch).toHaveLength(1);
+        expect(ch[0].depth_from_ft).toBe(10);
+        expect(rk).toHaveLength(1);
+        expect(rk[0].depth_from_ft).toBe(38);
+        expect(changes.filter((c) => c.includes('drop unmatched duplicate'))).toHaveLength(2);
+    });
+
+    it('keeps an unmatched row whose text is unique (paraphrased layer, no twin)', () => {
+        const rows = [
+            { depth_from_ft: 5, depth_to_ft: 25, description_raw: '(CH) Soft to stiff, very moist to wet, brown, Sandy Fat Clay with scattered', uscs_symbol: 'CH', eob: false },
+            { depth_from_ft: 30, depth_to_ft: 33, description_raw: 'a totally paraphrased layer description with no evidence twin', uscs_symbol: null, eob: false },
+        ];
+        const { rows: out } = snapLithologyTops(rows, pilotGeometry);
+        expect(out.filter((r) => r.uscs_symbol === null && r.eob !== true)).toHaveLength(1);
     });
 });

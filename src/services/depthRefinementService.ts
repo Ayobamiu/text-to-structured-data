@@ -96,36 +96,30 @@ const GROUPS: Record<string, GroupConfig> = {
             }
             return out;
         },
+        // The model's ONLY job is STRUCTURE — exact depths are snapped
+        // deterministically afterwards (snapLithologyTops), so the prompt
+        // stays focused on the judgment calls it has proven reliable at.
         instructions: [
-            'set_top corrects a layer\'s TOP depth (depth_from_ft). Bottoms are recomputed automatically ' +
-            'from the next layer\'s top — NEVER propose an op to fix depth_to_ft.',
-            'Check EVERY row, top to bottom, against the evidence — this overrides minimality: for each ' +
-            'row whose description matches an evidence line but whose depth_from_ft differs from that ' +
-            'line\'s measured depth, propose set_top. Correcting one row does not complete the job; a row ' +
-            'left at a rounded/gridline depth when its matching line shows a precise depth is an error.',
+            'Your job is the STRUCTURE of the layer list, not exact depths: exact depths are corrected ' +
+            'automatically afterwards by matching each row\'s text to the evidence, and bottoms are always ' +
+            'recomputed from the next layer\'s top. NEVER propose an op just to adjust a depth value; ' +
+            'propose set_top only for a row whose description was paraphrased so far from the evidence ' +
+            'text that automatic matching would fail, yet you can still tell which line is its top.',
             'One row = one MATERIAL, not one line of text. A row whose description merely continues the ' +
             'previous row\'s sentence — wrapped text, or added detail like colour, moisture, grain size, ' +
             'inclusions, or a parenthetical qualifier — is NOT its own layer → merge_rows with the row it ' +
-            'continues (first row survives, texts join). Setting a top on such a row is wrong — merge it instead.',
+            'continues (first row survives, texts join).',
             'A layer marked "(continued)" on a later page is the SAME layer; if it was extracted as an ' +
             'extra row, delete_row the duplicate.',
             'If the evidence shows a distinct material that no row has AS ITS OWN LAYER, add_row it — ' +
             'INCLUDING when its text was absorbed into another row\'s description (e.g. surfacing/pavement/' +
-            'aggregate base absorbed into the first soil layer\'s description). In that case add_row the ' +
-            'absorbed material starting at the absorbing row\'s current top, and set_top the absorbing row ' +
-            'to the measured depth of ITS OWN material (the evidence line matching its main description). ' +
-            'Set item fields you cannot know to null.',
+            'aggregate base absorbed into the first soil layer\'s description). Give the new row the ' +
+            'evidence line\'s text as description_raw and the evidence depth as depth_from_ft; set fields ' +
+            'you cannot know to null.',
             'Evidence lines that are notes, legends, water-level remarks, or bare depth ranges are NOT ' +
-            'materials: never set a boundary at one and never add a row for one. EXCEPTION: the bottom-of-' +
-            'hole / end-of-boring line is not a material but MUST exist as the final row (eob=true, ' +
-            'depth_from = depth_to = the depth its own text states) — add_row it if extraction omitted it.',
-            'Extracted row depths are often rounded to the ruler gridlines — a row\'s depth being several ' +
-            'feet away from its matching evidence line is EXPECTED and is exactly what set_top corrects. ' +
-            'Match rows to evidence lines by TEXT, then trust the measured depth.',
-            'Numbers STATED in the document text beat measured values (measurements carry a small reading ' +
-            'tolerance). Explicit depths: "Bottom of hole at N feet" → N. Stated thicknesses: a description ' +
-            'giving its own thicknesses (e.g. "X\' Asphalt over Y\' Base Course") puts that layer\'s bottom ' +
-            '— and the next layer\'s top — at their sum.',
+            'materials: never add a row for one. EXCEPTION: the bottom-of-hole / end-of-boring line is not ' +
+            'a material but MUST exist as the final row (eob=true, depth_from = depth_to) — add_row it if ' +
+            'extraction omitted it.',
         ],
     },
     samples_collected: {
@@ -438,41 +432,56 @@ export function applyOps(
             ...alive.map((w) => ({ orig: w.orig, row: w.row })),
             ...addedRows.map((row, i) => ({ orig: rows.length + i, row })),
         ];
-        all.sort((a, b) => {
-            const aEob = cfg.eobField && a.row[cfg.eobField] === true;
-            const bEob = cfg.eobField && b.row[cfg.eobField] === true;
-            if (aEob !== bEob) return aEob ? 1 : -1;
-            const ad = a.row[cfg.depthField];
-            const bd = b.row[cfg.depthField];
-            if (isNum(ad) && isNum(bd) && ad !== bd) return ad - bd;
-            return a.orig - b.orig;
-        });
-        result = all.map((w) => w.row);
+        result = finalizeIntervalOrder(cfg, all);
     } else {
         result = alive.map((w) => w.row);
-        for (const row of addedRows) {
-            const d = row[cfg.depthField];
-            const at = isNum(d) ? result.findIndex((r) => isNum(r[cfg.depthField]) && (r[cfg.depthField] as number) > d) : -1;
-            if (at === -1) result.push(row);
-            else result.splice(at, 0, row);
-        }
+        for (const row of addedRows) insertByDepth(cfg, result, row);
     }
 
-    // 6. recompute interval bottoms mechanically: each layer runs to the next
-    // layer's top; the last material layer runs to the EOB row's depth
-    if (cfg.recomputeBottoms && cfg.bottomField) {
-        for (let i = 0; i < result.length; i++) {
-            const isEob = cfg.eobField && result[i][cfg.eobField] === true;
-            const next = result[i + 1];
-            if (isEob) {
-                if (isNum(result[i][cfg.depthField])) result[i][cfg.bottomField] = result[i][cfg.depthField];
-            } else if (next && isNum(next[cfg.depthField])) {
-                result[i][cfg.bottomField] = next[cfg.depthField];
-            }
-        }
-    }
-
+    recomputeBottoms(cfg, result);
     return { rows: result, changes };
+}
+
+/** Sort interval rows by top depth (stable; EOB row pinned last). */
+function finalizeIntervalOrder(
+    cfg: GroupConfig,
+    decorated: { orig: number; row: Record<string, unknown> }[]
+): Record<string, unknown>[] {
+    decorated.sort((a, b) => {
+        const aEob = cfg.eobField && a.row[cfg.eobField] === true;
+        const bEob = cfg.eobField && b.row[cfg.eobField] === true;
+        if (aEob !== bEob) return aEob ? 1 : -1;
+        const ad = a.row[cfg.depthField];
+        const bd = b.row[cfg.depthField];
+        if (isNum(ad) && isNum(bd) && ad !== bd) return (ad as number) - (bd as number);
+        return a.orig - b.orig;
+    });
+    return decorated.map((w) => w.row);
+}
+
+/** Insert a point row (sample) at its depth position, keeping document order. */
+function insertByDepth(cfg: GroupConfig, rows: Record<string, unknown>[], row: Record<string, unknown>): void {
+    const d = row[cfg.depthField];
+    const at = isNum(d) ? rows.findIndex((r) => isNum(r[cfg.depthField]) && (r[cfg.depthField] as number) > (d as number)) : -1;
+    if (at === -1) rows.push(row);
+    else rows.splice(at, 0, row);
+}
+
+/**
+ * Recompute interval bottoms mechanically: each layer runs to the next
+ * layer's top; the last material layer runs to the EOB row's depth.
+ */
+function recomputeBottoms(cfg: GroupConfig, rows: Record<string, unknown>[]): void {
+    if (!cfg.recomputeBottoms || !cfg.bottomField) return;
+    for (let i = 0; i < rows.length; i++) {
+        const isEob = cfg.eobField && rows[i][cfg.eobField] === true;
+        const next = rows[i + 1];
+        if (isEob) {
+            if (isNum(rows[i][cfg.depthField])) rows[i][cfg.bottomField] = rows[i][cfg.depthField];
+        } else if (next && isNum(next[cfg.depthField])) {
+            rows[i][cfg.bottomField] = next[cfg.depthField];
+        }
+    }
 }
 
 // ── invariant gate ──────────────────────────────────────────────────────────
@@ -511,6 +520,283 @@ export function checkInvariants(
     }
 }
 
+// ── deterministic corrections ───────────────────────────────────────────────
+// The mechanical half of refinement. Model proposals showed run-to-run
+// variance on exactly these joins (under-added samples, skipped set_tops,
+// hallucinated duplicate deletes), so code owns them: text/id matching is
+// unambiguous now that the evidence carries full line texts.
+
+const normText = (s: unknown): string =>
+    typeof s === 'string' ? s.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim() : '';
+
+/** Minimum normalized length before a line/description prefix match counts. */
+const MIN_MATCH_CHARS = 10;
+/** Stated-number overrides may adjust a measured depth by at most this much. */
+const STATED_TOLERANCE_FT = 0.5;
+/** End-of-boring phrases as printed on logs (with or without a stated depth). */
+const EOB_RE = /bottom of (?:hole|boring)|end of boring|boring terminated|total depth/i;
+
+/** Build an all-null row template from the union of existing rows' keys. */
+function rowTemplate(rows: Record<string, unknown>[]): Record<string, unknown> {
+    const t: Record<string, unknown> = {};
+    for (const r of rows) for (const k of Object.keys(r)) if (!(k in t)) t[k] = null;
+    return t;
+}
+
+/**
+ * Samples, fully deterministic: walk the measured list (complete, document
+ * order) and match each measured sample to the first unused row with the
+ * same id (repeated ids match in order — same rule the document uses). Set
+ * matched rows' depths; add a row for every measured sample extraction
+ * dropped. NEVER deletes — duplicate rows are the QA layer's concern.
+ */
+export function correctSamplesDeterministically(
+    rows: Record<string, unknown>[],
+    geometry: DepthGeometry
+): { rows: Record<string, unknown>[]; changes: string[] } {
+    const cfg = GROUPS.samples_collected;
+    const out = rows.map((r) => ({ ...r }));
+    const changes: string[] = [];
+    // track consumed rows by OBJECT identity — indices shift as rows are
+    // inserted, and a freshly added row must never be re-matched by a later
+    // measured sample with the same id
+    const used = new Set<Record<string, unknown>>();
+    const template = rowTemplate(rows);
+    for (const m of geometry.samples) {
+        const mid = m.id.replace(/\s/g, '').toLowerCase();
+        const row = out.find((r) =>
+            !used.has(r) &&
+            typeof r.sample_id === 'string' &&
+            (r.sample_id as string).replace(/\s/g, '').toLowerCase() === mid
+        );
+        if (row) {
+            used.add(row);
+            if (row[cfg.depthField] !== m.depth) {
+                changes.push(`set depth ${m.id}: ${row[cfg.depthField]} → ${m.depth}`);
+                row[cfg.depthField] = m.depth;
+            }
+        } else {
+            const added = { ...template, sample_id: m.id, [cfg.depthField]: m.depth };
+            used.add(added);
+            insertByDepth(cfg, out, added);
+            changes.push(`add ${m.id} @ ${m.depth}`);
+        }
+    }
+    return { rows: out, changes };
+}
+
+/**
+ * Lithology tops, deterministic: match each row to the measured description
+ * line its text STARTS with (normalized prefix either way — the row's
+ * description and the line derive from the same printed text) and snap the
+ * row's top to that line's measured depth. Order-monotonic: rows and lines
+ * are both in document order, and a line anchors at most one row — note/
+ * legend lines simply never match anything. Then apply stated-number
+ * overrides (numbers printed in the text beat measured values, within
+ * tolerance):
+ *   - an EOB row stating its own depth ("Bottom of hole at 45.5 feet");
+ *   - a ground-surface row stating its thicknesses ("0.7' Plantmix over
+ *     0.4' Aggregate Base" → the next layer starts at 1.1).
+ *
+ * Runs AFTER the model's structure pass; the caller re-sorts, recomputes
+ * bottoms, and gates the result (fail open to the pre-snap rows).
+ */
+export function snapLithologyTops(
+    rows: Record<string, unknown>[],
+    geometry: DepthGeometry
+): { rows: Record<string, unknown>[]; changes: string[] } {
+    const cfg = GROUPS.lithology_intervals;
+    let out = rows.map((r) => ({ ...r }));
+    const changes: string[] = [];
+    const lines = geometry.lithologyLines;
+
+    // Deterministic split of an absorbed ground-surface layer (surfacing/
+    // pavement folded into the first soil row). Runs before top-matching so
+    // both parts snap to their own lines afterwards.
+    out = splitAbsorbedSurfacing(cfg, out, geometry, changes);
+
+    let from = 0; // monotonic pointer into lines
+    const matched = new Set<Record<string, unknown>>();
+    for (let i = 0; i < out.length; i++) {
+        const nd = normText(out[i].description_raw);
+        if (nd.length < MIN_MATCH_CHARS) continue;
+        for (let k = from; k < lines.length; k++) {
+            const nl = normText(lines[k].text);
+            if (nl.length < MIN_MATCH_CHARS) continue;
+            if (nd.startsWith(nl) || nl.startsWith(nd)) {
+                if (out[i][cfg.depthField] !== lines[k].depth) {
+                    changes.push(`snap top row ${i}: ${out[i][cfg.depthField]} → ${lines[k].depth} ("${lines[k].text.slice(0, 40)}…")`);
+                    out[i][cfg.depthField] = lines[k].depth;
+                }
+                matched.add(out[i]);
+                from = k + 1;
+                break;
+            }
+        }
+    }
+
+    // Page-break duplicate rows: extraction sometimes re-emits a continuing
+    // layer's restated description as its own row. Signature: the row's text
+    // (ignoring "(continued)" markers) is identical to a row that DID match
+    // an evidence line, while this row matched nothing — the measured
+    // transcript defines the real layer set, so drop the echo.
+    const dupKey = (r: Record<string, unknown>): string =>
+        normText(r.description_raw).replace(/\bcontinued\b/g, '').trim();
+    const matchedKeys = new Set([...matched].map(dupKey));
+    for (let i = out.length - 1; i >= 0; i--) {
+        const r = out[i];
+        if (matched.has(r) || (cfg.eobField && r[cfg.eobField] === true)) continue;
+        const key = dupKey(r);
+        if (key.length >= MIN_MATCH_CHARS && matchedKeys.has(key)) {
+            changes.push(`drop unmatched duplicate row: "${(r.description_raw as string).slice(0, 40)}…"`);
+            out.splice(i, 1);
+        }
+    }
+
+    // Deterministic EOB row: if the measured evidence shows an end-of-boring
+    // line but extraction emitted no eob row, create it from the line (the
+    // stated-depth override just below then refines its depth). Same
+    // evidence-completeness principle as the sample adds.
+    const eobField = cfg.eobField;
+    if (eobField && !out.some((r) => r[eobField] === true)) {
+        const eobLine = lines.find((l) => EOB_RE.test(l.text));
+        if (eobLine) {
+            out.push({
+                ...rowTemplate(out),
+                [eobField]: true,
+                description_raw: eobLine.text,
+                [cfg.depthField]: eobLine.depth,
+            });
+            changes.push(`add EOB row from evidence @ ${eobLine.depth}`);
+        }
+    }
+
+    // Stated EOB depth beats the measured one (kills the reading tolerance
+    // at the bottom of the hole).
+    for (const r of out) {
+        if (cfg.eobField && r[cfg.eobField] === true && typeof r.description_raw === 'string') {
+            const m = (r.description_raw as string).match(
+                new RegExp(`(?:${EOB_RE.source})[^\\d]{0,20}(\\d+(?:\\.\\d+)?)`, 'i')
+            );
+            if (m) {
+                const stated = +m[1];
+                const cur = r[cfg.depthField];
+                if (!isNum(cur) || Math.abs(stated - (cur as number)) <= STATED_TOLERANCE_FT) {
+                    if (cur !== stated) {
+                        changes.push(`stated EOB depth: ${cur} → ${stated}`);
+                        r[cfg.depthField] = stated;
+                    }
+                }
+            }
+        }
+    }
+
+    // Stated surfacing thickness: a ground-surface row whose text prints its
+    // own thicknesses ("0.7' X over 0.4' Y") fixes the NEXT layer's top at
+    // their sum — but only when that agrees with the measurement to within
+    // tolerance (the stated number wins the rounding, never invents a layer).
+    // top rows by MEASURED position, not array order — the caller only
+    // sorts after this function returns
+    const byTop = out
+        .filter((r) => !(cfg.eobField && r[cfg.eobField] === true) && isNum(r[cfg.depthField]))
+        .sort((a, b) => (a[cfg.depthField] as number) - (b[cfg.depthField] as number));
+    const first = byTop[0];
+    const next = byTop[1];
+    if (first && (first[cfg.depthField] as number) <= 0.05 && typeof first.description_raw === 'string') {
+        const feet = [...(first.description_raw as string).matchAll(/(\d+(?:\.\d+)?)\s*'/g)].map((m) => +m[1]);
+        const sum = +feet.reduce((a, b) => a + b, 0).toFixed(2);
+        if (feet.length >= 1 && sum > 0 && next && isNum(next[cfg.depthField])
+            && Math.abs(sum - (next[cfg.depthField] as number)) <= STATED_TOLERANCE_FT
+            && next[cfg.depthField] !== sum) {
+            changes.push(`stated surfacing thickness: next top ${next[cfg.depthField]} → ${sum}`);
+            next[cfg.depthField] = sum;
+        }
+    }
+
+    return { rows: out, changes };
+}
+
+/**
+ * Detect and split a merged ground-surface row: extraction commonly folds a
+ * thin surfacing/pavement layer into the first soil layer's description, so
+ * the row's text is the CONCATENATION of two measured lines that sit a
+ * layer's distance apart on the ruler. All conditions are evidence-driven:
+ *  - the row's text starts with line A's text and continues with line B's;
+ *  - A and B are ≥ MIN_SPLIT_GAP_FT apart (wrapped lines of one layer sit
+ *    ~one text-line apart and must NOT split);
+ *  - no other row already carries line A as its own layer;
+ *  - line B's opening words are locatable in the raw description, so the
+ *    texts can be cut cleanly (no duplicated text across the two rows).
+ * Fail open: any condition unmet → rows unchanged. Tops are left for the
+ * prefix snap + stated-thickness override that run right after.
+ */
+const MIN_SPLIT_GAP_FT = 0.8;
+
+function splitAbsorbedSurfacing(
+    cfg: GroupConfig,
+    rows: Record<string, unknown>[],
+    geometry: DepthGeometry,
+    changes: string[]
+): Record<string, unknown>[] {
+    const lines = geometry.lithologyLines;
+    if (lines.length < 2) return rows;
+    const [A, B] = lines;
+    const normA = normText(A.text);
+    const normB = normText(B.text);
+    if (normA.length < MIN_MATCH_CHARS || normB.length < MIN_MATCH_CHARS) return rows;
+    if (B.depth - A.depth < MIN_SPLIT_GAP_FT) return rows; // wrapped text, not a boundary
+
+    // does the surfacing already exist as its own row (e.g. the model's
+    // structure pass added it)? then only TRIM a still-merged row, don't
+    // create a second surfacing row
+    const standalone = rows.some((r) => {
+        const nd = normText(r.description_raw);
+        return nd.length >= MIN_MATCH_CHARS && (normA.startsWith(nd) || nd === normA);
+    });
+
+    // find the merged row: starts with A's text, continues with B's
+    const idx = rows.findIndex((r) => {
+        const nd = normText(r.description_raw);
+        if (!nd.startsWith(normA) || nd === normA) return false;
+        const rest = nd.slice(normA.length).trim();
+        return rest.startsWith(normB) || (rest.length >= MIN_MATCH_CHARS && normB.startsWith(rest));
+    });
+    if (idx < 0) return rows;
+
+    // locate B's opening words in the RAW description for a clean text cut
+    const merged = rows[idx];
+    const raw = merged.description_raw as string;
+    const bWords = B.text.trim().split(/\s+/).slice(0, 4).map((w) => w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+    const m = raw.match(new RegExp(bWords.join('\\s+'), 'i'));
+    if (!m || m.index == null || m.index === 0) return rows;
+
+    const soil = { ...merged, description_raw: raw.slice(m.index).trim(), [cfg.depthField]: B.depth };
+    // the soil part often opens with its printed USCS code — backfill the
+    // symbol field if extraction left it empty on the merged row
+    if (soil.uscs_symbol == null || soil.uscs_symbol === '') {
+        const um = (soil.description_raw as string).match(/^\(([A-Z]{2,3})\)/);
+        if (um) {
+            soil.uscs_symbol = um[1];
+            if ('uscs_source' in soil) soil.uscs_source = 'inline_parenthetical';
+        }
+    }
+    const out = [...rows];
+    if (standalone) {
+        out.splice(idx, 1, soil);
+        changes.push(`trimmed absorbed surface text: soil layer starts "${(soil.description_raw as string).slice(0, 30)}…" [${B.depth}]`);
+    } else {
+        const surfacing: Record<string, unknown> = {
+            ...rowTemplate(rows),
+            ...(cfg.eobField ? { [cfg.eobField]: false } : {}),
+            description_raw: raw.slice(0, m.index).trim(),
+            [cfg.depthField]: A.depth,
+        };
+        out.splice(idx, 1, surfacing, soil);
+        changes.push(`split absorbed surface layer: "${surfacing.description_raw}" [${A.depth}] / "${(soil.description_raw as string).slice(0, 30)}…" [${B.depth}]`);
+    }
+    return out;
+}
+
 // ── orchestration ───────────────────────────────────────────────────────────
 
 /**
@@ -534,10 +820,30 @@ export async function refineGroup(args: {
     const evidence = cfg.renderEvidence(geometry);
     if (!evidence) return { rows, report: { ...base, reason: 'no measured evidence for this group' } };
 
+    // ── samples: fully deterministic, no model call ──────────────────
+    if (group === 'samples_collected') {
+        try {
+            const { rows: corrected, changes } = correctSamplesDeterministically(rows, geometry);
+            if (changes.length === 0) return { rows, report: { ...base, status: 'no_ops' } };
+            console.log(`📐 depth refinement (${path}): deterministic — ${changes.join('; ')}`);
+            return { rows: corrected, report: { ...base, status: 'refined', ops_applied: changes.length, changes } };
+        } catch (err: any) {
+            console.warn(`⚠️ depth refinement (${path}): deterministic correction failed — keeping rows: ${err?.message}`);
+            return { rows, report: { ...base, status: 'error', reason: err?.message } };
+        }
+    }
+
+    // ── lithology: model fixes STRUCTURE, then code snaps the numbers ─
+    // The invariant gate runs ONCE, after the snap — never between the
+    // phases: a correct structure op (e.g. adding an absorbed surfacing row
+    // at the same top as the row it was split from) can legitimately tie
+    // tops that only the snap separates. Fallback ladder, each rung gated:
+    //   1. model structure ops + snap    2. snap only    3. original rows
     const model = args.model || DEFAULT_REFINER_MODEL;
     const itemSchema = schema ? resolveGroupItemSchema(schema, group) : null;
 
-    let ops: RefinementOp[];
+    let ops: RefinementOp[] = [];
+    let callError: string | null = null;
     try {
         const response = await openai.chat.completions.create({
             model,
@@ -549,35 +855,61 @@ export async function refineGroup(args: {
             response_format: buildOpsResponseFormat(cfg, itemSchema),
         });
         const content = response.choices?.[0]?.message?.content;
-        ops = (JSON.parse(content || '{}').ops || []) as RefinementOp[];
-        // per-op anyOf shapes omit unused fields — normalize for applyOps
-        ops = ops.map((o) => ({ row: null, rows: null, depth_ft: null, item: null, ...(o as Partial<RefinementOp>) } as RefinementOp));
+        ops = ((JSON.parse(content || '{}').ops || []) as RefinementOp[])
+            // per-op anyOf shapes omit unused fields — normalize for applyOps
+            .map((o) => ({ row: null, rows: null, depth_ft: null, item: null, ...(o as Partial<RefinementOp>) } as RefinementOp));
     } catch (err: any) {
-        console.warn(`⚠️ depth refinement (${path}): refiner call failed — keeping original rows: ${err?.message}`);
-        return { rows, report: { ...base, status: 'error', reason: err?.message, model } };
+        callError = err?.message || String(err);
+        console.warn(`⚠️ depth refinement (${path}): refiner call failed — snapping without structure ops: ${callError}`);
     }
 
-    if (ops.length === 0) {
-        return { rows, report: { ...base, status: 'no_ops', model } };
+    const snapAndGate = (input: Record<string, unknown>[]): { rows: Record<string, unknown>[]; changes: string[] } => {
+        const { rows: snapped, changes } = snapLithologyTops(input, geometry);
+        const final = finalizeIntervalOrder(cfg, snapped.map((row, i) => ({ orig: i, row })));
+        recomputeBottoms(cfg, final);
+        checkInvariants(group, input, final, []);
+        return { rows: final, changes };
+    };
+
+    // Rung 1: structure ops + snap
+    if (ops.length > 0) {
+        try {
+            const { rows: structured, changes: modelChanges } = applyOps(group, rows, ops);
+            const { rows: final, changes: snapChanges } = snapAndGate(structured);
+            const changes = [...modelChanges.map((c) => `model: ${c}`), ...snapChanges.map((c) => `snap: ${c}`)];
+            if (changes.length === 0) return { rows, report: { ...base, status: 'no_ops', model } };
+            console.log(`📐 depth refinement (${path}): ${changes.join('; ')}`);
+            return {
+                rows: final,
+                report: { ...base, status: 'refined', ops_proposed: ops.length, ops_applied: changes.length, changes, model },
+            };
+        } catch (err: any) {
+            console.warn(
+                `⚠️ depth refinement (${path}): structure+snap rejected (${err?.message}) — falling back to snap-only. ` +
+                `Proposed: ${JSON.stringify(ops)}`
+            );
+        }
     }
 
+    // Rung 2: snap only
     try {
-        const { rows: refined, changes } = applyOps(group, rows, ops);
-        checkInvariants(group, rows, refined, ops);
-        console.log(`📐 depth refinement (${path}): applied ${ops.length} op(s) — ${changes.join('; ')}`);
+        const { rows: final, changes: snapChanges } = snapAndGate(rows);
+        if (snapChanges.length === 0) {
+            return { rows, report: { ...base, status: 'no_ops', ops_proposed: ops.length, model, ...(callError ? { reason: callError } : {}) } };
+        }
+        const changes = snapChanges.map((c) => `snap: ${c}`);
+        console.log(`📐 depth refinement (${path}): ${changes.join('; ')}`);
         return {
-            rows: refined,
-            report: { ...base, status: 'refined', ops_proposed: ops.length, ops_applied: ops.length, changes, model },
+            rows: final,
+            report: {
+                ...base, status: 'refined', ops_proposed: ops.length, ops_applied: changes.length, changes, model,
+                ...(ops.length > 0 ? { reason: 'structure ops rejected; snap-only applied' } : {}),
+            },
         };
     } catch (err: any) {
-        console.warn(
-            `⚠️ depth refinement (${path}): ops rejected (${err?.message}) — keeping original rows. ` +
-            `Proposed: ${JSON.stringify(ops)}`
-        );
-        return {
-            rows,
-            report: { ...base, status: 'rejected', ops_proposed: ops.length, reason: err?.message, model },
-        };
+        // Rung 3: original rows
+        console.warn(`⚠️ depth refinement (${path}): snap rejected (${err?.message}) — keeping original rows`);
+        return { rows, report: { ...base, status: 'rejected', ops_proposed: ops.length, reason: err?.message, model } };
     }
 }
 
