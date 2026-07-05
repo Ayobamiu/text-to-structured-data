@@ -1041,7 +1041,8 @@ class FileProcessorWorker {
         // calibrated (no ruler, paddleocr fallback, words missing) the
         // geometry is simply absent and processing proceeds unchanged.
         if (depthGeometryEnabled && Array.isArray(extractionResult.ocrWords)) {
-            const geometry = recoverDepthGeometry(extractionResult.ocrWords);
+            const depthDiag = { totalPages: 0, calibratedPages: 0, pages: [] };
+            const geometry = recoverDepthGeometry(extractionResult.ocrWords, { diagnostics: depthDiag });
             if (geometry) {
                 extractionResult.depthGeometry = geometry;
                 console.log(
@@ -1051,7 +1052,25 @@ class FileProcessorWorker {
                     `across ${geometry.calibrated_pages} calibrated page(s)`
                 );
             } else {
-                console.log(`📐 Depth geometry enabled but nothing recoverable for ${file.filename} (no ruler found) — continuing without it`);
+                // Actionable fail-open trace: instead of a flat "no ruler found",
+                // report which assumption broke so a new format can be widened.
+                // (no_depth_header → header vocabulary; fit_rejected → elevation
+                // ruler or off-column band; no_ticks_in_band → tick interval.)
+                const pagesWithHeader = depthDiag.pages.filter((p) => p.depthHeaders.length > 0).length;
+                const reasonTally = depthDiag.pages
+                    .filter((p) => p.reason)
+                    .reduce((acc, p) => { acc[p.reason] = (acc[p.reason] || 0) + 1; return acc; }, {});
+                const reasons = Object.entries(reasonTally).map(([r, n]) => `${r}×${n}`).join(', ');
+                const sampleHeaders = [...new Set(
+                    depthDiag.pages.flatMap((p) => p.depthHeaders)
+                )].slice(0, 5);
+                console.log(
+                    `📐 Depth geometry enabled but nothing recoverable for ${file.filename} — ` +
+                    `${depthDiag.totalPages} page(s), ${pagesWithHeader} with a DEPTH heading, 0 calibrated` +
+                    `${reasons ? ` [${reasons}]` : ''}` +
+                    `${sampleHeaders.length ? ` heading(s) seen: ${sampleHeaders.map((h) => `"${h}"`).join(', ')}` : ''} ` +
+                    `— continuing without it`
+                );
             }
         }
 

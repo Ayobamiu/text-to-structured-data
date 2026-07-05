@@ -220,6 +220,105 @@ describe('recoverDepthGeometry', () => {
         // calibration unchanged → RS-1 still exactly 9.2
         expect(geo.samples[0].depth).toBe(9.2);
     });
+
+    // ── Step 1: robust anchor / band / fit verification ─────────────────────
+
+    it('anchors a multi-word / suffixed DEPTH heading (starts-with, not exact)', () => {
+        // "DEPTH(FT)" (or a fused "DEPTH IN FEET(ELEVATION)") no longer matches
+        // ^DEPTH$ but must still calibrate — leftmost DEPTH-ish word anchors the band.
+        const words = pilotPage1().map((w) =>
+            w.content === 'DEPTH' ? word('DEPTH(FT)', 1, 460, DEPTH_X) : w
+        );
+        const geo = recoverDepthGeometry(words)!;
+        expect(geo.calibrated_pages).toBe(1);
+        expect(geo.samples).toEqual([{ id: 'RS-1', depth: 9.2, page: 1 }]);
+    });
+
+    it('rejects an ELEVATION ruler (numbers decrease down the page → negative slope)', () => {
+        // 3-digit multiples of 5 that COUNT DOWN as Y increases: a low-elevation
+        // site ruler. isTick accepts them, but the fit slope is negative → reject.
+        const words = [
+            word('DEPTH', 1, 460, DEPTH_X), // heading present…
+            word('300', 1, 793, DEPTH_X),
+            word('295', 1, 1056, DEPTH_X),
+            word('290', 1, 1318, DEPTH_X),
+            word('RS-1', 1, 1015.74, TYPE_X),
+        ];
+        expect(recoverDepthGeometry(words)).toBeNull(); // …but no downward ruler → fail open
+    });
+
+    it('drops a single stray in-band number (outlier) and still fits the ruler', () => {
+        // a rogue multiple-of-5 dimension callout lands in the depth band at a Y
+        // that is off the ruler line; with ≥3 real ticks it is dropped, not fatal.
+        const words = [
+            ...pilotPage1(),
+            word('40', 1, 900, DEPTH_X), // way off the 5/10/15 line → outlier
+        ];
+        const geo = recoverDepthGeometry(words)!;
+        expect(geo.calibrated_pages).toBe(1);
+        expect(geo.samples).toEqual([{ id: 'RS-1', depth: 9.2, page: 1 }]); // unchanged
+    });
+
+    it('records an actionable per-page diagnostic on the fail-open path', () => {
+        const diag = { totalPages: 0, calibratedPages: 0, pages: [] as any[] };
+        // page 1: a heading but no ticks; page 2: no heading at all
+        const words = [
+            word('DEPTH', 1, 460, DEPTH_X),
+            word('SoilDescription', 1, 600, DESC_X),
+            word('hello', 2, 100, 50),
+        ];
+        expect(recoverDepthGeometry(words, { diagnostics: diag })).toBeNull();
+        expect(diag.totalPages).toBe(2);
+        expect(diag.calibratedPages).toBe(0);
+        expect(diag.pages.find((p) => p.page === 1)?.reason).toBe('no_ticks_in_band');
+        expect(diag.pages.find((p) => p.page === 1)?.depthHeaders).toEqual(['DEPTH']);
+        expect(diag.pages.find((p) => p.page === 2)?.reason).toBe('no_depth_header');
+    });
+
+    it('recovers a misspelled "DPETH" ruler and ignores a decoy FROM/TO DEPTH column', () => {
+        // Mirrors the real Lakeshore GP-1 page 7 (confirmed via OCR dump):
+        //  - the graphical ruler is headed "DPETH" (E/P transposition) at the far
+        //    left (xc 95), ticks 5/10/15 in its column (xc ~130);
+        //  - two decoy "DEPTH" (FROM/TO) headers sit far right (xc 700/775) whose
+        //    only in-band multiple-of-5 is a lone "20" → no clean ruler.
+        // Same ruler fit as the pilot (ticks at Y 793/1056/1318) → (CH) at 10.2.
+        const words = [
+            word('DPETH', 1, 629, 95),
+            word('(ELEVATION)', 1, 616, 130),
+            word('5', 1, 793, 130),
+            word('10', 1, 1056, 130),
+            word('15', 1, 1318, 130),
+            word('DEPTH', 1, 451, 700), // decoy FROM/TO header
+            word('DEPTH', 1, 559, 775), // decoy FROM/TO header
+            word('20', 1, 956, 775),    // lone FROM/TO value in the decoy band
+            word('(CH)', 1, 1068, DESC_X),
+        ];
+        const diag = { totalPages: 0, calibratedPages: 0, pages: [] as any[] };
+        const geo = recoverDepthGeometry(words, { diagnostics: diag })!;
+        expect(geo).not.toBeNull();
+        expect(geo.calibrated_pages).toBe(1);
+        expect(geo.contacts).toEqual([{ code: 'CH', top: 10.2, page: 1 }]);
+        // the DPETH column won the anchor contest with 3 ticks
+        expect(diag.pages[0].ticksUsed).toBe(3);
+    });
+
+    it('fails open when only the decoy FROM/TO DEPTH column is present (no real ruler)', () => {
+        const words = [
+            word('DEPTH', 1, 451, 700),
+            word('DEPTH', 1, 559, 775),
+            word('20', 1, 956, 775), // single non-ruler value
+            word('(CH)', 1, 1068, DESC_X),
+        ];
+        expect(recoverDepthGeometry(words)).toBeNull();
+    });
+
+    it('populates diagnostics on the success path too', () => {
+        const diag = { totalPages: 0, calibratedPages: 0, pages: [] as any[] };
+        recoverDepthGeometry(pilotPage1(), { diagnostics: diag });
+        expect(diag.calibratedPages).toBe(1);
+        expect(diag.pages[0].calibrated).toBe(true);
+        expect(diag.pages[0].ticksUsed).toBe(3);
+    });
 });
 
 // ── remapGeometryPages ──────────────────────────────────────────────────────

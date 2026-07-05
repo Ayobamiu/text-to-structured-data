@@ -76,6 +76,42 @@ export interface DepthGeometry {
     calibrated_pages: number;
 }
 
+/**
+ * Per-page trace of *why* a page did or didn't yield a calibrated ruler.
+ * Populated only when the caller passes a diagnostics sink — it turns the old
+ * ambiguous "nothing recoverable (no ruler found)" log into an actionable
+ * "found a DEPTH header but only 1 tick in the band" / "no DEPTH header at all",
+ * which is what tells us which vocabulary/geometry assumption a new format
+ * breaks (see DEPTH_GEOMETRY_HANDOFF.md open item #1/#2).
+ */
+export interface DepthPageDiagnostic {
+    page: number;
+    /** verbatim text of every word that matched the DEPTH heading (may be []) */
+    depthHeaders: string[];
+    /** multiples-of-5 numbers found inside the depth column band */
+    tickCandidates: number;
+    /** ticks that survived the ruler fit (0 if the fit was rejected) */
+    ticksUsed: number;
+    calibrated: boolean;
+    /** set when the page was not calibrated; one of the reasons below */
+    reason?:
+        | 'no_depth_header'
+        | 'no_ticks_in_band'
+        | 'single_tick_no_prior_slope'
+        | 'fit_rejected_not_downward_ruler';
+}
+
+export interface DepthDiagnostics {
+    totalPages: number;
+    calibratedPages: number;
+    pages: DepthPageDiagnostic[];
+}
+
+export interface RecoverOptions {
+    /** Optional out-object: filled with a per-page calibration trace. */
+    diagnostics?: DepthDiagnostics;
+}
+
 // Ruler tick labels: 1-3 digit multiples of 5 (5, 10, … 995). The x-band
 // around the DEPTH header is the real guard against grabbing other numbers.
 const TICK_RE = /^\d{1,3}$/;
@@ -108,9 +144,24 @@ const USCS_RE = /^\((GC|GP|GW|GM|SC|SP|SW|SM|CL|CH|ML|MH|OL|OH|PT|RK)\)[,.]?$/;
 // "(continued)" carryover label on a page break, not a new layer.
 const CONTINUED_WINDOW_PX = 25;
 
-// Column band half-widths around the located header words.
-const DEPTH_BAND_PX = 35;
+// Column band half-widths around the located header words. DEPTH is a touch
+// wider than the exact-pilot 35: a multi-word heading ("DEPTH IN FEET…") shifts
+// the anchor word's centre off the number column, so real ticks can sit a bit
+// further out. Widening is safe because the ruler fit (fitRuler) rejects any
+// stray number that widening lets in.
+const DEPTH_BAND_PX = 50;
 const TYPE_BAND_PX = 45;
+
+// Ruler-fit quality gates. After fitting depth = m*Y + b we verify the ticks
+// form a real DOWNWARD depth ruler:
+//   - slope must be positive (depth increases down the page). A non-positive
+//     slope means an ELEVATION ruler (numbers count DOWN the page) or noise —
+//     reject rather than emit inverted depths.
+//   - every tick must sit within TICK_FIT_TOLERANCE_FT of the fitted line; a
+//     single stray in-band number is dropped as an outlier while ≥3 ticks
+//     remain (2 points always fit a line exactly, so there's nothing to drop).
+const MIN_TICK_SLOPE_FT_PER_PX = 1e-4;
+const TICK_FIT_TOLERANCE_FT = 1.0;
 
 interface Word {
     t: string;
@@ -137,6 +188,73 @@ function fitTicks(ticks: Tick[]): { m: number; b: number } {
     const syd = ticks.reduce((a, t) => a + t.yc * t.d, 0);
     const m = (n * syd - sy * sd) / (n * syy - sy * sy);
     return { m, b: (sd - m * sy) / n };
+}
+
+/**
+ * Fit depth = m*Y + b over the tick candidates and verify the result is a real
+ * downward depth ruler (see MIN_TICK_SLOPE / TICK_FIT_TOLERANCE). Drops the
+ * worst-residual outlier while ≥3 ticks remain, so one stray in-band number
+ * (a dimension callout, an elevation label that happened to be ≤3 digits) can't
+ * poison an otherwise clean ruler. Returns null when no clean, positive-slope
+ * fit survives — the page then fails open (no calibration, today's behaviour).
+ */
+function fitRuler(cands: Tick[]): { m: number; b: number; ticks: Tick[] } | null {
+    let ticks = cands.slice();
+    while (ticks.length >= 2) {
+        const { m, b } = fitTicks(ticks);
+        let worst = -1;
+        let worstIdx = -1;
+        for (let i = 0; i < ticks.length; i++) {
+            const resid = Math.abs(m * ticks[i].yc + b - ticks[i].d);
+            if (resid > worst) { worst = resid; worstIdx = i; }
+        }
+        if (worst <= TICK_FIT_TOLERANCE_FT) {
+            // clean fit — accept only if it counts depth DOWN the page
+            return m >= MIN_TICK_SLOPE_FT_PER_PX ? { m, b, ticks } : null;
+        }
+        if (ticks.length <= 2) return null; // two points fit exactly; can't drop further
+        ticks = ticks.filter((_, i) => i !== worstIdx); // drop the stray, refit
+    }
+    return null;
+}
+
+/**
+ * Optimal string-alignment (Damerau-Levenshtein w/ adjacent transpositions)
+ * distance. Used only to forgive a single OCR slip in the DEPTH heading.
+ */
+function osaDistance(a: string, b: string): number {
+    const m = a.length;
+    const n = b.length;
+    const d: number[][] = Array.from({ length: m + 1 }, () => new Array(n + 1).fill(0));
+    for (let i = 0; i <= m; i++) d[i][0] = i;
+    for (let j = 0; j <= n; j++) d[0][j] = j;
+    for (let i = 1; i <= m; i++) {
+        for (let j = 1; j <= n; j++) {
+            const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+            d[i][j] = Math.min(d[i - 1][j] + 1, d[i][j - 1] + 1, d[i - 1][j - 1] + cost);
+            if (i > 1 && j > 1 && a[i - 1] === b[j - 2] && a[i - 2] === b[j - 1]) {
+                d[i][j] = Math.min(d[i][j], d[i - 2][j - 2] + 1); // adjacent transposition
+            }
+        }
+    }
+    return d[m][n];
+}
+
+/**
+ * Is this word the heading of a depth column? Matches "DEPTH…" and near-
+ * spellings one edit away — notably the "DPETH" (E/P transposition) seen on the
+ * Lakeshore soil-boring log, where the graphical ruler column is headed
+ * "DPETH IN FEET (ELEVATION)". Length-gated so it can't grab unrelated words,
+ * and a false match is harmless: the ruler fit rejects a column whose in-band
+ * numbers don't form a clean 5-ft ruler. Note this matches the RULER column AND
+ * any tabular FROM/TO "DEPTH" column — recoverDepthGeometry tries each anchor
+ * and keeps the one that actually fits, so decoy columns drop out.
+ */
+function isDepthHeader(t: string): boolean {
+    const s = t.toUpperCase().replace(/[^A-Z]/g, '');
+    if (s.startsWith('DEPTH')) return true;
+    if (s.length < 4 || s.length > 6) return false; // stay near DEPTH's length
+    return osaDistance(s.slice(0, 5), 'DEPTH') <= 1;
 }
 
 /**
@@ -225,7 +343,11 @@ export function isDepthGeometryEnabled(jobProcessingConfig: any): boolean {
  *
  * Returns null when nothing could be calibrated/recovered (fail open).
  */
-export function recoverDepthGeometry(ocrWords: OcrWord[] | null | undefined): DepthGeometry | null {
+export function recoverDepthGeometry(
+    ocrWords: OcrWord[] | null | undefined,
+    opts: RecoverOptions = {}
+): DepthGeometry | null {
+    const diag = opts.diagnostics;
     if (!Array.isArray(ocrWords) || ocrWords.length === 0) return null;
 
     const words: Word[] = [];
@@ -253,29 +375,66 @@ export function recoverDepthGeometry(ocrWords: OcrWord[] | null | undefined): De
 
     for (const page of pages) {
         const W = words.filter((w) => w.page === page);
-        const depthHdr = W.find((w) => /^DEPTH$/i.test(w.t));
+        // A log can carry MORE THAN ONE depth-labelled column — the graphical
+        // ruler AND a tabular FROM/TO "DEPTH" column (Lakeshore GP-1). Collect
+        // every depth-ish heading as a candidate x-anchor; the real ruler is the
+        // column whose in-band 5-ft ticks actually fit a downward line, so we
+        // try each and keep the best fit. Decoy columns yield no clean fit.
+        const depthHdrs = W.filter((w) => isDepthHeader(w.t));
         const typeHdr = W.find((w) => /^TYPE$/i.test(w.t));
-        if (!depthHdr) continue; // no ruler header on this page — skip
 
-        let ticks: Tick[] = W
-            .filter((w) => isTick(w.t) && Math.abs(w.xc - depthHdr.xc) <= DEPTH_BAND_PX)
-            .map((w) => ({ d: +w.t, yc: w.yc }))
-            .sort((a, b) => a.yc - b.yc);
-        const seen = new Set<number>();
-        ticks = ticks.filter((t) => !seen.has(t.d) && !!seen.add(t.d));
+        const pd: DepthPageDiagnostic | null = diag
+            ? { page, depthHeaders: depthHdrs.map((h) => h.t), tickCandidates: 0, ticksUsed: 0, calibrated: false }
+            : null;
+        if (pd && diag) diag.pages.push(pd);
+
+        if (depthHdrs.length === 0) {
+            if (pd) pd.reason = 'no_depth_header';
+            continue; // no ruler header on this page — skip
+        }
+
+        let best: { m: number; b: number; ticks: number } | null = null;
+        let maxCandidates = 0;
+        let singleTick: Tick | null = null;
+        for (const anchorXc of [...new Set(depthHdrs.map((h) => h.xc))]) {
+            let ticks: Tick[] = W
+                .filter((w) => isTick(w.t) && Math.abs(w.xc - anchorXc) <= DEPTH_BAND_PX)
+                .map((w) => ({ d: +w.t, yc: w.yc }))
+                .sort((a, b) => a.yc - b.yc);
+            const seen = new Set<number>();
+            ticks = ticks.filter((t) => !seen.has(t.d) && !!seen.add(t.d));
+            if (ticks.length > maxCandidates) maxCandidates = ticks.length;
+
+            if (ticks.length >= 2) {
+                const fit = fitRuler(ticks);
+                if (fit && (!best || fit.ticks.length > best.ticks)) {
+                    best = { m: fit.m, b: fit.b, ticks: fit.ticks.length };
+                }
+            } else if (ticks.length === 1 && !singleTick) {
+                singleTick = ticks[0]; // remember for the slope-reuse fallback
+            }
+        }
+        if (pd) pd.tickCandidates = maxCandidates;
 
         let cal: { m: number; b: number };
-        if (ticks.length >= 2) {
-            cal = fitTicks(ticks);
-            if (globalSlope == null) cal && (globalSlope = cal.m);
-        } else if (ticks.length === 1 && globalSlope != null) {
+        if (best) {
+            cal = { m: best.m, b: best.b };
+            if (pd) pd.ticksUsed = best.ticks;
+            if (globalSlope == null) globalSlope = best.m;
+        } else if (singleTick && globalSlope != null) {
             // Continuation page with a single visible tick: reuse the slope
             // (ft-per-pixel is constant across pages of the same log).
-            cal = { m: globalSlope, b: ticks[0].d - globalSlope * ticks[0].yc };
+            cal = { m: globalSlope, b: singleTick.d - globalSlope * singleTick.yc };
+            if (pd) pd.ticksUsed = 1;
         } else {
+            if (pd) pd.reason =
+                maxCandidates === 0 ? 'no_ticks_in_band'
+                    : maxCandidates === 1 ? 'single_tick_no_prior_slope'
+                        : 'fit_rejected_not_downward_ruler';
             continue; // can't calibrate this page — skip
         }
         calibratedPages++;
+        if (pd) pd.calibrated = true;
         const depthAt = (y: number): number => +(cal.m * y + cal.b).toFixed(1);
 
         // Sample/test depths: sample-id words inside the TYPE column band.
@@ -318,6 +477,11 @@ export function recoverDepthGeometry(ocrWords: OcrWord[] | null | undefined): De
         seenText.set(key, l.page);
         return l.depth >= MIN_LINE_DEPTH_FT;
     });
+
+    if (diag) {
+        diag.totalPages = pages.length;
+        diag.calibratedPages = calibratedPages;
+    }
 
     if (calibratedPages === 0 || (samples.length === 0 && cleanLines.length === 0 && contacts.length === 0)) {
         return null; // fail open
