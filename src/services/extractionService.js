@@ -382,7 +382,8 @@ class ExtractionService {
             const result = await this.extendAIService.extractFromS3(
                 finalS3Key,
                 filename,
-                (key, expiresIn) => this.s3Service.generateSignedUrl(key, expiresIn)
+                (key, expiresIn) => this.s3Service.generateSignedUrl(key, expiresIn),
+                { returnOcrWords: options.returnOcrWords === true }
             );
 
             // Clean up temporary filtered PDF if it was created

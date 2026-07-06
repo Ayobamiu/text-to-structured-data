@@ -39,6 +39,8 @@
 
 import { v4 as uuidv4 } from 'uuid';
 import { getActiveSchema as defaultGetActiveSchema } from './schemaRegistry.js';
+import { remapGeometryPages, filterGeometryPages } from './depthGeometryService.ts';
+import { refineExtractionData } from './depthRefinementService.ts';
 
 const DEFAULT_MAX_CONCURRENCY = 6;
 
@@ -57,6 +59,11 @@ const DEFAULT_MAX_CONCURRENCY = 6;
  *                                            schemaRegistry export. Override
  *                                            in tests so we can drive the
  *                                            orchestrator without a DB.
+ * @param {Object|null} [args.depthGeometry]  Recovered depth geometry
+ *                                            (depthGeometryService), in the
+ *                                            extraction result's page space;
+ *                                            injected per section as a prompt
+ *                                            appendix scoped to its pages.
  *
  * @returns {Promise<{
  *   resultEnvelope: Record<string, Array<Object>>,
@@ -85,6 +92,7 @@ export async function extractAndProcessPerSection({
     getActiveSchema = defaultGetActiveSchema,
     selectedPages = null,
     onSectionComplete = null,
+    depthGeometry = null,
 }) {
     if (!detectedSections || !Array.isArray(detectedSections.sections)) {
         throw new Error('extractAndProcessPerSection: detectedSections.sections must be an array');
@@ -124,6 +132,14 @@ export async function extractAndProcessPerSection({
         pageTextMap.set(key, txt);
     }
 
+    // Depth geometry arrives in the extraction result's own page numbering
+    // (sequential 1..N when extraction was page-filtered). Remap to original
+    // PDF page numbers — the same remap pageTextMap applies above — so it can
+    // be scoped by each section's extraction_pages.
+    const depthGeometryByOriginalPage = depthGeometry
+        ? remapGeometryPages(depthGeometry, selectedPages)
+        : null;
+
     // Resolve schemas in advance and only once per distinct slug. The
     // registry caches internally too, but local memoization avoids
     // duplicate cache lookups for multi-instance same-slug docs.
@@ -153,6 +169,7 @@ export async function extractAndProcessPerSection({
                 processingService,
                 processingMethod,
                 processingOptions,
+                depthGeometry: depthGeometryByOriginalPage,
             });
             // Fire the per-section progress callback as each finishes (sections
             // run concurrently, so this is completion order, not section order).
@@ -244,6 +261,7 @@ async function runSection({
     processingService,
     processingMethod,
     processingOptions,
+    depthGeometry = null,
 }) {
     const slug = section.document_type_slug;
     const pageRange = Array.isArray(section.page_range) && section.page_range.length === 2
@@ -277,7 +295,7 @@ async function runSection({
         };
     }
 
-    const contentForAI = section.extraction_pages
+    let contentForAI = section.extraction_pages
         .map((p) => pageTextMap.get(p) || '')
         .filter((t) => t.trim().length > 0)
         .join('\n\n');
@@ -506,6 +524,25 @@ async function runSection({
         console.warn(`⚠️ Section ${index} (${slug}): ${completenessWarning}`);
     }
 
+    // ── Depth refinement ──────────────────────────────────────────────
+    // Reconcile the extracted rows with the measured depth geometry in a
+    // focused second pass, scoped to this section's pages (geometry is in
+    // original PDF page numbers here, same space as extraction_pages).
+    // Mutates aiResult.data in place; fails open per group.
+    let depthRefinementReports = null;
+    if (depthGeometry) {
+        try {
+            depthRefinementReports = await refineExtractionData({
+                data: aiResult.data,
+                geometry: filterGeometryPages(depthGeometry, section.extraction_pages),
+                schema: schemaInfo,
+                model: processingOptions?.model,
+            });
+        } catch (err) {
+            console.warn(`⚠️ Section ${index} (${slug}): depth refinement failed — keeping extracted rows: ${err.message}`);
+        }
+    }
+
     return {
         ...baseMeta,
         status: 'success',
@@ -514,6 +551,7 @@ async function runSection({
         data: aiResult.data,
         schema_version: schemaInfo.version,
         schema_id: schemaInfo.schemaId,
+        ...(depthRefinementReports?.length ? { depth_refinement: depthRefinementReports } : {}),
         completeness: {
             emitted: emittedRows,
             estimated: estimatedRows,
