@@ -69,6 +69,65 @@ LEFT JOIN record_geocodes g ON g.section_result_id = typed.record->>'section_res
 WHERE typed.eff_slug = $2
 ORDER BY typed.created_at DESC, typed.file_id, typed.idx`;
 
+// ── Wellogic tab ─────────────────────────────────────────────────────────────
+// A flat, one-row-per-well sheet matching the REAL Michigan Wellogic Wells export
+// (…/EGLE/DwOpenData/MapServer/3) column-for-column, so it's drop-in for the ArcGIS
+// symbology/templates Khalid already uses. This is how Wellogic answers "one sheet":
+// one mappable row per well with X/Y up front — the subsurface is SUMMARIZED into
+// columns, not listed as intervals. We populate every field we can map today; the
+// aquifer/hydraulic summary (AQ_*, H_COND_*, TRANSMSV_*, TOPAQ/BOTAQ — from the
+// aquifer_test type) and array-derived SWL/ROCK_TOP are left blank for a follow-up.
+const WELLOGIC_HEADERS = [
+    'X', 'Y', 'OBJECTID', 'WELLID', 'COUNTY', 'PERMIT_NUM', 'TOWNSHIP', 'TOWN', 'RANGE', 'SECTION',
+    'OWNER_NAME', 'WELL_ADDR', 'WELL_CITY', 'WELL_ZIP', 'WELL_DEPTH', 'WELL_TYPE', 'TYPE_OTHER',
+    'WEL_STATUS', 'STATUS_OTH', 'WSSN', 'WELL_NUM', 'DRILLER_ID', 'DRILL_METH', 'METH_OTHER',
+    'CONST_DATE', 'CASE_TYPE', 'CASE_OTHER', 'CASE_DIA', 'CASE_DEPTH', 'SCREEN_FRM', 'SCREEN_TO',
+    'SWL', 'FLOWING', 'AQ_TYPE', 'TEST_DEPTH', 'TEST_HOURS', 'TEST_RATE', 'TEST_METHD', 'TEST_OTHER',
+    'GROUT', 'PMP_CPCITY', 'LATITUDE', 'LONGITUDE', 'METHD_COLL', 'ELEVATION', 'ELEV_METHD',
+    'WITHIN_CO', 'WITHIN_SEC', 'LOC_MATCH', 'SEC_DIST', 'ELEV_DEM', 'ELEV_DIF', 'LANDSYS',
+    'DEPTH_FLAG', 'ELEV_FLAG', 'SWL_FLAG', 'SPC_CPCITY', 'AQ_CODE', 'ROCK_TOP', 'AQ_THK_1', 'AQ_THK_2',
+    'AQ_THK_D', 'H_COND_1', 'H_COND_2', 'V_COND_1', 'V_COND_2', 'TRANSMSV_1', 'TRANSMSV_2', 'B_AQ_THK',
+    'B_H_COND', 'B_V_COND', 'B_TRANS', 'AQ_THICK_D', 'H_COND_D', 'V_COND_D', 'TRANS_D', 'AQ_FLAG',
+    'SCRN_FLAG', 'NOTES', 'WELLCODE', 'TOPAQ', 'BOTAQ', 'WWAT_ID',
+];
+const WELLOGIC_COLUMNS = WELLOGIC_HEADERS.map((h) => ({ header: h, key: h.toLowerCase() }));
+
+// X/Y = EPSG:3857 (Web Mercator) computed from lat/long so the sheet plots directly,
+// exactly like the Wellogic export. WELLID = section_result_id (unique join key);
+// the human boring label goes in WELL_NUM. Unmapped Wellogic columns stay blank.
+const WELLOGIC_SQL = `${RECORD_EXPAND_CTE}
+SELECT
+    g.longitude * 6378137.0 * pi() / 180.0                                        AS x,
+    CASE WHEN g.latitude IS NOT NULL
+         THEN 6378137.0 * ln(tan(pi()/4 + radians(g.latitude)/2)) END              AS y,
+    typed.record->>'section_result_id'                                            AS wellid,
+    COALESCE(NULLIF(record->'site_identification'->>'county',''), g.geocoded_county) AS county,
+    record->'well_construction'->>'permit_number'                                 AS permit_num,
+    g.geocoded_township                                                           AS township,
+    record->'site_identification'->>'township'                                    AS town,
+    record->'site_identification'->>'range'                                       AS range,
+    record->'site_identification'->>'section'                                     AS section,
+    record->'site_identification'->>'site_address'                               AS well_addr,
+    g.geocoded_city                                                              AS well_city,
+    g.geocoded_postal_code                                                       AS well_zip,
+    record->'drilling_and_personnel'->>'total_depth_ft'                          AS well_depth,
+    record->'document_metadata'->'document_type'->>0                             AS well_type,
+    record->'site_identification'->>'boring_well_id'                             AS well_num,
+    record->'drilling_and_personnel'->>'drilling_method'                         AS drill_meth,
+    record->'document_metadata'->>'log_date'                                     AS const_date,
+    record->'well_construction'->>'casing_diameter_in'                           AS case_dia,
+    record->'well_construction'->>'casing_to_ft'                                 AS case_depth,
+    record->'well_construction'->>'screen_from_ft'                              AS screen_frm,
+    record->'well_construction'->>'screen_to_ft'                                AS screen_to,
+    record->'well_construction'->>'grout_type'                                  AS grout,
+    g.latitude, g.longitude,
+    g.strategy                                                                   AS methd_coll,
+    record->'site_identification'->>'ground_elevation_ft'                        AS elevation
+FROM typed
+LEFT JOIN record_geocodes g ON g.section_result_id = typed.record->>'section_result_id'
+WHERE typed.eff_slug = $2
+ORDER BY typed.created_at DESC, typed.file_id, typed.idx`;
+
 // ── Interval tabs (one row per array element, linked by WELLID) ───────────────
 interface IntervalCol { header: string; key: string; json: string; jsonb?: boolean }
 interface IntervalTab { sheet: string; arrayKey: string; cols: IntervalCol[] }
@@ -133,15 +192,17 @@ ORDER BY typed.created_at DESC, typed.file_id, typed.idx, x.ord`;
 }
 
 export interface WellogicData {
+    wellogic: Record<string, unknown>[];
     wells: Record<string, unknown>[];
     tabs: { sheet: string; columns: { header: string; key: string }[]; rows: Record<string, unknown>[] }[];
 }
 
-/** Run the SQL reshape for a preview + slug (Wells + each interval tab). */
+/** Run the SQL reshape for a preview + slug (Wellogic flat sheet + Wells + interval tabs). */
 export async function getWellogicExportData(itemIds: string[], slug: string): Promise<WellogicData> {
-    if (!itemIds || itemIds.length === 0) return { wells: [], tabs: [] };
+    if (!itemIds || itemIds.length === 0) return { wellogic: [], wells: [], tabs: [] };
     const client = await pool.connect();
     try {
+        const wellogic = await client.query(WELLOGIC_SQL, [itemIds, slug]);
         const wells = await client.query(WELLS_SQL, [itemIds, slug]);
         const tabs = [];
         for (const tab of INTERVAL_TABS) {
@@ -152,7 +213,7 @@ export async function getWellogicExportData(itemIds: string[], slug: string): Pr
                 : res.rows;
             tabs.push({ sheet: tab.sheet, columns: tab.cols.map((c) => ({ header: c.header, key: c.key })), rows });
         }
-        return { wells: wells.rows, tabs };
+        return { wellogic: wellogic.rows, wells: wells.rows, tabs };
     } finally {
         client.release();
     }
@@ -161,6 +222,13 @@ export async function getWellogicExportData(itemIds: string[], slug: string): Pr
 /** Build the multi-tab workbook and stream it to a writable (the HTTP response). */
 export async function writeWellogicWorkbook(data: WellogicData, stream: Writable): Promise<void> {
     const wb = new ExcelJS.stream.xlsx.WorkbookWriter({ stream });
+
+    // Wellogic flat sheet first — the drop-in, one-row-per-well ArcGIS layer.
+    const wellogic = wb.addWorksheet('Wellogic');
+    wellogic.columns = WELLOGIC_COLUMNS;
+    wellogic.getRow(1).font = { bold: true };
+    for (const row of data.wellogic) wellogic.addRow(row).commit();
+    wellogic.commit();
 
     const wells = wb.addWorksheet('Wells');
     wells.columns = WELL_COLUMNS;
