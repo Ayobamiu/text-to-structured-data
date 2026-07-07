@@ -122,7 +122,18 @@ SELECT
     record->'well_construction'->>'grout_type'                                  AS grout,
     g.latitude, g.longitude,
     g.strategy                                                                   AS methd_coll,
-    record->'site_identification'->>'ground_elevation_ft'                        AS elevation
+    record->'site_identification'->>'ground_elevation_ft'                        AS elevation,
+    -- SWL: the static-water-level groundwater observation's depth (below surface).
+    (SELECT (array_agg(gw->>'depth_ft') FILTER (WHERE gw->>'observation_type' = 'static_level'))[1]
+       FROM jsonb_array_elements(CASE WHEN jsonb_typeof(record->'groundwater_observations') = 'array'
+                                      THEN record->'groundwater_observations' ELSE '[]'::jsonb END) gw) AS swl,
+    -- ROCK_TOP: shallowest lithology interval whose material is bedrock.
+    (SELECT min((li->>'depth_from_ft')::numeric)
+       FROM jsonb_array_elements(CASE WHEN jsonb_typeof(record->'lithology_intervals') = 'array'
+                                      THEN record->'lithology_intervals' ELSE '[]'::jsonb END) li
+      WHERE li->>'depth_from_ft' ~ '^[0-9]+(\\.[0-9]+)?$'
+        AND lower(li->>'primary_material') IN
+            ('rock','bedrock','sandstone','limestone','shale','dolomite','siltstone','granite','gneiss','schist','basalt')) AS rock_top
 FROM typed
 LEFT JOIN record_geocodes g ON g.section_result_id = typed.record->>'section_result_id'
 WHERE typed.eff_slug = $2
