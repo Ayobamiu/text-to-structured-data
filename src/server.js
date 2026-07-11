@@ -2802,9 +2802,60 @@ app.post("/files/:id/sections/save-and-reextract", authenticateToken, async (req
         await updateFileDetectedSections(fileId, newDetectedSections);
 
         if (sectionIndices.length === 0) {
-            // No extraction needed — just save and return
-            emitDetectedSectionsUpdate(file, newDetectedSections);
-            return res.json({ status: 'success', detected_sections: newDetectedSections });
+            // No extraction needed — but the save may have REMOVED sections
+            // (delete action), so reconcile before returning: the envelope must
+            // mirror the sections array, and verification/QA rows keyed to
+            // dropped section_result_ids must not linger (they skew per-file
+            // review counts and the review_status rollup).
+            let rebuiltResult;
+            // Only id-addressable envelopes can be reconciled (legacy results
+            // have no section_result_id on their records — leave those alone).
+            const recordById = new Map();
+            for (const arr of Object.values(file.result || {})) {
+                if (!Array.isArray(arr)) continue;
+                for (const rec of arr) {
+                    if (rec?.section_result_id) recordById.set(rec.section_result_id, rec);
+                }
+            }
+            if (recordById.size > 0) {
+                const currentIds = newDetectedSections.sections
+                    .map(s => s.section_result_id)
+                    .filter(Boolean);
+                const rebuilt = {};
+                for (const section of newDetectedSections.sections) {
+                    const slug = section.document_type_slug;
+                    const rec = section.section_result_id
+                        ? recordById.get(section.section_result_id)
+                        : null;
+                    if (!slug || !rec) continue;
+                    if (!rebuilt[slug]) rebuilt[slug] = [];
+                    rebuilt[slug].push(rec);
+                }
+                if (JSON.stringify(rebuilt) !== JSON.stringify(file.result || {})) {
+                    await pool.query(
+                        `UPDATE job_files SET result = $1, updated_at = NOW() WHERE id = $2`,
+                        [rebuilt, fileId]
+                    );
+                    rebuiltResult = rebuilt;
+                }
+
+                await cleanupOrphanSectionRows(fileId, currentIds);
+                const reviewStatus = await recomputeFileReviewStatus(fileId);
+                emitFilePatch(file.job_id, fileId, {
+                    detected_sections: newDetectedSections,
+                    ...(rebuiltResult !== undefined ? { result: rebuiltResult } : {}),
+                });
+                // Refresh derived list-row fields (record_count,
+                // section_review_counts, review_status) on the files table.
+                await emitFileFullPatch(file.job_id, fileId, { review_status: reviewStatus });
+            } else {
+                emitDetectedSectionsUpdate(file, newDetectedSections);
+            }
+            return res.json({
+                status: 'success',
+                detected_sections: newDetectedSections,
+                ...(rebuiltResult !== undefined ? { result: rebuiltResult } : {}),
+            });
         }
 
         // Load pages for extraction
@@ -3034,11 +3085,23 @@ app.post("/files/:id/sections/save-and-reextract", authenticateToken, async (req
             perSection.totalAiTimeSeconds || null
         );
 
+        // Sections deleted, or re-extracted under a new section_result_id,
+        // leave verification/QA rows keyed to the old id — drop those and
+        // refresh the file-level review rollup.
+        await cleanupOrphanSectionRows(
+            fileId,
+            finalDetectedSections.sections.map(s => s.section_result_id).filter(Boolean)
+        );
+        const reviewStatus = await recomputeFileReviewStatus(fileId);
+
         emitFilePatch(file.job_id, fileId, {
             processing_status: 'completed',
             result: mergedResult,
             detected_sections: finalDetectedSections,
+            review_status: reviewStatus,
         });
+        // Refresh derived list-row fields (record_count, section_review_counts)
+        await emitFileFullPatch(file.job_id, fileId, { review_status: reviewStatus });
 
         console.log(
             `✅ Save & re-extract completed for file ${file.filename}: ` +
@@ -3256,12 +3319,24 @@ app.post("/files/:id/reextract-sections", authenticateToken, async (req, res) =>
             perSection.totalAiTimeSeconds || null
         );
 
+        // Re-extracted sections get a new section_result_id; drop
+        // verification/QA rows keyed to the replaced ids and refresh the
+        // file-level review rollup.
+        await cleanupOrphanSectionRows(
+            fileId,
+            updatedDetectedSections.sections.map(s => s.section_result_id).filter(Boolean)
+        );
+        const reviewStatus = await recomputeFileReviewStatus(fileId);
+
         // Emit completion
         emitFilePatch(file.job_id, fileId, {
             processing_status: 'completed',
             result: mergedResult,
             detected_sections: updatedDetectedSections,
+            review_status: reviewStatus,
         });
+        // Refresh derived list-row fields (record_count, section_review_counts)
+        await emitFileFullPatch(file.job_id, fileId, { review_status: reviewStatus });
 
         console.log(
             `✅ Re-extraction completed for file ${file.filename}: ` +
@@ -3812,6 +3887,65 @@ app.patch("/files/:id/qa-findings/:findingId", authenticateToken, async (req, re
 
 // ── Section-level verification ───────────────────────────────────
 
+/**
+ * Recompute a file's review_status from its section_verifications rows,
+ * compared against the total sections in the result envelope (sections never
+ * verified have no row). Persists and returns the new status.
+ */
+async function recomputeFileReviewStatus(fileId, client = pool) {
+    const [verRows, totalRow] = await Promise.all([
+        client.query(`SELECT status FROM section_verifications WHERE file_id = $1`, [fileId]),
+        client.query(
+            `SELECT COALESCE(SUM(jsonb_array_length(v)), 0)::int AS total
+             FROM job_files, jsonb_each(result) AS kv(k, v)
+             WHERE id = $1 AND jsonb_typeof(result) = 'object'`,
+            [fileId]
+        ),
+    ]);
+    const statuses = verRows.rows.map(r => r.status);
+    const totalSections = totalRow.rows[0]?.total ?? 0;
+    let fileReviewStatus = 'pending';
+    if (statuses.length > 0) {
+        if (statuses.every(s => s === 'approved') && statuses.length >= totalSections) {
+            fileReviewStatus = 'approved';
+        } else if (statuses.some(s => s === 'rejected')) {
+            fileReviewStatus = 'rejected';
+        } else if (statuses.some(s => s === 'approved' || s === 'in_review')) {
+            fileReviewStatus = 'in_review';
+        }
+    }
+    await client.query(
+        `UPDATE job_files SET review_status = $1, updated_at = NOW() WHERE id = $2`,
+        [fileReviewStatus, fileId]
+    );
+    return fileReviewStatus;
+}
+
+/**
+ * Delete verification / QA rows keyed to section_result_ids that no longer
+ * exist on the file (section deleted or re-extracted under a new id).
+ * Without this, stale rows skew per-file review counts and the
+ * review_status rollup. `currentIds` is the set of section_result_ids still
+ * live on the file; an empty set removes all rows for the file.
+ */
+async function cleanupOrphanSectionRows(fileId, currentIds) {
+    const ids = (currentIds || []).filter(Boolean);
+    const where = `file_id = $1 AND NOT (section_result_id = ANY($2::uuid[]))`;
+    const [ver, runs, findings] = await Promise.all([
+        pool.query(`DELETE FROM section_verifications WHERE ${where}`, [fileId, ids]),
+        pool.query(`DELETE FROM section_qa_runs WHERE ${where}`, [fileId, ids]),
+        pool.query(`DELETE FROM section_qa_findings WHERE ${where}`, [fileId, ids]),
+    ]);
+    const removed = (ver.rowCount || 0) + (runs.rowCount || 0) + (findings.rowCount || 0);
+    if (removed > 0) {
+        console.log(
+            `🧹 Removed ${ver.rowCount} verification / ${runs.rowCount} QA-run / ` +
+            `${findings.rowCount} QA-finding row(s) orphaned on file ${fileId}`
+        );
+    }
+    return removed;
+}
+
 // GET  /files/:id/section-verifications
 // Returns all verification rows for a file, keyed by section_result_id.
 app.get("/files/:id/section-verifications", authenticateToken, async (req, res) => {
@@ -3856,32 +3990,7 @@ app.put("/files/:id/section-verifications/:sectionResultId", authenticateToken, 
         );
 
         // Recompute file-level review_status from section verifications
-        // Must compare against total sections in result, not just verification rows
-        const [verRows, totalRow] = await Promise.all([
-            pool.query(`SELECT status FROM section_verifications WHERE file_id = $1`, [fileId]),
-            pool.query(
-                `SELECT COALESCE(SUM(jsonb_array_length(v)), 0)::int AS total
-                 FROM job_files, jsonb_each(result) AS kv(k, v)
-                 WHERE id = $1 AND jsonb_typeof(result) = 'object'`,
-                [fileId]
-            ),
-        ]);
-        const statuses = verRows.rows.map(r => r.status);
-        const totalSections = totalRow.rows[0]?.total ?? 0;
-        let fileReviewStatus = 'pending';
-        if (statuses.length > 0) {
-            if (statuses.every(s => s === 'approved') && statuses.length >= totalSections) {
-                fileReviewStatus = 'approved';
-            } else if (statuses.some(s => s === 'rejected')) {
-                fileReviewStatus = 'rejected';
-            } else if (statuses.some(s => s === 'approved' || s === 'in_review')) {
-                fileReviewStatus = 'in_review';
-            }
-        }
-        await pool.query(
-            `UPDATE job_files SET review_status = $1, updated_at = NOW() WHERE id = $2`,
-            [fileReviewStatus, fileId]
-        );
+        const fileReviewStatus = await recomputeFileReviewStatus(fileId);
 
         res.json({
             status: "success",
@@ -3922,33 +4031,8 @@ app.put("/files/:id/section-verifications-bulk", authenticateToken, async (req, 
                 );
             }
 
-            // Recompute file-level review_status
-            // Must compare against total sections in result, not just verification rows
-            const [verRows, totalRow] = await Promise.all([
-                client.query(`SELECT status FROM section_verifications WHERE file_id = $1`, [fileId]),
-                client.query(
-                    `SELECT COALESCE(SUM(jsonb_array_length(v)), 0)::int AS total
-                     FROM job_files, jsonb_each(result) AS kv(k, v)
-                     WHERE id = $1 AND jsonb_typeof(result) = 'object'`,
-                    [fileId]
-                ),
-            ]);
-            const statuses = verRows.rows.map(r => r.status);
-            const totalSections = totalRow.rows[0]?.total ?? 0;
-            let fileReviewStatus = 'pending';
-            if (statuses.length > 0) {
-                if (statuses.every(s => s === 'approved') && statuses.length >= totalSections) {
-                    fileReviewStatus = 'approved';
-                } else if (statuses.some(s => s === 'rejected')) {
-                    fileReviewStatus = 'rejected';
-                } else if (statuses.some(s => s === 'approved' || s === 'in_review')) {
-                    fileReviewStatus = 'in_review';
-                }
-            }
-            await client.query(
-                `UPDATE job_files SET review_status = $1, updated_at = NOW() WHERE id = $2`,
-                [fileReviewStatus, fileId]
-            );
+            // Recompute file-level review_status (inside the transaction)
+            const fileReviewStatus = await recomputeFileReviewStatus(fileId, client);
 
             await client.query('COMMIT');
 
