@@ -1,10 +1,11 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import {
     applyOps,
     checkInvariants,
     findGroupItemSchema,
     correctSamplesDeterministically,
     snapLithologyTops,
+    dropEvidenceContradictingMerges,
     type RefinementOp,
 } from '../depthRefinementService.ts';
 import type { DepthGeometry } from '../depthGeometryService.ts';
@@ -470,5 +471,133 @@ describe('snapLithologyTops — messy-baseline hardening (live run findings)', (
         ];
         const { rows: out } = snapLithologyTops(rows, pilotGeometry);
         expect(out.filter((r) => r.uscs_symbol === null && r.eob !== true)).toHaveLength(1);
+    });
+});
+
+// ── stated-depth lock (Lakeshore GP-1 live finding, 2026-07-05) ─────────────
+// This format's descriptions open with explicit intervals ("0-1'", "1-10'"),
+// which the baseline extraction already read exactly; measured description
+// lines overshoot the drawn contact by ~0.6-0.9 ft (text sits below it).
+// Without the lock, refinement REGRESSED an already-correct result.
+
+const lakeshoreGeometry: DepthGeometry = {
+    samples: [],
+    lithologyLines: [
+        { text: '0-1 SURFACE GRAVEL FILL', depth: 0, page: 1 },
+        { text: "1-10' PRE-EXISTING SAND DISTURBED", depth: 1.6, page: 1 },
+        { text: 'SAND', depth: 10.8, page: 1 }, // too short to ever match
+        { text: 'LIGHT BROWN FINE SAND, MINOR COARSE', depth: 18, page: 1 },
+        { text: "E.O.B. @25' (IN SAME)", depth: 25.9, page: 1 },
+    ],
+    contacts: [],
+    calibrated_pages: 1,
+};
+
+const lakeshoreRows = () => [
+    { depth_from_ft: 0, depth_to_ft: 1, description_raw: "0-1' SURFACE GRAVEL FILL", eob: false },
+    { depth_from_ft: 1, depth_to_ft: 10, description_raw: "1-10' PRE-EXISTING SAND DISTURBED DURING UST REMOVAL AND TEST PIT EXCAVATION", eob: false },
+    { depth_from_ft: 10, depth_to_ft: 20, description_raw: 'SAND', eob: false },
+    { depth_from_ft: 20, depth_to_ft: 24, description_raw: "LIGHT BROWN FINE SAND, MINOR COARSE SAND & TRACE FINE GRAVEL. MOIST, LOOSE, NO ODORS OR STAINS. NOTICEABLY MORE MED. & COARSE SAND 21.5'-24'", eob: false },
+    { depth_from_ft: 24, depth_to_ft: 25, description_raw: "E.O.B. @25' (IN SAME)", eob: true },
+];
+
+describe('snapLithologyTops — stated-depth lock', () => {
+    it('locks leading "X-Y\'" rows, snaps unlocked rows, stated EOB wins past the old ±0.5 gate', () => {
+        const { rows: out, changes } = snapLithologyTops(lakeshoreRows(), lakeshoreGeometry);
+        expect(out.map((r) => r.depth_from_ft)).toEqual([0, 1, 10, 18, 25]);
+        // row 1 matched its overshooting evidence line (1.6) but must NOT snap
+        expect(changes.some((c) => c.includes('→ 1.6'))).toBe(false);
+        // light-brown row's only range is MID-text ("…21.5'-24'") → not locked
+        // → measured snap 20 → 18 fires (the one genuine correction)
+        expect(changes.some((c) => c.startsWith('snap top row 3: 20 → 18'))).toBe(true);
+        // stated "@25'" beats measured 25.9 (|0.9| > the old 0.5 tolerance)
+        expect(changes.some((c) => c.includes('stated EOB depth: 25.9 → 25'))).toBe(true);
+    });
+
+    it('undoes a model set_top that moved a stated row', () => {
+        const rows = lakeshoreRows();
+        rows[1].depth_from_ft = 1.6; // simulate the observed set_top 1 → 1.6
+        const { rows: out, changes } = snapLithologyTops(rows, lakeshoreGeometry);
+        expect(out[1].depth_from_ft).toBe(1);
+        expect(changes.some((c) => c.includes('stated top beats measured'))).toBe(true);
+    });
+
+    it('recognizes the E.O.B. abbreviation when adding a missing EOB row', () => {
+        const rows = lakeshoreRows().filter((r) => r.eob !== true);
+        const { rows: out } = snapLithologyTops(rows, lakeshoreGeometry);
+        const eob = out.find((r) => r.eob === true)!;
+        expect(eob).toBeTruthy();
+        expect(eob.depth_from_ft).toBe(25); // line @25.9, stated @25' wins
+    });
+
+    it('pilot rows carry no leading ranges → nothing locks (no regression)', () => {
+        const rows = [
+            { depth_from_ft: 0, depth_to_ft: 1, description_raw: "0.7' Plantmix over 0.4' Aggregate Base", eob: false },
+            { depth_from_ft: 5, depth_to_ft: 25, description_raw: '(CH) Soft to stiff, very moist to wet, brown, Sandy Fat Clay with scattered', eob: false },
+        ];
+        // "0.7' Plantmix over 0.4'…" is thicknesses, not a leading X-Y' range —
+        // the CH row must still snap to its measured line (10)
+        const { rows: out } = snapLithologyTops(rows, pilotGeometry);
+        expect(out.find((r) => (r.description_raw as string).startsWith('(CH)'))!.depth_from_ft).toBe(10);
+    });
+});
+
+describe('dropEvidenceContradictingMerges', () => {
+    const mergeOp = (rows: number[]): RefinementOp =>
+        ({ op: 'merge_rows', rows, row: null, depth_ft: null, item: null } as RefinementOp);
+
+    it('drops a merge that absorbs a row with its own evidence line (Lakeshore live bug)', () => {
+        // gpt-4.1 merged "SAND" (10-20) into "LIGHT BROWN…" (20-24) — but the
+        // absorbed row anchors to its own measured line at 18 → real layer
+        const out = dropEvidenceContradictingMerges([mergeOp([2, 3])], lakeshoreRows(), lakeshoreGeometry, 'test');
+        expect(out).toHaveLength(0);
+    });
+
+    it('keeps a merge of a wrapped fragment with no evidence anchor of its own', () => {
+        const rows = [
+            { depth_from_ft: 10, depth_to_ft: 20, description_raw: '(CH) Soft to stiff, very moist to wet, brown, Sandy Fat Clay with scattered', eob: false },
+            { depth_from_ft: 20, depth_to_ft: 26, description_raw: 'fragments', eob: false }, // wrapped tail — too short to anchor
+        ];
+        const out = dropEvidenceContradictingMerges([mergeOp([0, 1])], rows, pilotGeometry, 'test');
+        expect(out).toHaveLength(1);
+    });
+
+    it('keeps a merge when both rows anchor to the SAME line (true duplicate)', () => {
+        const rows = [
+            { depth_from_ft: 10, depth_to_ft: 26, description_raw: '(CH) Soft to stiff, very moist to wet, brown, Sandy Fat Clay', eob: false },
+            { depth_from_ft: 26, depth_to_ft: 30, description_raw: '(CH) Soft to stiff, very moist to wet, brown', eob: false },
+        ];
+        // both prefix-match the same CH evidence line → not contradicted
+        const out = dropEvidenceContradictingMerges([mergeOp([0, 1])], rows, pilotGeometry, 'test');
+        expect(out).toHaveLength(1);
+    });
+
+    it('never touches non-merge ops', () => {
+        const ops = [{ op: 'set_top', row: 1, depth_ft: 5, rows: null, item: null } as RefinementOp];
+        expect(dropEvidenceContradictingMerges(ops, lakeshoreRows(), lakeshoreGeometry, 'test')).toEqual(ops);
+    });
+});
+
+describe('DEPTH_REFINEMENT_GUARDS kill switch', () => {
+    const ENV = 'DEPTH_REFINEMENT_GUARDS';
+    let saved: string | undefined;
+    beforeEach(() => { saved = process.env[ENV]; delete process.env[ENV]; });
+    afterEach(() => {
+        if (saved === undefined) delete process.env[ENV];
+        else process.env[ENV] = saved;
+    });
+
+    it('guards are ON by default', () => {
+        const { rows: out } = snapLithologyTops(lakeshoreRows(), lakeshoreGeometry);
+        expect(out.map((r) => r.depth_from_ft)).toEqual([0, 1, 10, 18, 25]);
+    });
+
+    it('=false restores pre-guard behavior: stated rows snap to measured, EOB back to ±0.5', () => {
+        process.env[ENV] = 'false';
+        const { rows: out } = snapLithologyTops(lakeshoreRows(), lakeshoreGeometry);
+        // row 1 snaps to its overshooting line; EOB keeps measured 25.9
+        // (stated 25 is outside the old ±0.5 window)
+        expect(out[1].depth_from_ft).toBe(1.6);
+        expect(out.find((r) => r.eob === true)!.depth_from_ft).toBe(25.9);
     });
 });
