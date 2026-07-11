@@ -12,16 +12,25 @@
 
 import OpenAI from 'openai';
 import pool from '../database.js';
-import { getActiveSchema } from './schemaRegistry.js';
+import { getActiveSchema, getQAHints } from './schemaRegistry.js';
 import {
     buildSectionQASystemPrompt,
     buildSectionQAUserText,
     buildSectionQAResponseFormat,
+    buildGroupQACachedSystemPrompt,
+    buildGroupQASharedUserText,
+    buildGroupQAGroupInstruction,
+    buildGroupQAResponseFormat,
 } from '../config/openaiPrompts.ts';
 
 // Default QA model — overridable via env (QA_MODEL) or per-call (model arg /
-// request body) so we can A/B stronger vision+JSON models against gpt-4o-mini.
-const QA_MODEL = process.env.QA_MODEL || 'gpt-4o-mini';
+// request body) so we can A/B against other vision+JSON models. gpt-4o-mini
+// was too weak at cross-referencing a full extraction JSON against page
+// images in one shot (missed real errors, flagged trivial fields); gpt-5.5
+// supports vision input + strict structured outputs and is OpenAI's current
+// flagship reasoning model. Meaningfully more expensive per call — drop back
+// to a cheaper model via QA_MODEL if cost becomes the binding constraint.
+const QA_MODEL = process.env.QA_MODEL || 'gpt-5.5';
 const IMAGE_WIDTH = 1024; // Higher res than classifier — need to read actual values
 const IMAGE_QUALITY = 90;
 // Multi-page sections: cap how many page images we send to one QA call. Each
@@ -46,6 +55,15 @@ function openai() {
 // whose page value and extracted value are both empty is treated as a non-issue.
 const EMPTY_TOKENS = new Set(['', 'null', 'n/a', 'na', 'none', 'nil', '-', '–', 'unknown', 'undefined']);
 
+// Tokens the model uses on either side of a boolean field's comparison — form
+// labels ("Yes"/"No"), checkbox transcriptions ("checked"/"x"), and the raw
+// boolean/string themselves. Mirrors the client-side coercion in
+// web/src/lib/jsonPath.ts (coerceExpected) so a boolean `false` compared
+// against a page reading "No" is recognised as the same value instead of a
+// textual mismatch.
+const BOOLEAN_TRUE_TOKENS = new Set(['true', 'yes', 'y', 'checked', 'check', 'x', 'present']);
+const BOOLEAN_FALSE_TOKENS = new Set(['false', 'no', 'n', 'unchecked', 'absent']);
+
 function normalizeQAValue(v) {
     if (v == null) return '';
     return String(v).trim().toLowerCase();
@@ -55,14 +73,29 @@ function isEmptyQAValue(v) {
     return EMPTY_TOKENS.has(normalizeQAValue(v));
 }
 
+/** Resolve a value to a boolean when it's a real boolean or a recognised yes/no-style token; undefined otherwise. */
+function toBooleanToken(v) {
+    if (typeof v === 'boolean') return v;
+    const s = normalizeQAValue(v);
+    if (BOOLEAN_TRUE_TOKENS.has(s)) return true;
+    if (BOOLEAN_FALSE_TOKENS.has(s)) return false;
+    return undefined;
+}
+
 /**
  * Equality used throughout QA comparison: case/whitespace-insensitive, treats
- * all "blank" tokens as equal, and compares numerically when both sides parse
- * as numbers (so "5.5'" == 5.5, "3.0" == "3").
+ * all "blank" tokens as equal, treats yes/no/checked-style tokens as boolean
+ * synonyms when both sides are boolean-shaped, and compares numerically when
+ * both sides parse as numbers (so "5.5'" == 5.5, "3.0" == "3").
  */
 export function qaValuesEqual(a, b) {
     if (isEmptyQAValue(a) && isEmptyQAValue(b)) return true;
     if (normalizeQAValue(a) === normalizeQAValue(b)) return true;
+
+    const boolA = toBooleanToken(a);
+    const boolB = toBooleanToken(b);
+    if (boolA !== undefined && boolB !== undefined) return boolA === boolB;
+
     const na = parseFloat(a);
     const nb = parseFloat(b);
     return !Number.isNaN(na) && !Number.isNaN(nb) && na === nb;
@@ -90,6 +123,12 @@ export function isNoOpFinding(issue) {
 // value-substitution logic for them (a "row count" can't be compared to a cell).
 const ROW_ISSUE_TYPES = new Set(['missing_rows', 'extra_rows', 'wrong_count']);
 
+// Actionable row-level ops: delete/add/update ONE specific array item.
+// Distinct from ROW_ISSUE_TYPES above — those stay diagnostic-only for when
+// the model can tell a count is wrong but can't identify which row is at
+// fault; these carry enough (row_index/row_value) to actually apply a fix.
+const STRUCTURED_ROW_ISSUE_TYPES = new Set(['add_row', 'update_row', 'delete_row']);
+
 /** Read a dot/bracket path ("a.b[2].c") out of an object. */
 export function readFieldPath(obj, path) {
     if (obj == null || !path) return undefined;
@@ -109,13 +148,227 @@ function toActualString(v) {
 }
 
 /**
+ * Equality for a model-supplied `corrected_value` (already typed — string,
+ * number, boolean, or null) against the real value read from the record.
+ * Unlike `qaValuesEqual`, this trusts the types directly instead of
+ * re-deriving meaning from text: a boolean `corrected_value` is compared by
+ * strict identity, not by guessing whether some page-text quote means true
+ * or false. Falls back to `qaValuesEqual`'s string/numeric normalization
+ * only when neither side is a boolean/number (e.g. plain text fields).
+ */
+function correctedValueEquals(correctedValue, realValue) {
+    if (correctedValue === null && realValue == null) return true;
+    if (typeof correctedValue === 'boolean' || typeof realValue === 'boolean') {
+        return correctedValue === realValue;
+    }
+    if (typeof correctedValue === 'number' && typeof realValue === 'number') {
+        return correctedValue === realValue;
+    }
+    return qaValuesEqual(correctedValue, realValue);
+}
+
+// ─── Schema-aware helpers (per-group QA + enum backstop) ─────────────
+
+/**
+ * Split an extraction schema into its top-level groups, one per property.
+ * Each group's sub-schema is small enough to inline verbatim into a prompt
+ * (enums included) — this is what fixes the "model never saw the enum"
+ * failure mode the whole-record prompt had for large schemas.
+ *
+ * @param {object|string|null} jsonSchema  Active schema (object or JSON string)
+ * @returns {Array<{ name: string, schema: object }>}
+ */
+export function splitSchemaIntoGroups(jsonSchema) {
+    let schema = jsonSchema;
+    if (typeof schema === 'string') {
+        try { schema = JSON.parse(schema); } catch { return []; }
+    }
+    const props = schema?.properties;
+    if (!props || typeof props !== 'object') return [];
+    return Object.entries(props)
+        .filter(([, def]) => def && typeof def === 'object')
+        .map(([name, def]) => ({ name, schema: def }));
+}
+
+/** Unwrap anyOf wrappers (the schemas use anyOf:[{type:X},{type:null}] for nullables). */
+function unwrapAnyOf(schema) {
+    if (schema?.anyOf && Array.isArray(schema.anyOf)) {
+        // Prefer the non-null member — that's where properties/items/enum live.
+        return schema.anyOf.find((m) => m && m.type !== 'null') ?? schema.anyOf[0];
+    }
+    return schema;
+}
+
+/**
+ * Walk a dot/bracket path ("samples_collected[0].sample_type") through a JSON
+ * Schema and return the sub-schema for that field, or null when the path
+ * doesn't resolve. Numeric segments step into `items`.
+ */
+export function resolveSchemaForPath(rootSchema, path) {
+    let schema = rootSchema;
+    if (typeof schema === 'string') {
+        try { schema = JSON.parse(schema); } catch { return null; }
+    }
+    if (!schema || !path) return null;
+
+    const parts = String(path).replace(/\[(\d+)\]/g, '.$1').split('.').filter(Boolean);
+    let cur = schema;
+    for (const p of parts) {
+        cur = unwrapAnyOf(cur);
+        if (!cur || typeof cur !== 'object') return null;
+        if (/^\d+$/.test(p)) {
+            cur = cur.items;
+        } else {
+            cur = cur.properties?.[p];
+        }
+        if (!cur) return null;
+    }
+    return unwrapAnyOf(cur) ?? null;
+}
+
+/** Pull the enum list off a field schema (handles anyOf-wrapped enums). Null if not an enum field. */
+export function extractEnumValues(fieldSchema) {
+    const s = unwrapAnyOf(fieldSchema);
+    return Array.isArray(s?.enum) ? s.enum : null;
+}
+
+/**
+ * Enum backstop: a corrected_value for an enum-typed field must be one of the
+ * declared values. Try a light normalization ("Hollow Stem Auger" →
+ * "hollow_stem_auger") to rescue near-misses; return null when no legal value
+ * matches — better to show a finding without a one-click fix than an
+ * applicable-but-illegal one ("water sample" is not a sample_type).
+ */
+export function coerceToEnum(candidate, enumValues) {
+    if (candidate == null || !Array.isArray(enumValues)) return null;
+    if (enumValues.includes(candidate)) return candidate;
+    const norm = String(candidate).trim().toLowerCase().replace(/[\s-]+/g, '_');
+    return enumValues.find((v) => String(v).toLowerCase() === norm) ?? null;
+}
+
+/** Shallow key-by-key equality for two plain row objects (order-independent, tolerant like qaValuesEqual). */
+function rowsShallowEqual(a, b) {
+    if (a === b) return true;
+    if (!a || !b || typeof a !== 'object' || typeof b !== 'object') return false;
+    const keys = new Set([...Object.keys(a), ...Object.keys(b)]);
+    for (const key of keys) {
+        if (!qaValuesEqual(toActualString(a[key]), toActualString(b[key]))) return false;
+    }
+    return true;
+}
+
+/**
+ * Verify a delete_row/add_row/update_row finding against the real array.
+ * Never trusts the model's row_index/row_value blindly:
+ *   - the target field must resolve to a real array, or the finding is dropped
+ *   - row_index (delete_row/update_row) must be a valid in-range integer
+ *   - row_value (add_row/update_row) must parse as JSON
+ *   - update_row is dropped as a no-op when the proposed row already matches
+ *   - add_row is dropped when the proposed row is a near-duplicate of an
+ *     existing item (the model re-adding something that's already there)
+ */
+function verifyStructuredRowFinding(issue, record, rootSchema = null) {
+    // The model is instructed to give the BARE array path for row-level
+    // findings (row_index carries the position), but — same lesson as
+    // verifyFindingAgainstRecord not trusting `actual` — don't assume it
+    // always complies. Strip a trailing "[N]" so "lithology_intervals[3]"
+    // still resolves to the array instead of resolving to the row object at
+    // index 3 and silently failing the isArray check.
+    const arrayPath = String(issue?.field ?? '').replace(/\[\d+\]$/, '');
+    const array = readFieldPath(record, arrayPath);
+    if (!Array.isArray(array)) {
+        return { keep: false, issue }; // target isn't really an array — nothing to act on
+    }
+
+    let rowValue;
+    if (issue.row_value != null) {
+        try {
+            rowValue = JSON.parse(issue.row_value);
+        } catch {
+            return { keep: false, issue }; // malformed JSON — can't verify or apply it
+        }
+        // Schema guard: drop keys the array's item schema doesn't declare, so
+        // an applied row can't violate additionalProperties:false downstream.
+        if (rootSchema && rowValue && typeof rowValue === 'object' && !Array.isArray(rowValue)) {
+            const itemSchema = resolveSchemaForPath(rootSchema, `${arrayPath}[0]`);
+            const allowed = itemSchema?.properties;
+            if (allowed && typeof allowed === 'object') {
+                for (const key of Object.keys(rowValue)) {
+                    if (!(key in allowed)) delete rowValue[key];
+                }
+                issue = { ...issue, row_value: JSON.stringify(rowValue) };
+            }
+        }
+    }
+
+    const issueType = issue.issue_type;
+
+    if (issueType === 'delete_row' || issueType === 'update_row') {
+        // Tolerate a numeric string in case row_index doesn't come back as a
+        // real integer (schema declares integer, but don't take that for
+        // granted any more than we take any other model output for granted).
+        const rawIndex = issue.row_index;
+        const idx =
+            typeof rawIndex === 'string' && /^\d+$/.test(rawIndex)
+                ? Number(rawIndex)
+                : rawIndex;
+        if (!Number.isInteger(idx) || idx < 0 || idx >= array.length) {
+            return { keep: false, issue }; // hallucinated index
+        }
+        // Persist the coerced integer, not whatever raw shape row_index
+        // arrived in (e.g. a numeric string) — saveQAFindings only accepts a
+        // real integer for the row_index column.
+        const corrected = { ...issue, row_index: idx, actual: toActualString(array[idx]) };
+        if (issueType === 'update_row') {
+            if (rowValue === undefined || rowsShallowEqual(rowValue, array[idx])) {
+                return { keep: false, issue: corrected }; // no-op: proposed row already matches
+            }
+        }
+        return { keep: true, issue: corrected };
+    }
+
+    // add_row
+    if (rowValue === undefined || rowValue === null || typeof rowValue !== 'object' || Array.isArray(rowValue)) {
+        return { keep: false, issue }; // no usable row content to add
+    }
+    if (array.some((item) => rowsShallowEqual(rowValue, item))) {
+        return { keep: false, issue }; // model re-proposed a row that's already there
+    }
+    // row_index is an optional insertion HINT for add_row — coerce a numeric
+    // string but don't drop the finding over it; null (append) is a safe
+    // fallback rather than a reason to discard an otherwise-valid finding.
+    const rawAddIndex = issue.row_index;
+    const addIndex =
+        typeof rawAddIndex === 'string' && /^\d+$/.test(rawAddIndex)
+            ? Number(rawAddIndex)
+            : rawAddIndex;
+    return {
+        keep: true,
+        issue: {
+            ...issue,
+            row_index: Number.isInteger(addIndex) ? addIndex : null,
+            actual: null,
+        },
+    };
+}
+
+/**
  * Reconcile one model finding against the real extraction record.
  * Returns { keep, issue } where `issue.actual` is corrected to ground truth.
  *
- * @param {object} issue   model-emitted finding (field, issue_type, expected, actual, ...)
- * @param {object} record  the extraction record that was sent to the model
+ * @param {object} issue       model-emitted finding (field, issue_type, expected, actual, corrected_value, ...)
+ * @param {object} record      the extraction record that was sent to the model
+ * @param {object} [rootSchema] active extraction schema — enables the enum
+ *                              backstop (an illegal corrected_value for an
+ *                              enum field is normalized or stripped) and
+ *                              row_value key validation.
  */
-export function verifyFindingAgainstRecord(issue, record) {
+export function verifyFindingAgainstRecord(issue, record, rootSchema = null) {
+    // Actionable row-level ops: delete/add/update a specific array item.
+    if (STRUCTURED_ROW_ISSUE_TYPES.has(issue?.issue_type)) {
+        return verifyStructuredRowFinding(issue, record, rootSchema);
+    }
+
     // Row-count issues: nothing to substitute; just drop obvious no-ops.
     if (ROW_ISSUE_TYPES.has(issue?.issue_type)) {
         return { keep: !isNoOpFinding(issue), issue };
@@ -124,10 +377,38 @@ export function verifyFindingAgainstRecord(issue, record) {
     const realValue = readFieldPath(record, issue?.field);
     const corrected = { ...issue, actual: toActualString(realValue) };
 
-    // No real discrepancy: the page value already matches the true extracted
-    // value → the model fabricated the mismatch. Drop it.
+    // Enum backstop: never surface an applicable correction that the schema
+    // forbids. "water sample" is not a legal sample_type — normalize it to a
+    // declared enum value when possible, otherwise strip the correction and
+    // keep the finding as informational (the discrepancy itself may be real).
+    if (rootSchema && corrected.corrected_value != null) {
+        const enumValues = extractEnumValues(resolveSchemaForPath(rootSchema, issue?.field));
+        if (enumValues) {
+            corrected.corrected_value = coerceToEnum(corrected.corrected_value, enumValues);
+        }
+    }
+
+    // corrected_value is a typed answer (or an intentional null for
+    // extra_value) — compare it directly against the real value instead of
+    // string-coercing `expected`. This is what lets a boolean finding whose
+    // `expected` is evidence text (e.g. "EOB = 68.0 FEET") rather than a
+    // literal true/false still be verified and applied correctly.
+    // NOTE: read from `corrected`, not `issue` — the enum backstop above may
+    // have normalized or stripped an illegal correction, and the comparison
+    // must see the backstopped value (a stripped correction falls through to
+    // the legacy evidence-based comparison below).
+    const hasCorrectedValue = corrected.corrected_value !== undefined;
+    if (hasCorrectedValue && (corrected.corrected_value !== null || issue?.issue_type === 'extra_value')) {
+        if (correctedValueEquals(corrected.corrected_value, realValue)) {
+            return { keep: false, issue: corrected };
+        }
+        return { keep: true, issue: corrected };
+    }
+
+    // Legacy fallback: no usable corrected_value (older QA runs from before
+    // this field existed, or the model omitted it) — fall back to comparing
+    // the raw evidence quote against the real value.
     if (qaValuesEqual(corrected.expected, realValue)) return { keep: false, issue: corrected };
-    // Both sides blank / expected == corrected actual → no-op. Drop.
     if (isNoOpFinding(corrected)) return { keep: false, issue: corrected };
 
     return { keep: true, issue: corrected };
@@ -179,14 +460,21 @@ export async function runSectionQA({ fileId, sectionResultId, slug, pageNumbers,
         throw new Error(`Could not rasterize pages ${wantedPages.join(', ')} for QA`);
     }
 
-    // Field hints come from the active schema in the registry (not hardcoded).
-    // Non-fatal: if the slug isn't registered we just omit the hints.
+    // Field hints + per-field-group review priority both come from the
+    // registry (not hardcoded). Non-fatal: if the slug isn't registered, or
+    // has no qa_hints set, QA just falls back to its generic prompt.
     let activeSchema = null;
+    let qaHints = null;
     try {
         const active = await getActiveSchema(slug);
         activeSchema = active?.schema ?? null;
     } catch (err) {
-        console.warn(`⚠️ getActiveSchema('${slug}') failed for QA hints: ${err.message}`);
+        console.warn(`⚠️ getActiveSchema('${slug}') failed for QA prompt: ${err.message}`);
+    }
+    try {
+        qaHints = await getQAHints(slug);
+    } catch (err) {
+        console.warn(`⚠️ getQAHints('${slug}') failed: ${err.message}`);
     }
 
     // Strip section_result_id from the record — not relevant for QA
@@ -198,12 +486,32 @@ export async function runSectionQA({ fileId, sectionResultId, slug, pageNumbers,
         image_url: { url: `data:image/jpeg;base64,${p.jpeg.toString('base64')}`, detail: 'high' },
     }));
 
+    // Per-group review: one call per top-level schema group, each carrying
+    // that group's FULL sub-schema (enums always visible — the whole-record
+    // prompt had to truncate large schemas, which is how illegal enum
+    // corrections like sample_type="water sample" slipped through). Falls
+    // back to the legacy whole-record call when no schema is registered.
+    const groups = splitSchemaIntoGroups(activeSchema);
+    if (groups.length > 0) {
+        return runGroupedQA({
+            groups,
+            qaHints: qaHints || {},
+            activeSchema,
+            cleanRecord,
+            imageBlocks,
+            renderedPages,
+            pageCount: pages.length,
+            sectionResultId,
+            model,
+        });
+    }
+
     const response = await openai().chat.completions.create({
         model,
         messages: [
             {
                 role: 'system',
-                content: buildSectionQASystemPrompt({ schema: activeSchema, pageCount: pages.length }),
+                content: buildSectionQASystemPrompt({ schema: activeSchema, pageCount: pages.length, qaHints }),
             },
             {
                 role: 'user',
@@ -218,14 +526,34 @@ export async function runSectionQA({ fileId, sectionResultId, slug, pageNumbers,
 
     const result = JSON.parse(response.choices[0].message.content);
 
+    // Response is grouped by top-level schema field-group (see
+    // buildSectionQAResponseFormat) so per-group qa_hints priority can steer
+    // the model's attention within a single call. Flatten back to one issues
+    // list — downstream verification/persistence doesn't need the grouping.
+    const flatIssues = [];
+    for (const g of result.groups || []) {
+        for (const issue of g.issues || []) {
+            flatIssues.push({ ...issue, _group: g.group });
+        }
+    }
+
     // Verify every finding against the real extraction record: correct the
     // model's `actual` to ground truth and drop findings where the page value
     // already matches it (the model's dominant false-positive mode — it
     // fabricates `actual` to manufacture a discrepancy).
     const validIssues = [];
-    for (const issue of result.issues || []) {
+    for (const issue of flatIssues) {
         const { keep, issue: verified } = verifyFindingAgainstRecord(issue, cleanRecord);
         if (keep) validIssues.push(verified);
+    }
+
+    if (flatIssues.length > 0) {
+        const byGroup = new Map();
+        for (const issue of flatIssues) byGroup.set(issue._group, (byGroup.get(issue._group) || 0) + 1);
+        console.log(
+            `   QA groups for ${sectionResultId?.substring(0, 8)}...: ` +
+            [...byGroup.entries()].map(([g, n]) => `${g}(${n})`).join(', ')
+        );
     }
 
     return {
@@ -234,6 +562,172 @@ export async function runSectionQA({ fileId, sectionResultId, slug, pageNumbers,
         summary: result.summary,
         tokens: response.usage,
         model, // the model actually used (for storage + A/B reporting)
+    };
+}
+
+// ─── Per-group QA orchestration ──────────────────────────────────────
+
+/** Run up to `limit` async workers over `items`; results in input order. */
+async function mapConcurrent(items, limit, worker) {
+    const results = new Array(items.length);
+    let cursor = 0;
+    async function pump() {
+        while (true) {
+            const i = cursor++;
+            if (i >= items.length) return;
+            results[i] = await worker(items[i], i);
+        }
+    }
+    await Promise.all(Array.from({ length: Math.min(limit, items.length) }, () => pump()));
+    return results;
+}
+
+/**
+ * Derive overall_quality from the VERIFIED findings instead of trusting the
+ * model's self-report — a model can claim "poor, 5 errors" while every one of
+ * its findings gets dropped in verification, leaving quality and count
+ * contradicting each other in the UI.
+ */
+export function deriveQualityFromFindings(findings) {
+    if (!findings || findings.length === 0) return 'perfect';
+    const errors = findings.filter((f) => f.severity === 'error').length;
+    if (errors === 0) return 'good';
+    return errors <= 2 ? 'acceptable' : 'poor';
+}
+
+/** One-line summary computed from verified findings, grouped by field-group. */
+export function buildFindingsSummary(findings) {
+    if (!findings || findings.length === 0) return 'No issues found.';
+    const byGroup = new Map();
+    for (const f of findings) {
+        const g = f._group || String(f.field || '').split(/[.[]/)[0] || 'record';
+        byGroup.set(g, (byGroup.get(g) || 0) + 1);
+    }
+    const parts = [...byGroup.entries()].map(([g, n]) => `${g} (${n})`);
+    return `${findings.length} issue(s): ${parts.join(', ')}`;
+}
+
+// How many group calls run in parallel per section. Each call re-sends the
+// page images, so this bounds burst token throughput, not total cost.
+const GROUP_QA_CONCURRENCY = 3;
+
+/**
+ * One QA call per schema group. Skips groups whose qa_hints entry sets
+ * skip:true (e.g. extraction_metadata — pipeline housekeeping). A single
+ * failed group call degrades to a warning instead of failing the section;
+ * the run only throws when EVERY call failed.
+ *
+ * Cost: every call shares an identical prefix (generic system prompt → full
+ * record → page images) with only the group instruction differing at the
+ * tail, so OpenAI's automatic prompt caching bills the expensive image
+ * tokens at the cached rate (~10x cheaper) for every call after the first.
+ * The first call runs ALONE to warm the cache — concurrent identical-prefix
+ * requests all miss it because the cache is written only after a request
+ * finishes processing.
+ */
+async function runGroupedQA({ groups, qaHints, activeSchema, cleanRecord, imageBlocks, renderedPages, pageCount, sectionResultId, model }) {
+    const toReview = groups.filter((g) => qaHints[g.name]?.skip !== true);
+    const skipped = groups.length - toReview.length;
+
+    console.log(
+        `🔍 Per-group QA for ${sectionResultId?.substring(0, 8)}...: ` +
+        `${toReview.length} group(s)${skipped > 0 ? ` (${skipped} skipped via qa_hints)` : ''} with ${model}`
+    );
+
+    const startedAt = Date.now();
+    const totalTokens = { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, cached_tokens: 0 };
+    const failures = [];
+
+    // Shared prefix — built ONCE, byte-identical across every group call.
+    const systemPrompt = buildGroupQACachedSystemPrompt(pageCount);
+    const sharedUserParts = [
+        { type: 'text', text: buildGroupQASharedUserText(cleanRecord, renderedPages) },
+        ...imageBlocks,
+    ];
+
+    async function qaOneGroup(group) {
+        try {
+            const response = await openai().chat.completions.create({
+                model,
+                messages: [
+                    { role: 'system', content: systemPrompt },
+                    {
+                        role: 'user',
+                        content: [
+                            ...sharedUserParts,
+                            // Group-specific instruction LAST — everything
+                            // before this point is the shared cache prefix.
+                            {
+                                type: 'text',
+                                text: buildGroupQAGroupInstruction({
+                                    groupName: group.name,
+                                    groupSchema: group.schema,
+                                    groupValue: cleanRecord[group.name],
+                                    hint: qaHints[group.name] || null,
+                                }),
+                            },
+                        ],
+                    },
+                ],
+                response_format: buildGroupQAResponseFormat(),
+            });
+
+            totalTokens.prompt_tokens += response.usage?.prompt_tokens || 0;
+            totalTokens.completion_tokens += response.usage?.completion_tokens || 0;
+            totalTokens.total_tokens += response.usage?.total_tokens || 0;
+            totalTokens.cached_tokens += response.usage?.prompt_tokens_details?.cached_tokens || 0;
+
+            const result = JSON.parse(response.choices[0].message.content);
+            // Focus guard: this call reviews ONE group — drop anything the
+            // model flagged outside it (it sees the full record as context
+            // and occasionally wanders).
+            return (result.issues || [])
+                .filter((issue) => {
+                    const f = String(issue?.field || '');
+                    return f === group.name || f.startsWith(`${group.name}.`) || f.startsWith(`${group.name}[`);
+                })
+                .map((issue) => ({ ...issue, _group: group.name }));
+        } catch (err) {
+            console.warn(`⚠️ QA call failed for group '${group.name}': ${err.message}`);
+            failures.push(group.name);
+            return [];
+        }
+    }
+
+    // Warm the cache with the first group alone, then fan out the rest.
+    const [firstGroup, ...restGroups] = toReview;
+    const firstIssues = firstGroup ? await qaOneGroup(firstGroup) : [];
+    const restIssues = await mapConcurrent(restGroups, GROUP_QA_CONCURRENCY, qaOneGroup);
+    const perGroupIssues = [firstIssues, ...restIssues];
+
+    if (failures.length === toReview.length && toReview.length > 0) {
+        throw new Error(`All ${toReview.length} group QA calls failed (last groups: ${failures.join(', ')})`);
+    }
+
+    // Same verification as always — nothing the model says is trusted until
+    // it's been checked against the real record and (now) the real schema.
+    const validIssues = [];
+    for (const issue of perGroupIssues.flat()) {
+        const { keep, issue: verified } = verifyFindingAgainstRecord(issue, cleanRecord, activeSchema);
+        if (keep) validIssues.push(verified);
+    }
+
+    const overall_quality = deriveQualityFromFindings(validIssues);
+    const summary = buildFindingsSummary(validIssues);
+
+    console.log(
+        `   Per-group QA done in ${((Date.now() - startedAt) / 1000).toFixed(1)}s — ` +
+        `${validIssues.length} finding(s), quality=${overall_quality}, ${totalTokens.total_tokens} tokens ` +
+        `(${totalTokens.cached_tokens} cached)` +
+        (failures.length ? `, failed groups: ${failures.join(', ')}` : '')
+    );
+
+    return {
+        findings: validIssues,
+        overall_quality,
+        summary,
+        tokens: totalTokens,
+        model,
     };
 }
 
@@ -291,13 +785,15 @@ export async function saveQAFindings({ fileId, sectionResultId, findings, overal
             const result = await client.query(
                 `INSERT INTO section_qa_findings
                     (file_id, section_result_id, field_path, issue_type, severity,
-                     expected, actual, explanation, status, overall_quality, qa_model)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'open', $9, $10)
-                 ON CONFLICT (file_id, section_result_id, field_path, issue_type)
+                     expected, actual, corrected_value, row_index, row_value, explanation, status, overall_quality, qa_model)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10::jsonb, $11, 'open', $12, $13)
+                 ON CONFLICT (file_id, section_result_id, field_path, issue_type, row_index)
                  DO UPDATE SET
                      severity = EXCLUDED.severity,
                      expected = EXCLUDED.expected,
                      actual = EXCLUDED.actual,
+                     corrected_value = EXCLUDED.corrected_value,
+                     row_value = EXCLUDED.row_value,
                      explanation = EXCLUDED.explanation,
                      overall_quality = EXCLUDED.overall_quality,
                      qa_model = EXCLUDED.qa_model,
@@ -311,6 +807,14 @@ export async function saveQAFindings({ fileId, sectionResultId, findings, overal
                     finding.severity,
                     finding.expected,
                     finding.actual,
+                    finding.corrected_value !== undefined ? JSON.stringify(finding.corrected_value) : null,
+                    Number.isInteger(finding.row_index) ? finding.row_index : null,
+                    // row_value is already a JSON-encoded string per the model's
+                    // response schema (see SECTION_QA_ISSUE_SCHEMA) — pass it
+                    // through as-is and let ::jsonb parse it. Do NOT
+                    // JSON.stringify it again, that would double-encode it into
+                    // an escaped string literal instead of a real jsonb object.
+                    finding.row_value ?? null,
                     finding.explanation,
                     overall_quality,
                     qaModel,
