@@ -1680,6 +1680,16 @@ export async function getAllFiles(limit = 50, offset = 0, status = null, jobId =
                 jf.review_notes,
                 (jf.result IS NOT NULL) as has_result,
                 COALESCE(jsonb_array_length(jf.detected_sections->'sections'), 0) as record_count,
+                (
+                    SELECT jsonb_build_object(
+                        'approved',  COUNT(*) FILTER (WHERE sv.status = 'approved'),
+                        'rejected',  COUNT(*) FILTER (WHERE sv.status = 'rejected'),
+                        'in_review', COUNT(*) FILTER (WHERE sv.status = 'in_review'),
+                        'pending',   COUNT(*) FILTER (WHERE sv.status = 'pending')
+                    )
+                    FROM section_verifications sv
+                    WHERE sv.file_id = jf.id
+                ) as section_review_counts,
                 (jf.extraction_metadata->>'extraction_method') as extraction_method,
                 (jf.processing_metadata->>'model') as processing_model,
                 jf.flags,
@@ -1762,6 +1772,16 @@ export async function getFileSkinnyRow(fileId) {
                 jf.review_notes,
                 (jf.result IS NOT NULL) as has_result,
                 COALESCE(jsonb_array_length(jf.detected_sections->'sections'), 0) as record_count,
+                (
+                    SELECT jsonb_build_object(
+                        'approved',  COUNT(*) FILTER (WHERE sv.status = 'approved'),
+                        'rejected',  COUNT(*) FILTER (WHERE sv.status = 'rejected'),
+                        'in_review', COUNT(*) FILTER (WHERE sv.status = 'in_review'),
+                        'pending',   COUNT(*) FILTER (WHERE sv.status = 'pending')
+                    )
+                    FROM section_verifications sv
+                    WHERE sv.file_id = jf.id
+                ) as section_review_counts,
                 (jf.extraction_metadata->>'extraction_method') as extraction_method,
                 (jf.processing_metadata->>'model') as processing_model,
                 jf.flags,
