@@ -1250,6 +1250,7 @@ app.get("/document-types", authenticateToken, async (req, res) => {
                 status: t.status,
                 has_classifier_hints: t.classifier_hints != null,
                 has_qa_hints: t.qa_hints != null && Object.keys(t.qa_hints).length > 0,
+                identifier_fields: t.identifier_fields ?? [],
             })),
         });
     } catch (error) {
@@ -2793,9 +2794,11 @@ app.post("/files/:id/sections/save-and-reextract", authenticateToken, async (req
                 : {};
         const newDetectedSections = { ...storedDetected, sections: incomingSections };
 
-        // Find sections needing extraction (section_result_id === null)
+        // Find sections needing extraction (section_result_id === null).
+        // Superseded sections never extract — they're duplicates whose
+        // canonical twin carries the data.
         const sectionIndices = newDetectedSections.sections
-            .map((s, i) => (s.section_result_id == null ? i : -1))
+            .map((s, i) => (s.section_result_id == null && !s.superseded_by ? i : -1))
             .filter(i => i >= 0);
 
         // Save the updated detected_sections first (even if no extraction needed)
@@ -2818,11 +2821,16 @@ app.post("/files/:id/sections/save-and-reextract", authenticateToken, async (req
                 }
             }
             if (recordById.size > 0) {
-                const currentIds = newDetectedSections.sections
+                // Superseded sections keep their entry in detected_sections
+                // (provenance) but their record leaves the envelope and their
+                // verification/QA rows are cleaned up, same as a delete.
+                const liveSections = newDetectedSections.sections
+                    .filter(s => !s.superseded_by);
+                const currentIds = liveSections
                     .map(s => s.section_result_id)
                     .filter(Boolean);
                 const rebuilt = {};
-                for (const section of newDetectedSections.sections) {
+                for (const section of liveSections) {
                     const slug = section.document_type_slug;
                     const rec = section.section_result_id
                         ? recordById.get(section.section_result_id)
@@ -3052,12 +3060,13 @@ app.post("/files/:id/sections/save-and-reextract", authenticateToken, async (req
         finalDetectedSections.edits = [];
         await updateFileDetectedSections(fileId, finalDetectedSections);
 
-        // Rebuild envelope by ID
+        // Rebuild envelope by ID (superseded sections stay out — their
+        // canonical twin carries the data)
         const mergedResult = {};
         for (const section of finalDetectedSections.sections) {
             const slug = section.document_type_slug;
             const id = section.section_result_id;
-            if (!slug) continue;
+            if (!slug || section.superseded_by) continue;
             if (!mergedResult[slug]) mergedResult[slug] = [];
 
             const newEntry = id ? newRecordById.get(id) : null;
@@ -3085,12 +3094,15 @@ app.post("/files/:id/sections/save-and-reextract", authenticateToken, async (req
             perSection.totalAiTimeSeconds || null
         );
 
-        // Sections deleted, or re-extracted under a new section_result_id,
-        // leave verification/QA rows keyed to the old id — drop those and
-        // refresh the file-level review rollup.
+        // Sections deleted, superseded, or re-extracted under a new
+        // section_result_id leave verification/QA rows keyed to the old id —
+        // drop those and refresh the file-level review rollup.
         await cleanupOrphanSectionRows(
             fileId,
-            finalDetectedSections.sections.map(s => s.section_result_id).filter(Boolean)
+            finalDetectedSections.sections
+                .filter(s => !s.superseded_by)
+                .map(s => s.section_result_id)
+                .filter(Boolean)
         );
         const reviewStatus = await recomputeFileReviewStatus(fileId);
 
@@ -3275,11 +3287,12 @@ app.post("/files/:id/reextract-sections", authenticateToken, async (req, res) =>
         await updateFileDetectedSections(fileId, updatedDetectedSections);
 
         // 4. Rebuild envelope: walk ALL sections, pick record by ID
+        // (superseded sections stay out — their canonical twin carries the data)
         const mergedResult = {};
         for (const section of updatedDetectedSections.sections) {
             const slug = section.document_type_slug;
             const id = section.section_result_id;
-            if (!slug) continue;
+            if (!slug || section.superseded_by) continue;
             if (!mergedResult[slug]) mergedResult[slug] = [];
 
             const newEntry = id ? newRecordById.get(id) : null;
@@ -3320,11 +3333,14 @@ app.post("/files/:id/reextract-sections", authenticateToken, async (req, res) =>
         );
 
         // Re-extracted sections get a new section_result_id; drop
-        // verification/QA rows keyed to the replaced ids and refresh the
-        // file-level review rollup.
+        // verification/QA rows keyed to the replaced ids (and to superseded
+        // sections) and refresh the file-level review rollup.
         await cleanupOrphanSectionRows(
             fileId,
-            updatedDetectedSections.sections.map(s => s.section_result_id).filter(Boolean)
+            updatedDetectedSections.sections
+                .filter(s => !s.superseded_by)
+                .map(s => s.section_result_id)
+                .filter(Boolean)
         );
         const reviewStatus = await recomputeFileReviewStatus(fileId);
 
