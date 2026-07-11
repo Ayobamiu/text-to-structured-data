@@ -212,6 +212,12 @@ export async function extractAndProcessPerSection({
             error: r.error,
             duration_ms: r.duration_ms,
             ai_metadata: r.ai_metadata,
+            // Depth-refinement audit trail (what the refiner changed and why).
+            // This summary is the ONLY persistence of the per-section reports —
+            // without it the v2 path silently loses the audit trail the v1 path
+            // keeps in processing_metadata.depth_refinement (found 2026-07-11
+            // while verifying a live Lakeshore run: numbers right, trail gone).
+            ...(r.depth_refinement ? { depth_refinement: r.depth_refinement } : {}),
             // Large-section guardrail fields (only present when flagged)
             ...(r.large_section ? {
                 large_section: true,
