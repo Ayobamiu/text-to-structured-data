@@ -327,54 +327,102 @@ export const SECTION_QA_ISSUE_TYPES = [
     'extra_rows',
     'wrong_count',
     'formatting',
+    // Actionable row-level ops — use these instead of missing_rows/extra_rows/
+    // wrong_count whenever the specific row and its content/index can be
+    // identified. The count-only types remain for when only the count is
+    // known to be wrong but the specific row can't be reconstructed.
+    'add_row',
+    'update_row',
+    'delete_row',
 ] as const;
 
 export const SECTION_QA_SEVERITIES = ['error', 'warning', 'info'] as const;
 
+const SECTION_QA_ISSUE_SCHEMA: Record<string, unknown> = {
+    type: 'object',
+    additionalProperties: false,
+    required: ['field', 'issue_type', 'severity', 'expected', 'actual', 'corrected_value', 'row_index', 'row_value', 'explanation'],
+    properties: {
+        field: {
+            type: 'string',
+            description:
+                'Dot-path with array indices for scalar issue types. E.g., "lithology_intervals[0].depth_to_ft". EXCEPTION for add_row/update_row/delete_row: use the BARE array path with NO index — e.g. "lithology_intervals", never "lithology_intervals[3]". The row position goes in row_index, not in field.',
+        },
+        issue_type: {
+            type: 'string',
+            enum: [...SECTION_QA_ISSUE_TYPES],
+        },
+        severity: {
+            type: 'string',
+            enum: [...SECTION_QA_SEVERITIES],
+        },
+        expected: {
+            type: ['string', 'null'],
+            description:
+                'EVIDENCE, not necessarily the answer: a VERBATIM quote of text visible on the page that shows something is wrong. Never a placeholder like "Unknown"/"N/A"/"Null" or a guess like "1 or more rows". Null only for hallucinated values (issue_type=extra_value). May be a marker/label rather than a literal value — see corrected_value for the actual typed answer.',
+        },
+        actual: {
+            type: ['string', 'null'],
+            description:
+                'The value actually present in the provided extraction JSON at this field. Null if the JSON field is genuinely null/absent.',
+        },
+        corrected_value: {
+            type: ['string', 'number', 'boolean', 'null'],
+            description:
+                'THE ANSWER: the value that should replace `actual`, in the EXACT type the schema declares for this field — a boolean field gets the literal true/false, a number field gets a number, a string field gets the correct string. Never a description or the words "Yes"/"No" for a boolean field. Null ONLY when issue_type="extra_value" (remove, do not replace) or for row-level issue types (missing_rows/extra_rows/wrong_count/add_row/update_row/delete_row) — those use row_index/row_value instead.',
+        },
+        row_index: {
+            type: ['integer', 'null'],
+            description:
+                'Only for delete_row/update_row (required — which array item, 0-indexed) and optionally add_row (insertion position; null means append at the end). Null for every other issue_type.',
+        },
+        row_value: {
+            type: ['string', 'null'],
+            description:
+                'Only for add_row/update_row: a JSON-ENCODED STRING (use JSON.stringify semantics) of the full row object, using EXACTLY the field names from the array\'s item schema. Only include fields you can actually verify from the page — omit fields you cannot read rather than guessing. Null for every other issue_type, including delete_row.',
+        },
+        explanation: {
+            type: 'string',
+            description: 'Why this is an issue. Max 25 words.',
+        },
+    },
+};
+
+// Findings are grouped by top-level schema field-group (e.g.
+// "lithology_intervals", "document_metadata") instead of one flat list. This
+// keeps the per-call cost the same as a single flat pass (one call, same page
+// images) while letting per-group qa_hints priority/ignore guidance organize
+// the model's attention — a group marked "critical" gets real scrutiny, a
+// "low" priority group (often administrative fields like total_pages) gets a
+// glance instead of dominating the findings list.
 export const SECTION_QA_RESPONSE_SCHEMA: Record<string, unknown> = {
     type: 'object',
     additionalProperties: false,
-    required: ['summary', 'issues', 'overall_quality'],
+    required: ['summary', 'groups', 'overall_quality'],
     properties: {
         summary: {
             type: 'string',
             description:
                 'One sentence: how many issues, what kind. E.g., "2 errors found in lithology depths."',
         },
-        issues: {
+        groups: {
             type: 'array',
             description:
-                'All discrepancies between page image(s) and extraction. Empty array if extraction is correct.',
+                'One entry per top-level schema field-group where you found at least one issue. Omit groups with zero issues — do not include empty-issues entries.',
             items: {
                 type: 'object',
                 additionalProperties: false,
-                required: ['field', 'issue_type', 'severity', 'expected', 'actual', 'explanation'],
+                required: ['group', 'issues'],
                 properties: {
-                    field: {
+                    group: {
                         type: 'string',
-                        description: 'Dot-path with array indices. E.g., "lithology_intervals[0].depth_to_ft"',
-                    },
-                    issue_type: {
-                        type: 'string',
-                        enum: [...SECTION_QA_ISSUE_TYPES],
-                    },
-                    severity: {
-                        type: 'string',
-                        enum: [...SECTION_QA_SEVERITIES],
-                    },
-                    expected: {
-                        type: ['string', 'null'],
                         description:
-                            'A VERBATIM quote of text visible on the page. Never a placeholder like "Unknown"/"N/A"/"Null" or a guess like "1 or more rows". Null only for hallucinated values (issue_type=extra_value).',
+                            'The top-level schema property name this group of issues belongs to (e.g. "lithology_intervals", "site_identification"). Must match a real top-level property in the provided schema.',
                     },
-                    actual: {
-                        type: ['string', 'null'],
-                        description:
-                            'The value actually present in the provided extraction JSON at this field. Null if the JSON field is genuinely null/absent.',
-                    },
-                    explanation: {
-                        type: 'string',
-                        description: 'Why this is an issue. Max 25 words.',
+                    issues: {
+                        type: 'array',
+                        description: 'Discrepancies found within this field-group.',
+                        items: SECTION_QA_ISSUE_SCHEMA,
                     },
                 },
             },
@@ -393,6 +441,157 @@ export function buildSectionQAResponseFormat(): OpenAIResponseFormat {
         SECTION_QA_RESPONSE_SCHEMA,
         true
     );
+}
+
+// ---------------------------------------------------------------------------
+// Per-group Section QA — one call per top-level schema group
+// ---------------------------------------------------------------------------
+// Instead of reviewing the whole record in one pass (where the model's
+// attention spreads thin and large schemas had to be truncated out of the
+// prompt), each top-level schema group (lithology_intervals,
+// samples_collected, ...) gets its own call carrying that group's FULL
+// sub-schema — enums and types always visible, no size guard needed — plus
+// the group's extracted data and the page images.
+
+export const GROUP_QA_RESPONSE_NAME = 'extraction_group_qa_review';
+
+// Same issue shape as the whole-record review, minus the groups wrapper —
+// each call already IS one group.
+export const GROUP_QA_RESPONSE_SCHEMA: Record<string, unknown> = {
+    type: 'object',
+    additionalProperties: false,
+    required: ['summary', 'issues'],
+    properties: {
+        summary: {
+            type: 'string',
+            description: 'One sentence: how many issues in this group, what kind.',
+        },
+        issues: {
+            type: 'array',
+            description: 'Discrepancies found within this field-group. Empty array if it is extracted correctly.',
+            items: SECTION_QA_ISSUE_SCHEMA,
+        },
+    },
+};
+
+export function buildGroupQAResponseFormat(): OpenAIResponseFormat {
+    return buildStrictJsonSchemaResponseFormat(
+        GROUP_QA_RESPONSE_NAME,
+        GROUP_QA_RESPONSE_SCHEMA,
+        true
+    );
+}
+
+// Prompt-caching layout: OpenAI bills cached input ~10x cheaper when requests
+// share an identical token PREFIX. A section's N group calls therefore put
+// everything shared FIRST (generic system prompt → full record → page images)
+// and the group-specific instruction LAST — calls 2..N pay the cached rate on
+// the expensive image tokens instead of full price N times.
+
+/**
+ * Generic system prompt shared verbatim by every group call in a section —
+ * contains NO group-specific content so the cache prefix stays identical.
+ * The group's schema, data, and hints arrive in the trailing user-message
+ * part (buildGroupQAGroupInstruction).
+ */
+export function buildGroupQACachedSystemPrompt(pageCount = 1): string {
+    const multi = pageCount > 1;
+    const pageWord = multi ? 'pages' : 'page';
+
+    const rowRule = multi
+        ? `count rows across ALL ${pageCount} page images before flagging — an array often continues from one page onto the next`
+        : `count table rows carefully before flagging`;
+
+    return `You are a document extraction QA reviewer working through ONE extraction record group by group. Each request shows you the full record and the source ${multi ? `${pageCount} page images (in order)` : 'page image'}, then names ONE group to review. Flag only real discrepancies WITHIN the named group.
+
+SCHEMA RULES (violating these makes a finding unusable):
+- The named group's schema is given in full at the end of the request. Field names, types, and enum lists in it are authoritative.
+- Field paths in findings MUST start with the named group — e.g. "the_group[0].some_field" for array items or "the_group.some_field" for object members.
+- When a field declares an enum, corrected_value MUST be EXACTLY one of the enum values, verbatim — never a paraphrase. If the page shows "Water sample" and the enum is ["mw_groundwater", "soil_grab", ...], pick the enum value that MEANS what the page shows (mw_groundwater), never invent "water sample".
+- Types are authoritative: boolean fields get literal true/false in corrected_value, number fields get numbers.
+
+HOW TO COMPARE (read carefully — most false reports come from skipping this):
+- The extraction is given to you IN FULL. Before flagging any field, read its actual value. If it already holds the correct value, do NOT flag it.
+- Every "expected" value MUST be a verbatim quote of text you can actually read on the ${pageWord}. Never invent placeholders ("Unknown", "N/A", "Null") or guesses. If you cannot read a concrete value on the ${pageWord}, do not raise the issue.
+- "expected" is EVIDENCE (what the page shows); "corrected_value" is the ANSWER (the exact typed value to store, conforming to the group's schema).
+- If a field is blank on the ${pageWord} AND null/empty in the extraction, that is CORRECT — do not flag it.
+
+ROW-LEVEL FIXES (for array groups — use these instead of a vague count complaint whenever you can pin down the specific row):
+- CRITICAL: for add_row/update_row/delete_row, "field" is the BARE array path (the group name) with NO index — the row's position goes in row_index.
+- delete_row: a SPECIFIC row is fabricated or duplicated with no supporting page content. Set row_index to its 0-indexed position. row_value stays null.
+- add_row: a SPECIFIC row is missing and you can read its content from the ${pageWord}. Set row_value to a JSON-encoded string of the row object (exact field names from the group's schema; omit fields you can't verify). row_index = insertion position if determinable, else null (append).
+- update_row: an existing row is substantially wrong across multiple fields. Set row_index and row_value (corrected JSON-encoded row).
+- Fall back to missing_rows/extra_rows/wrong_count ONLY when the count is wrong but the specific row can't be identified — ${rowRule}.
+
+NOT ERRORS (never flag these):
+- Enum/label normalization: "hollow_stem_auger" for "Hollow Stem Auger". Only flag if the MEANING differs.
+- Number/unit formatting: 3 and 3.0 are equal; ignore trailing zeros, thousands separators, and unit suffixes when the magnitude matches.
+- Date formatting (2024-01-15 vs 01/15/2024): at most "info" severity, never "error".
+- Boolean representation: a boolean field's ${pageWord} value is a form label or checkbox ("Yes"/"No", "checked"/blank, "X"). Translate the label to true/false FIRST, then compare — "false" vs "No" is the SAME value.
+
+Output rules:
+- If the named group matches the ${pageWord} everywhere, return an empty issues array.
+- Do NOT flag fields outside the named group — the rest of the record is context only.
+- Be specific: exact field paths with array indices.`;
+}
+
+/**
+ * Shared leading user-message text — identical across every group call in a
+ * section (part of the cached prefix, together with the image parts the
+ * caller appends right after it).
+ */
+export function buildGroupQASharedUserText(
+    fullRecord: Record<string, unknown>,
+    renderedPages: number[]
+): string {
+    const pagesNote = renderedPages.length > 1
+        ? `pages ${renderedPages.join(', ')}, in order — data may continue across pages`
+        : `page ${renderedPages[0] ?? '?'}`;
+    return `SOURCE: ${pagesNote}. The image(s) follow this message.
+
+FULL EXTRACTION RECORD (the group to review is named after the images):
+${JSON.stringify(fullRecord, null, 2)}`;
+}
+
+/**
+ * Trailing group-specific instruction — the ONLY part that differs between a
+ * section's group calls, so it must stay last in the message content.
+ *
+ * @param opts.groupName   Top-level schema property name (e.g. "samples_collected")
+ * @param opts.groupSchema The sub-schema for that property (object, not string)
+ * @param opts.groupValue  The extracted value of that property (undefined = not extracted)
+ * @param opts.hint        This group's qa_hints entry (priority/ignore/notes), if any
+ */
+export function buildGroupQAGroupInstruction(opts: {
+    groupName: string;
+    groupSchema: unknown;
+    groupValue?: unknown;
+    hint?: { priority?: string; ignore?: string[]; notes?: string } | null;
+}): string {
+    const { groupName, groupSchema, groupValue = undefined, hint = null } = opts;
+
+    const hintLines: string[] = [];
+    if (hint?.priority) hintLines.push(`- Review priority for this group: ${hint.priority}.`);
+    if (Array.isArray(hint?.ignore) && hint.ignore.length > 0) {
+        hintLines.push(`- NEVER flag these fields: ${hint.ignore.join(', ')}.`);
+    }
+    if (hint?.notes) hintLines.push(`- Reviewer guidance: ${hint.notes}`);
+    const hintBlock = hintLines.length > 0
+        ? `\n\nREVIEWER GUIDANCE FOR THIS GROUP (authoritative):\n${hintLines.join('\n')}`
+        : '';
+
+    const groupJson = groupValue === undefined ? 'null (not extracted)' : JSON.stringify(groupValue, null, 2);
+
+    return `REVIEW THIS GROUP NOW: "${groupName}"
+
+THE SCHEMA FOR "${groupName}" (authoritative — field names, types, and enum lists come from here):
+${JSON.stringify(groupSchema, null, 2)}
+
+EXTRACTED "${groupName}" (the data under review — same as in the full record above):
+${groupJson}
+
+- Field paths in your findings MUST start with "${groupName}".
+- For add_row/update_row/delete_row, "field" is the BARE path "${groupName}" — never "${groupName}[3]".${hintBlock}`;
 }
 
 /**
@@ -447,22 +646,98 @@ export function schemaToFieldHints(jsonSchema: unknown): string {
     return `\nSchema fields (use EXACTLY these field paths in issues):\n${parts.join('\n')}`;
 }
 
+// Above this size, inlining the full schema costs more prompt tokens than the
+// benefit is worth — fall back to the compact name-only hint block instead.
+const MAX_FULL_SCHEMA_PROMPT_CHARS = 6000;
+
+/**
+ * Prefer handing the model the REAL JSON schema (types, enums, nullability) so
+ * it can tell a boolean field from a text label instead of guessing from field
+ * names alone — this is what lets it recognise that a page reading "Yes"/"No"
+ * must resolve to a boolean, not a string, before comparing. Falls back to the
+ * compact `schemaToFieldHints` block for schemas too large to justify the
+ * token cost (e.g. multi-group schemas like borehole_log).
+ *
+ * @param jsonSchema Active schema (object or JSON string)
+ * @returns prompt block, or '' when the schema has no usable properties
+ */
+export function schemaToPromptBlock(jsonSchema: unknown): string {
+    let schema: any = jsonSchema;
+    if (typeof schema === 'string') {
+        try { schema = JSON.parse(schema); } catch { return ''; }
+    }
+    if (!schema || typeof schema !== 'object' || !schema.properties) return '';
+
+    const pretty = JSON.stringify(schema, null, 2);
+    if (pretty.length <= MAX_FULL_SCHEMA_PROMPT_CHARS) {
+        return `\nSchema (types/enums are authoritative — use EXACT field paths, and read each field's declared type before flagging it):\n${pretty}`;
+    }
+    return schemaToFieldHints(schema);
+}
+
+/** Per-field-group QA guidance, keyed by top-level schema property name. See
+ * ai/migrations/add_qa_hints_to_document_types.js for the authoritative shape.
+ * `skip: true` excludes the group from QA entirely (no call made for it) —
+ * use for pipeline-housekeeping groups like extraction_metadata. */
+export type QAHints = Record<
+    string,
+    { priority?: 'critical' | 'high' | 'normal' | 'low'; ignore?: string[]; notes?: string; skip?: boolean }
+>;
+
+/**
+ * Turn a document type's qa_hints into a prompt block the model uses to
+ * prioritize its attention across field-groups instead of treating every
+ * field as equally important. Mirrors how classifier_hints (skip_when/
+ * keep_when) is spliced into the visual classifier's prompt.
+ */
+export function buildQAHintsBlock(qaHints: unknown): string {
+    let hints: QAHints | null = null;
+    if (typeof qaHints === 'string') {
+        try { hints = JSON.parse(qaHints); } catch { return ''; }
+    } else if (qaHints && typeof qaHints === 'object') {
+        hints = qaHints as QAHints;
+    }
+    if (!hints || typeof hints !== 'object') return '';
+
+    const lines: string[] = [];
+    for (const [group, hint] of Object.entries(hints)) {
+        if (!hint || typeof hint !== 'object') continue;
+        const bits: string[] = [];
+        if (hint.priority) bits.push(`priority=${hint.priority}`);
+        if (Array.isArray(hint.ignore) && hint.ignore.length > 0) {
+            bits.push(`never flag: ${hint.ignore.join(', ')}`);
+        }
+        if (hint.notes) bits.push(hint.notes);
+        if (bits.length > 0) lines.push(`  - ${group}: ${bits.join(' — ')}`);
+    }
+    if (lines.length === 0) return '';
+
+    return `\n\nPER-GROUP REVIEW PRIORITY (authoritative — set by a human reviewer for this document type):\n${lines.join('\n')}\nSpend real scrutiny on "critical"/"high" groups. "low" priority groups only need a glance — don't let them crowd out issues in higher-priority groups. Never flag fields listed under "never flag" for a group.`;
+}
+
 /**
  * System prompt for post-extraction QA. The rules are tuned to suppress the
  * common false-positive classes:
  *   1. claiming a field is null/wrong without reading the provided JSON,
  *   2. no-op findings where page and extraction are both empty,
  *   3. number/unit/date formatting differences,
- *   4. speculative/placeholder "expected" values not quoted from the page.
+ *   4. speculative/placeholder "expected" values not quoted from the page,
+ *   5. boolean fields compared against yes/no-style page labels as if they
+ *      were text mismatches,
+ *   6. a genuine finding whose replacement value can't be applied because
+ *      "expected" (evidence text) isn't the same shape as the field's real
+ *      type — corrected_value carries the typed answer separately.
  *
- * @param opts.schema    Active JSON schema → field hints (optional)
+ * @param opts.schema    Active JSON schema → prompt block (optional)
  * @param opts.pageCount How many page images are attached (default 1)
+ * @param opts.qaHints   Per-field-group priority/ignore guidance (optional)
  */
 export function buildSectionQASystemPrompt(
-    opts: { schema?: unknown; pageCount?: number } = {}
+    opts: { schema?: unknown; pageCount?: number; qaHints?: unknown } = {}
 ): string {
-    const { schema = null, pageCount = 1 } = opts;
-    const fieldHints = schemaToFieldHints(schema);
+    const { schema = null, pageCount = 1, qaHints = null } = opts;
+    const fieldHints = schemaToPromptBlock(schema);
+    const qaHintsBlock = buildQAHintsBlock(qaHints);
     const multi = pageCount > 1;
     const pageWord = multi ? 'pages' : 'page';
 
@@ -488,10 +763,24 @@ HOW TO COMPARE (read carefully — most false reports come from skipping this):
 - If a field is blank on the ${pageWord} AND null/empty in the extraction, that is CORRECT — do not flag it.
 - Do NOT flag an issue where "expected" and "actual" mean the same thing.
 
+CORRECTED VALUE (read this — it is not the same field as "expected"):
+- "expected" is EVIDENCE: the verbatim page text that shows something is wrong. It does not have to be a value someone could paste directly into the field — for a derived/boolean field, the evidence is often a marker or note, not the literal word "true"/"false".
+- "corrected_value" is the ANSWER: the actual value that should replace "actual", in the EXACT type the schema declares for that field. A boolean field's corrected_value is the JSON literal true or false — never a description, a quote, or the words "Yes"/"No". A number field's corrected_value is a number, not a string with units.
+- Example: a boring log's final row has the note "EOB = 68.0 FEET" but the record's \`eob\` field (a boolean) is false. expected="EOB = 68.0 FEET" (what you read), corrected_value=true (the answer) — NOT expected="true", and NOT corrected_value="EOB = 68.0 FEET".
+- Set corrected_value to null ONLY when issue_type="extra_value" (the value should be removed, not replaced) or for row-level issue types (below).
+
+ROW-LEVEL FIXES (use these instead of a vague count complaint whenever you can pin down the specific row):
+- CRITICAL: for these three types, "field" is the BARE array path with NO index (e.g. "lithology_intervals") — put the row's position in row_index instead, never as "field[3]". This is different from every other issue type, where field DOES include the index.
+- delete_row: a SPECIFIC row in the array is fabricated or duplicated with no supporting page content. Set row_index to that row's 0-indexed position. row_value stays null.
+- add_row: a SPECIFIC row is missing and you can read its content from the ${pageWord}. Set row_value to a JSON-encoded string of the row object (exact field names from the array's item schema; omit fields you can't verify — do not guess). row_index is the position it belongs at if you can tell (e.g. by depth order), otherwise null (append).
+- update_row: an existing row's content is substantially wrong across multiple fields at once. Set row_index to that row and row_value to the corrected JSON-encoded row object.
+- Fall back to missing_rows / extra_rows / wrong_count ONLY when you can tell the array's row count is wrong but cannot identify or reconstruct which specific row is at fault (e.g. a table partially obscured by damage). Example: a boring log's array has one row invented from a bare depth tick with no lithology description anywhere near it on the ${pageWord} — that is delete_row with row_index pointing at that row, NOT a vague wrong_count.
+
 NOT ERRORS (never flag these):
 - Enum/label normalization: "hollow_stem_auger" for "Hollow Stem Auger". Only flag if the MEANING differs.
 - Number/unit formatting: 3 and 3.0 are equal; ignore trailing zeros, thousands separators (1,000 vs 1000), and unit suffixes ("5 ft" vs 5) when the magnitude matches.
 - Date formatting (2024-01-15 vs 01/15/2024): at most "info" severity, never "error".
+- Boolean representation: if the schema declares a field as boolean, its ${pageWord} value is a form label or checkbox ("Yes"/"No", "checked"/blank, "X"), never literal text. Translate the label to true/false FIRST, then compare against the JSON's true/false — do not flag "false" against "No" (or "true" against "Yes"/"checked") as a mismatch, they are the same value.
 
 FLAG ONLY WHAT YOU CAN VERIFY ON THE ${multi ? 'PAGES' : 'PAGE'}:
 - WRONG VALUES: JSON value clearly contradicts what's printed on the ${pageWord}.
@@ -500,9 +789,10 @@ FLAG ONLY WHAT YOU CAN VERIFY ON THE ${multi ? 'PAGES' : 'PAGE'}:
 - MISSING / EXTRA ROWS: an array has fewer/more items than rows visible — ${rowRule}.
 
 Output rules:
-- If the extraction matches the ${pageWord}, return an empty issues array.
+- Organize findings into \`groups\`: one entry per top-level schema field (e.g. "lithology_intervals", "site_identification") where you found at least one issue. Omit any group with zero issues entirely — do not emit an entry with an empty issues array.
+- If the extraction matches the ${pageWord} everywhere, return an empty \`groups\` array.
 - Be specific: exact field paths with array indices (e.g., "lithology_intervals[2].primary_material").
-${fieldHints}`;
+${fieldHints}${qaHintsBlock}`;
 }
 
 /**
