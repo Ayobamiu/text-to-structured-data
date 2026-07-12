@@ -126,6 +126,16 @@ const isSampleId = (s: string): boolean => SAMPLE_RE.test(s.replace(/\s/g, ''));
 // the description band for the (primary) depth-tagged transcript.
 const DESC_HDR_RE = /^(MATERIAL|DESCRIPTION)$/i;
 
+// A page can carry SEVERAL description-ish headings: Lakeshore GP-1 has
+// "…DESCRIPTION OF MATERIAL" (x≈380-520) AND "DESCRIPTION OF OPERATION AND
+// REMARKS" (x≈985). Treating all matches as ONE header span swallowed every
+// column in between — blows/from-to/HNU numbers bled into the transcript
+// ("LIGHT BROWN FINE SAND, MINOR COARSE 18 20 0"), which broke the refiner's
+// prefix matching. Matches within this x-gap chain into one cluster; the
+// LEFTMOST cluster is the material-description column (it sits next to the
+// depth/graph columns; operator remarks live far right).
+const DESC_HDR_CLUSTER_PX = 200;
+
 // Description-band geometry (all in OCR pixels):
 const HEADER_ROW_PX = 30;       // words within this Y of the desc header = same header row
 const MIN_COL_GAP_PX = 40;      // a header word this far from the desc header (by centre) = another column
@@ -269,8 +279,17 @@ function isDepthHeader(t: string): boolean {
  * Returns [] (fail open) when the description header isn't found on this page.
  */
 function recoverDescriptionLines(W: Word[], depthAt: (y: number) => number, page: number): RecoveredLine[] {
-    const descHdrs = W.filter((w) => DESC_HDR_RE.test(w.t));
-    if (descHdrs.length === 0) return [];
+    const hdrMatches = W.filter((w) => DESC_HDR_RE.test(w.t)).sort((a, b) => a.xc - b.xc);
+    if (hdrMatches.length === 0) return [];
+
+    // Keep only the leftmost x-cluster of header matches (see
+    // DESC_HDR_CLUSTER_PX) so a far-right "DESCRIPTION OF OPERATION AND
+    // REMARKS" column can't stretch the band across the whole table.
+    const descHdrs: Word[] = [hdrMatches[0]];
+    for (let i = 1; i < hdrMatches.length; i++) {
+        if (hdrMatches[i].xc - hdrMatches[i - 1].xc > DESC_HDR_CLUSTER_PX) break;
+        descHdrs.push(hdrMatches[i]);
+    }
 
     const descMinXc = Math.min(...descHdrs.map((w) => w.xc));
     const descMaxXc = Math.max(...descHdrs.map((w) => w.xc));

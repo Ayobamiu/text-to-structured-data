@@ -468,6 +468,51 @@ function insertByDepth(cfg: GroupConfig, rows: Record<string, unknown>[], row: R
 }
 
 /**
+ * Evidence guard for merge_rows: if an ABSORBED row's text anchors to its own
+ * measured description line (same prefix logic as the snap), the log draws it
+ * as a separate layer — the merge contradicts the measurement and is dropped.
+ * Observed live (Lakeshore GP-1): gpt-4.1 merged "SAND" (10-20) into "LIGHT
+ * BROWN FINE SAND…" (20-24), two layers the ruler separates by ~8 ft; the
+ * previous run it proposed a different bad op — the guard exists because op
+ * variance is real. Legit merges survive: wrapped fragments ("fragments",
+ * "…(Roadway Fill)") and "(continued)" echoes don't BEGIN like a full
+ * evidence line, so they never anchor. Dropped per-op; other ops still apply.
+ */
+export function dropEvidenceContradictingMerges(
+    ops: RefinementOp[],
+    rows: Record<string, unknown>[],
+    geometry: DepthGeometry,
+    path: string
+): RefinementOp[] {
+    const lines = geometry.lithologyLines;
+    const anchorOf = (r: Record<string, unknown> | undefined): number | null => {
+        if (!r) return null;
+        const nd = normText(r.description_raw);
+        if (nd.length < MIN_MATCH_CHARS) return null;
+        const k = lines.findIndex((l) => {
+            const nl = normText(l.text);
+            return nl.length >= MIN_MATCH_CHARS && (nd.startsWith(nl) || nl.startsWith(nd));
+        });
+        return k >= 0 ? k : null;
+    };
+    return ops.filter((o) => {
+        if (o.op !== 'merge_rows' || !Array.isArray(o.rows)) return true;
+        const sorted = [...o.rows].sort((a, b) => a - b);
+        const survivorAnchor = anchorOf(rows[sorted[0]]);
+        const contradicted = sorted.slice(1).some((idx) => {
+            const a = anchorOf(rows[idx]);
+            return a != null && a !== survivorAnchor;
+        });
+        if (contradicted) {
+            console.warn(
+                `⚠️ depth refinement (${path}): dropped merge_rows ${sorted.join(',')} — an absorbed row has its own measured description line`
+            );
+        }
+        return !contradicted;
+    });
+}
+
+/**
  * Recompute interval bottoms mechanically: each layer runs to the next
  * layer's top; the last material layer runs to the EOB row's depth.
  */
@@ -533,8 +578,62 @@ const normText = (s: unknown): string =>
 const MIN_MATCH_CHARS = 10;
 /** Stated-number overrides may adjust a measured depth by at most this much. */
 const STATED_TOLERANCE_FT = 0.5;
-/** End-of-boring phrases as printed on logs (with or without a stated depth). */
-const EOB_RE = /bottom of (?:hole|boring)|end of boring|boring terminated|total depth/i;
+/**
+ * End-of-boring phrases as printed on logs (with or without a stated depth).
+ * Includes the "E.O.B."/"EOB" abbreviation (Lakeshore GP-1: "E.O.B. @25'"),
+ * which the phrase alternatives don't cover.
+ */
+const EOB_RE = /\bE\.?\s?O\.?\s?B\.?(?=\W|$)|bottom of (?:hole|boring)|end of boring|boring terminated|total depth/i;
+/**
+ * A stated EOB depth ("@25'", "at 45.5 feet") is authoritative and always
+ * beats the measured one — measured EOB lines overshoot by up to ~1 ft
+ * because the text sits below the terminal contact (Lakeshore measured 25.9
+ * for a stated 25; the old ±0.5 gate rejected the correction and collapsed
+ * the EOB layer). This wide window only guards against parsing a number that
+ * plainly isn't the boring depth.
+ */
+const EOB_STATED_SANITY_FT = 5;
+
+/**
+ * Kill switch for the 2026-07-05 deterministic guards: the stated-depth lock
+ * (statedTopOf), stated-EOB always-win (EOB_STATED_SANITY_FT), and the
+ * evidence merge guard (dropEvidenceContradictingMerges). Default ON; set
+ * env DEPTH_REFINEMENT_GUARDS=false to restore the pre-guard refinement
+ * behavior without a deploy (operator escape hatch, same pattern as the
+ * feature's own DEPTH_GEOMETRY_RECOVERY kill switch). Read per call so a
+ * worker restart isn't needed for tests; workers read env at boot anyway.
+ */
+export const refinementGuardsEnabled = (): boolean =>
+    (process.env.DEPTH_REFINEMENT_GUARDS || '').toLowerCase() !== 'false';
+
+/**
+ * Leading explicit interval in a lithology description ("0-1' SURFACE GRAVEL
+ * FILL", "1-10' PRE-EXISTING SAND…"): loggers print the layer's own range at
+ * the START of the text, so a leading "X-Y'" is the stated layer boundary.
+ * Ranges elsewhere in the text are sub-observations ("…MORE MED. & COARSE
+ * SAND 21.5'-24'") and must NOT count; the trailing foot-mark is required so
+ * text like "2-3 inch gravel" can't match.
+ */
+const LEADING_RANGE_RE = /^\s*(\d+(?:\.\d+)?)\s*['′]?\s*[-–—]\s*(\d+(?:\.\d+)?)\s*['′]/;
+
+/**
+ * The row's stated top depth when its own description opens with an explicit
+ * "X-Y'" interval, else null. Rows with a stated top are LOCKED against
+ * measured snapping and model set_top ops: the text is the logger's explicit
+ * boundary, and measured description lines sit a fraction of a foot BELOW the
+ * drawn contact (Lakeshore: "1-10'" line measured at 1.6 ft), so measured
+ * evidence overriding stated numbers regresses rows extraction already had
+ * exactly right. Rows without a stated top keep full measured refinement —
+ * this is what makes PARTIALLY-explicit logs work row by row.
+ */
+function statedTopOf(row: Record<string, unknown>): number | null {
+    if (!refinementGuardsEnabled()) return null; // kill switch → nothing locks
+    if (typeof row.description_raw !== 'string') return null;
+    const m = (row.description_raw as string).match(LEADING_RANGE_RE);
+    if (!m) return null;
+    const from = +m[1];
+    return from < +m[2] ? from : null;
+}
 
 /** Build an all-null row template from the union of existing rows' keys. */
 function rowTemplate(rows: Record<string, unknown>[]): Record<string, unknown> {
@@ -624,7 +723,10 @@ export function snapLithologyTops(
             const nl = normText(lines[k].text);
             if (nl.length < MIN_MATCH_CHARS) continue;
             if (nd.startsWith(nl) || nl.startsWith(nd)) {
-                if (out[i][cfg.depthField] !== lines[k].depth) {
+                // stated-locked rows still match (consuming their evidence
+                // line keeps the monotonic pointer + dup-drop correct) but
+                // their depth is never snapped to the measured value
+                if (statedTopOf(out[i]) == null && out[i][cfg.depthField] !== lines[k].depth) {
                     changes.push(`snap top row ${i}: ${out[i][cfg.depthField]} → ${lines[k].depth} ("${lines[k].text.slice(0, 40)}…")`);
                     out[i][cfg.depthField] = lines[k].depth;
                 }
@@ -653,6 +755,19 @@ export function snapLithologyTops(
         }
     }
 
+    // Stated tops beat measured. Asserted AFTER the ops+snap so it also undoes
+    // a model set_top that moved a stated row (observed: gpt-4.1 proposed
+    // set_top 1 → 1.6 against an explicit "1-10'" on Lakeshore). No-op for
+    // rows whose extracted depth already equals the stated one — the normal
+    // case, since extraction read the same text.
+    for (let i = 0; i < out.length; i++) {
+        const stated = statedTopOf(out[i]);
+        if (stated != null && out[i][cfg.depthField] !== stated) {
+            changes.push(`stated top beats measured row ${i}: ${out[i][cfg.depthField]} → ${stated}`);
+            out[i][cfg.depthField] = stated;
+        }
+    }
+
     // Deterministic EOB row: if the measured evidence shows an end-of-boring
     // line but extraction emitted no eob row, create it from the line (the
     // stated-depth override just below then refines its depth). Same
@@ -671,8 +786,8 @@ export function snapLithologyTops(
         }
     }
 
-    // Stated EOB depth beats the measured one (kills the reading tolerance
-    // at the bottom of the hole).
+    // Stated EOB depth beats the measured one (see EOB_STATED_SANITY_FT —
+    // always wins, wide window only guards against grabbing a wrong number).
     for (const r of out) {
         if (cfg.eobField && r[cfg.eobField] === true && typeof r.description_raw === 'string') {
             const m = (r.description_raw as string).match(
@@ -681,7 +796,9 @@ export function snapLithologyTops(
             if (m) {
                 const stated = +m[1];
                 const cur = r[cfg.depthField];
-                if (!isNum(cur) || Math.abs(stated - (cur as number)) <= STATED_TOLERANCE_FT) {
+                // guards off → old ±0.5 measured-adjustment window
+                const window = refinementGuardsEnabled() ? EOB_STATED_SANITY_FT : STATED_TOLERANCE_FT;
+                if (!isNum(cur) || Math.abs(stated - (cur as number)) <= window) {
                     if (cur !== stated) {
                         changes.push(`stated EOB depth: ${cur} → ${stated}`);
                         r[cfg.depthField] = stated;
@@ -858,6 +975,9 @@ export async function refineGroup(args: {
         ops = ((JSON.parse(content || '{}').ops || []) as RefinementOp[])
             // per-op anyOf shapes omit unused fields — normalize for applyOps
             .map((o) => ({ row: null, rows: null, depth_ft: null, item: null, ...(o as Partial<RefinementOp>) } as RefinementOp));
+        if (refinementGuardsEnabled()) {
+            ops = dropEvidenceContradictingMerges(ops, rows, geometry, path);
+        }
     } catch (err: any) {
         callError = err?.message || String(err);
         console.warn(`⚠️ depth refinement (${path}): refiner call failed — snapping without structure ops: ${callError}`);

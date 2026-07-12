@@ -259,6 +259,35 @@ describe('recoverDepthGeometry', () => {
         expect(geo.samples).toEqual([{ id: 'RS-1', depth: 9.2, page: 1 }]); // unchanged
     });
 
+    it('bounds the description band to the LEFTMOST header cluster (two DESCRIPTION columns)', () => {
+        // Lakeshore GP-1 layout: "…DESCRIPTION OF MATERIAL" column plus a
+        // far-right "DESCRIPTION OF OPERATION AND REMARKS" column. Merging
+        // both matches into one span swallowed the blows/from-to/HNU columns
+        // in between ("LIGHT BROWN FINE SAND, MINOR COARSE 18 20 0") which
+        // broke the refiner's prefix matching.
+        const words = [
+            word('DEPTH', 1, 460, DEPTH_X),
+            word('5', 1, 793, DEPTH_X),
+            word('10', 1, 1056, DEPTH_X),
+            word('15', 1, 1318, DEPTH_X),
+            word('GRAPH', 1, 460, 300),        // left neighbour of the desc column
+            word('DESCRIPTION', 1, 460, 420),  // material-description cluster…
+            word('MATERIAL', 1, 460, 520),     // …(gap 100 ≤ cluster px)
+            word('BLOWS', 1, 460, 700),        // right neighbour → right band edge
+            word('DESCRIPTION', 1, 460, 1000), // decoy remarks cluster (gap 480)
+            word('REMARKS', 1, 460, 1100),
+            // one content line: real description + bleed candidates at same yc
+            word('LIGHT', 1, 793, 420),
+            word('BROWN', 1, 793, 470),
+            word('SAND', 1, 793, 520),
+            word('18', 1, 793, 700),   // blows/from-to numbers — outside the band
+            word('20', 1, 793, 760),
+            word('SET', 1, 793, 1000), // remarks text — outside the band
+        ];
+        const geo = recoverDepthGeometry(words)!;
+        expect(geo.lithologyLines).toEqual([{ text: 'LIGHT BROWN SAND', depth: 4.9, page: 1 }]);
+    });
+
     it('records an actionable per-page diagnostic on the fail-open path', () => {
         const diag = { totalPages: 0, calibratedPages: 0, pages: [] as any[] };
         // page 1: a heading but no ticks; page 2: no heading at all
