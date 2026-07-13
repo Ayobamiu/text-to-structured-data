@@ -45,6 +45,77 @@ function openai() {
     return _openaiClient;
 }
 
+// ─── Rate-limit resilience ───────────────────────────────────────────
+// Running QA on many sections at once (the "QA all" flow) fans out
+// N_sections × GROUP_QA_CONCURRENCY simultaneous vision calls. A burst like
+// that can 429 every group of one section at the same moment, which turns
+// into a thrown run ("all group QA calls failed") even though a retry a few
+// seconds later succeeds — observed in production on an 8-section run.
+// Two guards:
+//   1. A process-wide semaphore caps concurrent QA calls across ALL in-flight
+//      sections (per-section GROUP_QA_CONCURRENCY still applies beneath it).
+//   2. Each call retries transient failures (429/5xx/network) with
+//      exponential backoff. The slot is released while sleeping so a stalled
+//      retry never starves other sections.
+const QA_GLOBAL_CONCURRENCY = Math.max(1, parseInt(process.env.QA_GLOBAL_CONCURRENCY || '6', 10) || 6);
+const QA_RETRY_ATTEMPTS = 3;
+
+function makeSemaphore(max) {
+    let active = 0;
+    const queue = [];
+    const runNext = () => {
+        if (active < max && queue.length > 0) {
+            active++;
+            queue.shift()();
+        }
+    };
+    return {
+        async run(fn) {
+            await new Promise((resolve) => { queue.push(resolve); runNext(); });
+            try {
+                return await fn();
+            } finally {
+                active--;
+                runNext();
+            }
+        },
+    };
+}
+const qaCallSemaphore = makeSemaphore(QA_GLOBAL_CONCURRENCY);
+
+const RETRYABLE_HTTP_STATUS = new Set([429, 500, 502, 503, 504]);
+const RETRYABLE_NET_CODES = new Set(['ETIMEDOUT', 'ECONNRESET', 'ECONNREFUSED', 'EPIPE', 'ENOTFOUND', 'EAI_AGAIN']);
+function isTransientQAError(err) {
+    if (!err) return false;
+    if (RETRYABLE_HTTP_STATUS.has(err.status)) return true;
+    if (RETRYABLE_NET_CODES.has(err.code) || RETRYABLE_NET_CODES.has(err.cause?.code)) return true;
+    return /timed? ?out|connection error/i.test(err.message || '');
+}
+
+/**
+ * Run one OpenAI QA call under the global semaphore, retrying transient
+ * failures (up to QA_RETRY_ATTEMPTS total attempts, ~1s/4s backoff + jitter).
+ * Non-transient errors (400s, parse errors) surface immediately.
+ */
+async function callQAWithRetry(label, fn) {
+    let lastErr;
+    for (let attempt = 1; attempt <= QA_RETRY_ATTEMPTS; attempt++) {
+        try {
+            return await qaCallSemaphore.run(fn);
+        } catch (err) {
+            lastErr = err;
+            if (attempt === QA_RETRY_ATTEMPTS || !isTransientQAError(err)) throw err;
+            const delayMs = Math.round(1000 * 4 ** (attempt - 1) * (0.75 + Math.random() * 0.5));
+            console.warn(
+                `⚠️ ${label}: transient failure on attempt ${attempt}/${QA_RETRY_ATTEMPTS} ` +
+                `(${err.status || err.code || err.message}) — retrying in ${delayMs}ms`
+            );
+            await new Promise((r) => setTimeout(r, delayMs));
+        }
+    }
+    throw lastErr;
+}
+
 // ─── False-positive filtering ────────────────────────────────────────
 // Prompts (system prompt, field hints, response schema) live in
 // ../config/openaiPrompts.ts — single source of truth. This service keeps
@@ -506,7 +577,7 @@ export async function runSectionQA({ fileId, sectionResultId, slug, pageNumbers,
         });
     }
 
-    const response = await openai().chat.completions.create({
+    const response = await callQAWithRetry('QA (legacy whole-record)', () => openai().chat.completions.create({
         model,
         messages: [
             {
@@ -522,7 +593,7 @@ export async function runSectionQA({ fileId, sectionResultId, slug, pageNumbers,
             },
         ],
         response_format: buildSectionQAResponseFormat(),
-    });
+    }));
 
     const result = JSON.parse(response.choices[0].message.content);
 
@@ -647,7 +718,7 @@ async function runGroupedQA({ groups, qaHints, activeSchema, cleanRecord, imageB
 
     async function qaOneGroup(group) {
         try {
-            const response = await openai().chat.completions.create({
+            const response = await callQAWithRetry(`QA group '${group.name}'`, () => openai().chat.completions.create({
                 model,
                 messages: [
                     { role: 'system', content: systemPrompt },
@@ -670,7 +741,7 @@ async function runGroupedQA({ groups, qaHints, activeSchema, cleanRecord, imageB
                     },
                 ],
                 response_format: buildGroupQAResponseFormat(),
-            });
+            }));
 
             totalTokens.prompt_tokens += response.usage?.prompt_tokens || 0;
             totalTokens.completion_tokens += response.usage?.completion_tokens || 0;
@@ -745,7 +816,7 @@ async function runGroupedQA({ groups, qaHints, activeSchema, cleanRecord, imageB
  * @param {string} params.overall_quality
  * @returns {Promise<object[]>} the saved finding rows
  */
-export async function saveQAFindings({ fileId, sectionResultId, findings, overall_quality, summary = null, qaModel = QA_MODEL }) {
+export async function saveQAFindings({ fileId, sectionResultId, findings, overall_quality, summary = null, qaModel = QA_MODEL, tokens = null }) {
     const client = await pool.connect();
     try {
         await client.query('BEGIN');
@@ -758,21 +829,44 @@ export async function saveQAFindings({ fileId, sectionResultId, findings, overal
         );
 
         // Record the run itself (incl. clean passes) so the UI can tell a
-        // QA'd-clean section from a never-QA'd one across reloads.
-        await client.query(
-            `INSERT INTO section_qa_runs
-                (file_id, section_result_id, overall_quality, summary, findings_count, qa_model, last_qa_at, updated_at)
-             VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW())
-             ON CONFLICT (file_id, section_result_id)
-             DO UPDATE SET
-                 overall_quality = EXCLUDED.overall_quality,
-                 summary = EXCLUDED.summary,
-                 findings_count = EXCLUDED.findings_count,
-                 qa_model = EXCLUDED.qa_model,
-                 last_qa_at = NOW(),
-                 updated_at = NOW()`,
-            [fileId, sectionResultId, overall_quality, summary, findings.length, qaModel]
-        );
+        // QA'd-clean section from a never-QA'd one across reloads. Token
+        // telemetry (add_tokens_to_section_qa_runs migration) is written only
+        // when the column exists — code deployed before the migration must
+        // not break QA saves (the ON CONFLICT incident of 2026-07-11 was
+        // exactly this class of code/DB skew).
+        const withTokens = await sectionQARunsHasTokensColumn(client);
+        if (withTokens) {
+            await client.query(
+                `INSERT INTO section_qa_runs
+                    (file_id, section_result_id, overall_quality, summary, findings_count, qa_model, tokens, last_qa_at, updated_at)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, NOW(), NOW())
+                 ON CONFLICT (file_id, section_result_id)
+                 DO UPDATE SET
+                     overall_quality = EXCLUDED.overall_quality,
+                     summary = EXCLUDED.summary,
+                     findings_count = EXCLUDED.findings_count,
+                     qa_model = EXCLUDED.qa_model,
+                     tokens = EXCLUDED.tokens,
+                     last_qa_at = NOW(),
+                     updated_at = NOW()`,
+                [fileId, sectionResultId, overall_quality, summary, findings.length, qaModel, tokens ? JSON.stringify(tokens) : null]
+            );
+        } else {
+            await client.query(
+                `INSERT INTO section_qa_runs
+                    (file_id, section_result_id, overall_quality, summary, findings_count, qa_model, last_qa_at, updated_at)
+                 VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW())
+                 ON CONFLICT (file_id, section_result_id)
+                 DO UPDATE SET
+                     overall_quality = EXCLUDED.overall_quality,
+                     summary = EXCLUDED.summary,
+                     findings_count = EXCLUDED.findings_count,
+                     qa_model = EXCLUDED.qa_model,
+                     last_qa_at = NOW(),
+                     updated_at = NOW()`,
+                [fileId, sectionResultId, overall_quality, summary, findings.length, qaModel]
+            );
+        }
 
         if (findings.length === 0) {
             await client.query('COMMIT');
@@ -831,6 +925,26 @@ export async function saveQAFindings({ fileId, sectionResultId, findings, overal
     } finally {
         client.release();
     }
+}
+
+// Cached once per process: does section_qa_runs have the tokens column yet?
+// (See the migration-tolerance note in saveQAFindings.)
+let _tokensColumnPresent = null;
+async function sectionQARunsHasTokensColumn(client) {
+    if (_tokensColumnPresent !== null) return _tokensColumnPresent;
+    try {
+        const r = await client.query(
+            `SELECT 1 FROM information_schema.columns
+             WHERE table_name = 'section_qa_runs' AND column_name = 'tokens'`
+        );
+        _tokensColumnPresent = r.rows.length > 0;
+        if (!_tokensColumnPresent) {
+            console.warn('⚠️ section_qa_runs.tokens column missing — run migrations/add_tokens_to_section_qa_runs.js to enable QA cost telemetry');
+        }
+    } catch {
+        _tokensColumnPresent = false;
+    }
+    return _tokensColumnPresent;
 }
 
 /**

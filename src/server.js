@@ -3696,6 +3696,7 @@ app.post("/files/:id/sections/:sectionResultId/qa", authenticateToken, async (re
             overall_quality: qaResult.overall_quality,
             summary: qaResult.summary,
             qaModel: qaResult.model,
+            tokens: qaResult.tokens || null,
         });
 
         console.log(
@@ -3799,6 +3800,7 @@ app.post("/files/:id/qa", authenticateToken, async (req, res) => {
                     overall_quality: qaResult.overall_quality,
                     summary: qaResult.summary,
                     qaModel: qaResult.model,
+                    tokens: qaResult.tokens || null,
                 });
 
                 totalFindings += savedFindings.length;
