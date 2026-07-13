@@ -720,6 +720,12 @@ async function runGroupedQA({ groups, qaHints, activeSchema, cleanRecord, imageB
         try {
             const response = await callQAWithRetry(`QA group '${group.name}'`, () => openai().chat.completions.create({
                 model,
+                // All group calls of one section share a byte-identical prefix
+                // (system prompt → record → page images). OpenAI routes
+                // requests to prompt-cache shards by prefix hash + this key;
+                // without it, the concurrent fan-out lands on different
+                // shards and misses (observed: 0-60% cached vs ~85% possible).
+                prompt_cache_key: `section-qa-${sectionResultId}`,
                 messages: [
                     { role: 'system', content: systemPrompt },
                     {
@@ -747,6 +753,15 @@ async function runGroupedQA({ groups, qaHints, activeSchema, cleanRecord, imageB
             totalTokens.completion_tokens += response.usage?.completion_tokens || 0;
             totalTokens.total_tokens += response.usage?.total_tokens || 0;
             totalTokens.cached_tokens += response.usage?.prompt_tokens_details?.cached_tokens || 0;
+            // Per-call breakdown: prompt − cached on a post-warm-up call ≈ the
+            // group instruction (sub-schema) size; cached ≈ shared-prefix
+            // credit. This is the data that decides which cost lever matters
+            // (prefix caching vs group batching vs tiering) per section shape.
+            console.log(
+                `      qa-call group='${group.name}' prompt=${response.usage?.prompt_tokens || 0} ` +
+                `cached=${response.usage?.prompt_tokens_details?.cached_tokens || 0} ` +
+                `completion=${response.usage?.completion_tokens || 0}`
+            );
 
             const result = JSON.parse(response.choices[0].message.content);
             // Focus guard: this call reviews ONE group — drop anything the
