@@ -595,6 +595,49 @@ ${groupJson}
 }
 
 /**
+ * Batched variant of buildGroupQAGroupInstruction — one trailing instruction
+ * covering SEVERAL groups (cost lever: the expensive shared prefix is sent
+ * once per batch instead of once per group). Must stay the LAST content part
+ * so the shared prefix remains byte-identical with single-group calls.
+ */
+export function buildGroupQABatchInstruction(opts: {
+    groups: Array<{
+        name: string;
+        schema: unknown;
+        value?: unknown;
+        hint?: { priority?: string; ignore?: string[]; notes?: string } | null;
+    }>;
+}): string {
+    const { groups } = opts;
+    const names = groups.map((g) => g.name);
+
+    const blocks = groups.map((g) => {
+        const hintLines: string[] = [];
+        if (g.hint?.priority) hintLines.push(`- Review priority: ${g.hint.priority}.`);
+        if (Array.isArray(g.hint?.ignore) && g.hint.ignore.length > 0) {
+            hintLines.push(`- NEVER flag these fields: ${g.hint.ignore.join(', ')}.`);
+        }
+        if (g.hint?.notes) hintLines.push(`- Reviewer guidance: ${g.hint.notes}`);
+        const hintBlock = hintLines.length > 0 ? `\nGUIDANCE FOR "${g.name}":\n${hintLines.join('\n')}` : '';
+        const valueJson = g.value === undefined ? 'null (not extracted)' : JSON.stringify(g.value, null, 2);
+        return `### GROUP "${g.name}"
+SCHEMA (authoritative — field names, types, enum lists):
+${JSON.stringify(g.schema, null, 2)}
+EXTRACTED VALUE:
+${valueJson}${hintBlock}`;
+    });
+
+    return `REVIEW THESE ${groups.length} GROUPS NOW: ${names.map((n) => `"${n}"`).join(', ')}
+(This request covers multiple groups — apply the per-group rules above to EACH group below, one at a time, with the same care as a single-group review. Do not skim later groups: work through them in order and give every group a full pass.)
+
+${blocks.join('\n\n')}
+
+- Field paths in your findings MUST start with one of: ${names.join(', ')}.
+- For add_row/update_row/delete_row, "field" is the BARE array path (e.g. "${names[0]}") — never with an index.
+- Do NOT flag fields outside these ${groups.length} groups.`;
+}
+
+/**
  * Turn an extraction JSON Schema into a compact field-path hint block so the
  * model uses EXACT field paths instead of hallucinating names. Walks the
  * top-level `properties`, classifying each as an object (nested `properties`),

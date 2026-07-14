@@ -20,6 +20,7 @@ import {
     buildGroupQACachedSystemPrompt,
     buildGroupQASharedUserText,
     buildGroupQAGroupInstruction,
+    buildGroupQABatchInstruction,
     buildGroupQAResponseFormat,
 } from '../config/openaiPrompts.ts';
 
@@ -499,7 +500,7 @@ export function verifyFindingAgainstRecord(issue, record, rootSchema = null) {
  * @param {Buffer} params.pdfBuffer      raw PDF bytes (caller provides to avoid re-download)
  * @returns {Promise<{ findings: object[], overall_quality: string, summary: string, tokens: object }>}
  */
-export async function runSectionQA({ fileId, sectionResultId, slug, pageNumbers, extractionRecord, pdfBuffer, model = QA_MODEL }) {
+export async function runSectionQA({ fileId, sectionResultId, slug, pageNumbers, extractionRecord, pdfBuffer, model = QA_MODEL, batchGroups = null }) {
     const { rasterizePdf } = await import('./pdfRasterizer.js');
 
     // Pick the pages to QA: dedupe, sort, and cap at MAX_QA_PAGES so a long
@@ -574,6 +575,7 @@ export async function runSectionQA({ fileId, sectionResultId, slug, pageNumbers,
             pageCount: pages.length,
             sectionResultId,
             model,
+            batchGroups,
         });
     }
 
@@ -682,6 +684,39 @@ export function buildFindingsSummary(findings) {
 // page images, so this bounds burst token throughput, not total cost.
 const GROUP_QA_CONCURRENCY = 3;
 
+// Group batching (cost lever): the shared prefix (system → record → images)
+// is ~83% of a section's prompt spend and OpenAI's cache retains big
+// image-bearing prefixes unreliably (measured 0-60% hit rate on identical
+// prefixes) — so the deterministic saving is sending the prefix FEWER times.
+// critical/high-priority groups keep their own focused call; everything else
+// is reviewed in shared batch calls of up to QA_BATCH_MAX_GROUPS.
+const QA_BATCH_MAX_GROUPS = Math.max(2, parseInt(process.env.QA_BATCH_MAX_GROUPS || '8', 10) || 8);
+const SOLO_PRIORITIES = new Set(['critical', 'high']);
+
+/**
+ * Partition reviewable groups into call "units": [{ groups: [...] }, ...].
+ * Disabled → one unit per group (today's behavior). Enabled → groups whose
+ * qa_hints priority is critical/high stay solo (focused attention); the rest
+ * are chunked into batches of up to maxPerBatch, preserving schema order.
+ * Pure — exported for tests.
+ */
+export function partitionGroupsForBatching(groups, qaHints = {}, { enabled = false, maxPerBatch = QA_BATCH_MAX_GROUPS } = {}) {
+    if (!enabled) return groups.map((g) => ({ groups: [g] }));
+    const units = [];
+    let batch = [];
+    for (const g of groups) {
+        if (SOLO_PRIORITIES.has(qaHints[g.name]?.priority)) {
+            units.push({ groups: [g] });
+        } else {
+            batch.push(g);
+            if (batch.length >= maxPerBatch) { units.push({ groups: batch }); batch = []; }
+        }
+    }
+    if (batch.length === 1) units.push({ groups: batch });      // lone leftover: same as solo
+    else if (batch.length > 1) units.push({ groups: batch });
+    return units;
+}
+
 /**
  * One QA call per schema group. Skips groups whose qa_hints entry sets
  * skip:true (e.g. extraction_metadata — pipeline housekeeping). A single
@@ -696,13 +731,19 @@ const GROUP_QA_CONCURRENCY = 3;
  * requests all miss it because the cache is written only after a request
  * finishes processing.
  */
-async function runGroupedQA({ groups, qaHints, activeSchema, cleanRecord, imageBlocks, renderedPages, pageCount, sectionResultId, model }) {
+async function runGroupedQA({ groups, qaHints, activeSchema, cleanRecord, imageBlocks, renderedPages, pageCount, sectionResultId, model, batchGroups = null }) {
     const toReview = groups.filter((g) => qaHints[g.name]?.skip !== true);
     const skipped = groups.length - toReview.length;
 
+    // Switch: explicit per-call option (harness A/B) wins; otherwise the
+    // QA_GROUP_BATCHING env var. Default off until validated per doc type.
+    const batching = batchGroups != null ? batchGroups === true : process.env.QA_GROUP_BATCHING === 'true';
+    const units = partitionGroupsForBatching(toReview, qaHints, { enabled: batching });
+
     console.log(
         `🔍 Per-group QA for ${sectionResultId?.substring(0, 8)}...: ` +
-        `${toReview.length} group(s)${skipped > 0 ? ` (${skipped} skipped via qa_hints)` : ''} with ${model}`
+        `${toReview.length} group(s) in ${units.length} call(s)${batching ? ' [batched]' : ''}` +
+        `${skipped > 0 ? ` (${skipped} skipped via qa_hints)` : ''} with ${model}`
     );
 
     const startedAt = Date.now();
@@ -716,11 +757,29 @@ async function runGroupedQA({ groups, qaHints, activeSchema, cleanRecord, imageB
         ...imageBlocks,
     ];
 
-    async function qaOneGroup(group) {
+    async function qaOneUnit(unit) {
+        const names = unit.groups.map((g) => g.name);
+        const label = names.join('+');
         try {
-            const response = await callQAWithRetry(`QA group '${group.name}'`, () => openai().chat.completions.create({
+            const instruction = unit.groups.length === 1
+                ? buildGroupQAGroupInstruction({
+                    groupName: unit.groups[0].name,
+                    groupSchema: unit.groups[0].schema,
+                    groupValue: cleanRecord[unit.groups[0].name],
+                    hint: qaHints[unit.groups[0].name] || null,
+                })
+                : buildGroupQABatchInstruction({
+                    groups: unit.groups.map((g) => ({
+                        name: g.name,
+                        schema: g.schema,
+                        value: cleanRecord[g.name],
+                        hint: qaHints[g.name] || null,
+                    })),
+                });
+
+            const response = await callQAWithRetry(`QA call '${label}'`, () => openai().chat.completions.create({
                 model,
-                // All group calls of one section share a byte-identical prefix
+                // All calls of one section share a byte-identical prefix
                 // (system prompt → record → page images). OpenAI routes
                 // requests to prompt-cache shards by prefix hash + this key;
                 // without it, the concurrent fan-out lands on different
@@ -732,17 +791,9 @@ async function runGroupedQA({ groups, qaHints, activeSchema, cleanRecord, imageB
                         role: 'user',
                         content: [
                             ...sharedUserParts,
-                            // Group-specific instruction LAST — everything
+                            // Unit-specific instruction LAST — everything
                             // before this point is the shared cache prefix.
-                            {
-                                type: 'text',
-                                text: buildGroupQAGroupInstruction({
-                                    groupName: group.name,
-                                    groupSchema: group.schema,
-                                    groupValue: cleanRecord[group.name],
-                                    hint: qaHints[group.name] || null,
-                                }),
-                            },
+                            { type: 'text', text: instruction },
                         ],
                     },
                 ],
@@ -754,40 +805,41 @@ async function runGroupedQA({ groups, qaHints, activeSchema, cleanRecord, imageB
             totalTokens.total_tokens += response.usage?.total_tokens || 0;
             totalTokens.cached_tokens += response.usage?.prompt_tokens_details?.cached_tokens || 0;
             // Per-call breakdown: prompt − cached on a post-warm-up call ≈ the
-            // group instruction (sub-schema) size; cached ≈ shared-prefix
-            // credit. This is the data that decides which cost lever matters
-            // (prefix caching vs group batching vs tiering) per section shape.
+            // instruction (sub-schema) size; cached ≈ shared-prefix credit.
+            // This is the data that decides which cost lever matters per
+            // section shape (prefix caching vs batching vs tiering).
             console.log(
-                `      qa-call group='${group.name}' prompt=${response.usage?.prompt_tokens || 0} ` +
+                `      qa-call group='${label}' prompt=${response.usage?.prompt_tokens || 0} ` +
                 `cached=${response.usage?.prompt_tokens_details?.cached_tokens || 0} ` +
                 `completion=${response.usage?.completion_tokens || 0}`
             );
 
             const result = JSON.parse(response.choices[0].message.content);
-            // Focus guard: this call reviews ONE group — drop anything the
-            // model flagged outside it (it sees the full record as context
-            // and occasionally wanders).
+            // Focus guard: this call reviews ONLY the unit's groups — drop
+            // anything the model flagged outside them (it sees the full
+            // record as context and occasionally wanders).
+            const inUnit = (f) => names.some((n) => f === n || f.startsWith(`${n}.`) || f.startsWith(`${n}[`));
             return (result.issues || [])
-                .filter((issue) => {
-                    const f = String(issue?.field || '');
-                    return f === group.name || f.startsWith(`${group.name}.`) || f.startsWith(`${group.name}[`);
-                })
-                .map((issue) => ({ ...issue, _group: group.name }));
+                .filter((issue) => inUnit(String(issue?.field || '')))
+                .map((issue) => {
+                    const root = String(issue?.field || '').split(/[.[]/)[0];
+                    return { ...issue, _group: root };
+                });
         } catch (err) {
-            console.warn(`⚠️ QA call failed for group '${group.name}': ${err.message}`);
-            failures.push(group.name);
+            console.warn(`⚠️ QA call failed for '${label}': ${err.message}`);
+            failures.push(label);
             return [];
         }
     }
 
-    // Warm the cache with the first group alone, then fan out the rest.
-    const [firstGroup, ...restGroups] = toReview;
-    const firstIssues = firstGroup ? await qaOneGroup(firstGroup) : [];
-    const restIssues = await mapConcurrent(restGroups, GROUP_QA_CONCURRENCY, qaOneGroup);
+    // Warm the cache with the first unit alone, then fan out the rest.
+    const [firstUnit, ...restUnits] = units;
+    const firstIssues = firstUnit ? await qaOneUnit(firstUnit) : [];
+    const restIssues = await mapConcurrent(restUnits, GROUP_QA_CONCURRENCY, qaOneUnit);
     const perGroupIssues = [firstIssues, ...restIssues];
 
-    if (failures.length === toReview.length && toReview.length > 0) {
-        throw new Error(`All ${toReview.length} group QA calls failed (last groups: ${failures.join(', ')})`);
+    if (failures.length === units.length && units.length > 0) {
+        throw new Error(`All ${units.length} QA calls failed (${failures.join(', ')})`);
     }
 
     // Same verification as always — nothing the model says is trusted until

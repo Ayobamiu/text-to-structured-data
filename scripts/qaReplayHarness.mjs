@@ -45,9 +45,10 @@ const LIMIT = parseInt(argOf('limit', '3'), 10);
 const SINCE = argOf('since', '2026-07-02');
 const SECTIONS = argOf('sections', null)?.split(',').map((s) => s.trim()).filter(Boolean) ?? null;
 const MODEL = argOf('model', null); // null → service default (QA_MODEL env / gpt-5.5)
-const COMPARE = args.includes('--compare'); // baseline (current config) vs MODEL on the same record
-if (COMPARE && !MODEL) {
-    console.error('--compare needs a candidate --model to compare against the current config');
+const BATCH = args.includes('--batch'); // candidate uses group batching (QA_GROUP_BATCHING analog)
+const COMPARE = args.includes('--compare'); // baseline (current config) vs candidate on the same record
+if (COMPARE && !MODEL && !BATCH) {
+    console.error('--compare needs a candidate config: --model <m> and/or --batch');
     process.exit(1);
 }
 
@@ -131,7 +132,7 @@ for (const t of targets) {
 
     if (!pdfCache.has(file.s3_key)) pdfCache.set(file.s3_key, await s3.downloadFile(file.s3_key));
 
-    const replay = async (modelOverride) => {
+    const replay = async (cfg) => {
         const started = Date.now();
         const qa = await runSectionQA({
             fileId: t.file_id,
@@ -140,7 +141,10 @@ for (const t of targets) {
             pageNumbers,
             extractionRecord: record,
             pdfBuffer: pdfCache.get(file.s3_key),
-            ...(modelOverride ? { model: modelOverride } : {}),
+            ...(cfg?.model ? { model: cfg.model } : {}),
+            // Explicit false for the baseline so a QA_GROUP_BATCHING=true env
+            // can't silently batch both sides of a --compare.
+            batchGroups: cfg?.batch === true,
         });
         return { ...qa, seconds: (Date.now() - started) / 1000 };
     };
@@ -151,7 +155,7 @@ for (const t of targets) {
         // Same record, two configs: the reference set is what the CURRENT
         // config finds right now — immune to the applied-fixes staleness hole.
         const base = await replay(null);
-        const cand = await replay(MODEL);
+        const cand = await replay({ model: MODEL, batch: BATCH });
         const baseKeys = new Map(base.findings.map((f) => [keyOf(f), f]));
         const candKeys = new Set(cand.findings.map((f) => keyOf(f)));
         const missed = [...baseKeys.entries()].filter(([k]) => !candKeys.has(k));
@@ -173,7 +177,7 @@ for (const t of targets) {
         console.log(
             `${label}\n` +
             `   baseline (${base.model}): ${base.findings.length} finding(s), ${base.tokens?.total_tokens || 0} tokens (${base.tokens?.cached_tokens || 0} cached), ${base.seconds.toFixed(1)}s\n` +
-            `   candidate (${cand.model}): ${cand.findings.length} finding(s), ${cand.tokens?.total_tokens || 0} tokens (${cand.tokens?.cached_tokens || 0} cached), ${cand.seconds.toFixed(1)}s\n` +
+            `   candidate (${cand.model}${BATCH ? ', batched' : ''}): ${cand.findings.length} finding(s), ${cand.tokens?.total_tokens || 0} tokens (${cand.tokens?.cached_tokens || 0} cached), ${cand.seconds.toFixed(1)}s\n` +
             `   candidate reproduced ${base.findings.length - missed.length}/${base.findings.length} of baseline` +
             `${missed.length ? ` — MISSED: ${missed.map(([, m]) => `${m.issue_type}@${m.field_path ?? m.field}[${m.severity}]`).join(', ')}` : ''}` +
             `${extras.length ? `; ${extras.length} extra(s)` : ''}`
@@ -181,7 +185,7 @@ for (const t of targets) {
         continue;
     }
 
-    const qa = await replay(MODEL);
+    const qa = await replay({ model: MODEL, batch: BATCH });
     const produced = new Map(qa.findings.map((f) => [keyOf(f), f]));
     const misses = [];
     let matched = 0;
