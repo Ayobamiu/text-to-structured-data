@@ -79,3 +79,48 @@ Real-world check: run QA on file `1ac7c59b-...` (American Hydrogeology closure r
 - Re-validate on the known-bad sections above with the per-group + caching pipeline (each run costs real gpt-5.5 tokens).
 - Cost levers if needed, in order: more `skip: true` groups → batch normal/low-priority groups into one call → model tiering per priority (`model` plumbing already per-call).
 - Under discussion: using gpt-5.5 vision **for extraction itself** (image → structured data, bypassing ExtendAI text extraction). Candidate path: add as a new extractor behind the existing `document_types.default_extractor` switch and A/B against extendai using this QA tool as judge. Not started.
+
+---
+
+# Production-feedback round (2026-07-12 → 07-13)
+
+Fixes for the five production complaints. Branches (local, committed, not pushed):
+**ai `feat/qa-reliability-telemetry`** (4a6a033 → 08377a1), **web `feat/qa-apply-anchor`** (99e52ea → e0bb0c3). Merge ai first; web's bulk-apply works against an old backend but anchors need findings that carry `actual` (all per-group findings do).
+
+## What changed
+
+| Complaint | Fix | Switch |
+|---|---|---|
+| Apply order corrupted rows (delete 6 → "update 7" hit row 8) | Apply resolves row ops by content anchor (`finding.actual`): match / relocate-if-unique / refuse. Sibling open findings re-indexed after structural applies | always on (it's correctness) |
+| Review slower than manual | "Review & apply all (N)" in the findings panel → before/after modal (strikethrough → green), untick to exclude, one confirm, one Save. Stale rows pre-excluded with reason | button appears at ≥2 applyable findings; "mark accepted" checkbox in modal (default ON) |
+| Token expensive | Group batching: critical/high `qa_hints` groups keep solo calls, rest share batch calls. Validated: 3/3 recall, 29% cheaper, faster. Savings grow as groups move to `normal` priority | `QA_GROUP_BATCHING` in .env (now `true`); `QA_BATCH_MAX_GROUPS` (default 8); per-request `batchGroups` overrides env |
+| 8-section run threw midway | 3-attempt exponential backoff on 429/5xx/timeout per call + global semaphore across sections | `QA_GLOBAL_CONCURRENCY` (default 6) |
+| (diagnosis) caching unreliable | Probes proved OpenAI drops big image-bearing prefixes (hit→miss on identical sequential calls). `prompt_cache_key` pinned per section + per-call `qa-call` token log lines. Prefix ≈ 83% of prompt spend ⇒ batching is the deterministic lever | n/a |
+
+`section_qa_runs.tokens` jsonb persists per-run token totals (migration applied 2026-07-13).
+
+## How to test
+
+1. **Anchored apply (the corruption fix)** — section with row findings on one array:
+   apply a `delete_row`, then any `update_row`/`delete_row` BELOW it → labels re-number
+   live; apply lands on the right row (message notes "row moved from N to M" when
+   relocated). Apply the same finding twice → second refuses ("row changed since QA ran").
+2. **Bulk apply** — section with ≥2 findings → "Review & apply all" → untick one, confirm
+   → JSON updated for ticked only, unticked stays open, applied ones flip to accepted
+   (if checkbox on) → Save. Then re-run QA: expect far fewer/no findings.
+3. **Batching quality** — before trusting it on a NEW doc type:
+   `node scripts/qaReplayHarness.mjs --compare --batch --limit 3` (dry run, ~2x section
+   cost) → bar: 100% recall on error-severity, judge extras by eye. Turn off anytime with
+   `QA_GROUP_BATCHING=false`.
+4. **Batch resilience** — run QA on many sections at once; per-call 429s retry with
+   backoff (watch for "attempt 2/3" warnings); total concurrent OpenAI calls capped at 6.
+5. **Cost telemetry** — `select section_result_id, qa_model, tokens from section_qa_runs
+   order by last_qa_at desc limit 10;` — compare `total_tokens` before/after flipping
+   batching; `qa-call` log lines show per-call prompt/cached/completion.
+
+## Judgment calls made without asking (each has an off switch)
+
+- `QA_GROUP_BATCHING=true` in ai/.env — validated 3/3 recall but only on borehole_log; set `false` to revert.
+- Bulk-apply modal defaults "mark applied findings as accepted" ON — untick in the modal.
+- Batched calls keep full gpt-5.5 (no model tiering yet) — tiering left for after a week of tokens telemetry; harness supports `--model X --compare` when ready.
+- Solo-call threshold = `critical|high` priority; tune per doc type via qa_hints priorities (more `normal` = cheaper).

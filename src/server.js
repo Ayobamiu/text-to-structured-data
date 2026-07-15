@@ -210,6 +210,12 @@ io.on('connection', (socket) => {
         if (!data?.jobId) return;
         io.to(`job-${data.jobId}`).emit('file-processing-event', data);
     });
+
+    // QA job progress from the worker → relay to the job room.
+    socket.on('qa-progress-event', (data) => {
+        if (!data?.jobId) return;
+        io.to(`job-${data.jobId}`).emit('qa-progress-event', data);
+    });
 });
 
 
@@ -3629,9 +3635,80 @@ app.put("/files/:id/verify", authenticateToken, requireRole('admin'), async (req
 });
 
 // ── Section QA ──────────────────────────────────────────────────────
+// QA runs are queued (file_processing_queue, mode `qa:*`) and executed by
+// the worker — the endpoints below validate, enqueue, and return 202.
+// Progress arrives over Socket.IO as `qa-progress-event` in the job room.
+
+/**
+ * Shared enqueue path for both QA endpoints. Validates the file/scope is
+ * QA-able (so callers get an immediate error, not a failed background job),
+ * dedupes against already queued/running QA jobs, enqueues, and notifies
+ * the job room that a QA run is queued.
+ */
+async function enqueueQAJob({ fileId, scope, sectionResultId = null, model = null, res }) {
+    const { buildQAMode, getActiveQAJobs, collectQARecords } = await import('./services/qaJobService.js');
+
+    // Validate now — cheap (no S3 download, no OpenAI) and gives the caller
+    // an immediate 4xx instead of a silently failing background job.
+    let file, records;
+    try {
+        ({ file, records } = await collectQARecords({ fileId, scope, sectionResultId }));
+    } catch (err) {
+        const notFound = /not found/i.test(err.message);
+        return res.status(notFound ? 404 : 400).json({ status: 'error', message: err.message });
+    }
+
+    // scope=remaining with everything already QA'd — nothing to enqueue.
+    if (!records.length) {
+        return res.json({ status: 'success', queued: false, fileId, scope, sectionResultIds: [], totalSections: 0 });
+    }
+
+    // Dedupe: one QA job per (file, scope-target) at a time. A section-scoped
+    // job only conflicts with itself or a whole-file job; a whole-file job
+    // conflicts with any active QA on the file.
+    const active = await getActiveQAJobs(fileId);
+    const conflict = scope === 'section'
+        ? active.find((j) => j.scope !== 'section' || j.sectionResultId === sectionResultId)
+        : active[0];
+    if (conflict) {
+        return res.status(409).json({
+            status: 'error',
+            message: conflict.scope === 'section'
+                ? 'QA is already running on this section'
+                : 'A QA run is already queued or running for this file',
+            activeQa: active,
+        });
+    }
+
+    await queueService.addFileToQueue(fileId, file.job_id, 0, buildQAMode({ scope, sectionResultId, model }));
+
+    // Tell the job room immediately — the worker won't emit until it picks
+    // the job up on its next poll (up to WORKER_INTERVAL_MS later).
+    const sectionResultIds = records.map((r) => r.sectionResultId);
+    io.to(`job-${file.job_id}`).emit('qa-progress-event', {
+        jobId: file.job_id,
+        fileId,
+        status: 'queued',
+        scope,
+        sectionResultIds,
+        progress: { current: 0, total: sectionResultIds.length },
+        timestamp: new Date().toISOString(),
+    });
+
+    console.log(`📥 QA job queued for ${fileId} (scope=${scope}${sectionResultId ? `, section=${sectionResultId.substring(0, 8)}...` : ''}, ${sectionResultIds.length} section(s))`);
+
+    return res.status(202).json({
+        status: 'success',
+        queued: true,
+        fileId,
+        scope,
+        sectionResultIds,
+        totalSections: sectionResultIds.length,
+    });
+}
 
 // POST /files/:id/sections/:sectionResultId/qa
-// Run VLM QA on a single section and save findings.
+// Queue a VLM QA run on a single section (processed by the worker).
 app.post("/files/:id/sections/:sectionResultId/qa", authenticateToken, async (req, res) => {
     try {
         const { id: fileId, sectionResultId } = req.params;
@@ -3639,86 +3716,21 @@ app.post("/files/:id/sections/:sectionResultId/qa", authenticateToken, async (re
         const hasAccess = await checkFileAccess(fileId, req.user, res);
         if (!hasAccess) return;
 
-        const file = await getFileResult(fileId);
-        if (!file) return res.status(404).json({ status: 'error', message: 'File not found' });
-
-        if (!file.result || typeof file.result !== 'object') {
-            return res.status(400).json({ status: 'error', message: 'File has no extraction result' });
-        }
-        if (!file.s3_key) {
-            return res.status(400).json({ status: 'error', message: 'File has no S3 key — QA requires S3 storage' });
-        }
-
-        // Find the record in the V2 envelope
-        let extractionRecord = null;
-        let slug = null;
-        for (const [s, arr] of Object.entries(file.result)) {
-            if (!Array.isArray(arr)) continue;
-            const found = arr.find(r => r?.section_result_id === sectionResultId);
-            if (found) { extractionRecord = found; slug = s; break; }
-        }
-
-        if (!extractionRecord) {
-            return res.status(404).json({ status: 'error', message: `No record with section_result_id '${sectionResultId}'` });
-        }
-
-        // Find extraction_pages for this section
-        const detected = file.detected_sections?.sections || [];
-        const section = detected.find(s => s.section_result_id === sectionResultId);
-        const pageNumbers = section?.extraction_pages || [];
-
-        if (!pageNumbers.length) {
-            return res.status(400).json({ status: 'error', message: 'No extraction pages found for this section' });
-        }
-
-        // Download PDF once
-        const s3 = new S3Service();
-        const pdfBuffer = await s3.downloadFile(file.s3_key);
-
-        const { runSectionQA, saveQAFindings } = await import('./services/sectionQAService.js');
-
-        console.log(`🔍 Running QA on section ${sectionResultId.substring(0, 8)}... (${slug}, page ${pageNumbers[0]})`);
-
-        const qaResult = await runSectionQA({
+        return await enqueueQAJob({
             fileId,
+            scope: 'section',
             sectionResultId,
-            slug,
-            pageNumbers,
-            extractionRecord,
-            pdfBuffer,
-            model: req.body?.model, // optional per-request override for A/B
-        });
-
-        const savedFindings = await saveQAFindings({
-            fileId,
-            sectionResultId,
-            findings: qaResult.findings,
-            overall_quality: qaResult.overall_quality,
-            summary: qaResult.summary,
-            qaModel: qaResult.model,
-        });
-
-        console.log(
-            `✅ QA complete for ${sectionResultId.substring(0, 8)}...: ` +
-            `${qaResult.findings.length} finding(s), quality=${qaResult.overall_quality}`
-        );
-
-        res.json({
-            status: 'success',
-            sectionResultId,
-            overall_quality: qaResult.overall_quality,
-            summary: qaResult.summary,
-            findings: savedFindings,
-            tokens: qaResult.tokens,
+            model: req.body?.model || null, // optional per-request override for A/B
+            res,
         });
     } catch (error) {
-        console.error('❌ section QA error:', error.message);
+        console.error('❌ section QA enqueue error:', error.message);
         res.status(500).json({ status: 'error', message: error.message });
     }
 });
 
 // POST /files/:id/qa
-// Run VLM QA on ALL sections in a file.
+// Queue a VLM QA run on a file's sections (all, or ?scope=remaining).
 app.post("/files/:id/qa", authenticateToken, async (req, res) => {
     try {
         const { id: fileId } = req.params;
@@ -3726,107 +3738,16 @@ app.post("/files/:id/qa", authenticateToken, async (req, res) => {
         const hasAccess = await checkFileAccess(fileId, req.user, res);
         if (!hasAccess) return;
 
-        const file = await getFileResult(fileId);
-        if (!file) return res.status(404).json({ status: 'error', message: 'File not found' });
+        const scope = (req.query?.scope ?? req.body?.scope) === 'remaining' ? 'remaining' : 'all';
 
-        if (!file.result || typeof file.result !== 'object') {
-            return res.status(400).json({ status: 'error', message: 'File has no extraction result' });
-        }
-        if (!file.s3_key) {
-            return res.status(400).json({ status: 'error', message: 'File has no S3 key' });
-        }
-
-        // Collect all records from V2 envelope
-        const allRecords = [];
-        for (const [s, arr] of Object.entries(file.result)) {
-            if (!Array.isArray(arr)) continue;
-            for (const rec of arr) {
-                if (rec?.section_result_id) allRecords.push({ slug: s, record: rec, sectionResultId: rec.section_result_id });
-            }
-        }
-
-        if (!allRecords.length) {
-            return res.status(400).json({ status: 'error', message: 'No V2 records found — is this a V2 file?' });
-        }
-
-        const detected = file.detected_sections?.sections || [];
-        const { runSectionQA, saveQAFindings, getQARuns } = await import('./services/sectionQAService.js');
-
-        // scope=remaining → only QA sections that haven't been QA'd yet (server
-        // decides authoritatively, so the client needn't loop per section).
-        const scope = req.query?.scope ?? req.body?.scope;
-        let records = allRecords;
-        if (scope === 'remaining') {
-            const runs = await getQARuns(fileId);
-            records = allRecords.filter((r) => !runs[r.sectionResultId]);
-            if (!records.length) {
-                return res.json({ status: 'success', fileId, totalSections: 0, results: [], totalFindings: 0 });
-            }
-        }
-
-        // Download PDF once for all sections
-        const s3 = new S3Service();
-        const pdfBuffer = await s3.downloadFile(file.s3_key);
-
-        console.log(`🔍 Running QA on ${records.length}/${allRecords.length} sections of ${file.filename} (scope=${scope || 'all'})...`);
-
-        const results = [];
-        let totalFindings = 0;
-
-        for (const { slug, record, sectionResultId } of records) {
-            const section = detected.find(s => s.section_result_id === sectionResultId);
-            const pageNumbers = section?.extraction_pages || [];
-            if (!pageNumbers.length) {
-                results.push({ sectionResultId, skipped: true, reason: 'no extraction pages' });
-                continue;
-            }
-
-            try {
-                const qaResult = await runSectionQA({
-                    fileId,
-                    sectionResultId,
-                    slug,
-                    pageNumbers,
-                    extractionRecord: record,
-                    pdfBuffer,
-                    model: req.body?.model, // optional per-request override for A/B
-                });
-
-                const savedFindings = await saveQAFindings({
-                    fileId,
-                    sectionResultId,
-                    findings: qaResult.findings,
-                    overall_quality: qaResult.overall_quality,
-                    summary: qaResult.summary,
-                    qaModel: qaResult.model,
-                });
-
-                totalFindings += savedFindings.length;
-                results.push({
-                    sectionResultId,
-                    slug,
-                    page: pageNumbers[0],
-                    overall_quality: qaResult.overall_quality,
-                    findingCount: savedFindings.length,
-                    findings: savedFindings,
-                });
-            } catch (err) {
-                console.warn(`⚠️ QA failed for section ${sectionResultId.substring(0, 8)}...: ${err.message}`);
-                results.push({ sectionResultId, error: err.message });
-            }
-        }
-
-        console.log(`✅ QA complete for ${file.filename}: ${totalFindings} finding(s) across ${results.length} sections`);
-
-        res.json({
-            status: 'success',
+        return await enqueueQAJob({
             fileId,
-            totalSections: records.length,
-            results,
-            totalFindings,
+            scope,
+            model: req.body?.model || null, // optional per-request override for A/B
+            res,
         });
     } catch (error) {
-        console.error('❌ file QA error:', error.message);
+        console.error('❌ file QA enqueue error:', error.message);
         res.status(500).json({ status: 'error', message: error.message });
     }
 });
@@ -3841,12 +3762,14 @@ app.get("/files/:id/qa-findings", authenticateToken, async (req, res) => {
         if (!hasAccess) return;
 
         const { getQAFindings, getQARuns } = await import('./services/sectionQAService.js');
-        const [grouped, qaRuns] = await Promise.all([
+        const { getActiveQAJobs } = await import('./services/qaJobService.js');
+        const [grouped, qaRuns, activeQa] = await Promise.all([
             getQAFindings(fileId),
             getQARuns(fileId),
+            getActiveQAJobs(fileId),
         ]);
 
-        res.json({ status: 'success', findings: grouped, qaRuns });
+        res.json({ status: 'success', findings: grouped, qaRuns, activeQa });
     } catch (error) {
         console.error('❌ get QA findings:', error.message);
         res.status(500).json({ status: 'error', message: error.message });

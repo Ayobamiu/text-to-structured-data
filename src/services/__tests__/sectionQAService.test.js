@@ -16,6 +16,7 @@ import {
     readFieldPath,
     verifyFindingAgainstRecord,
     splitSchemaIntoGroups,
+    partitionGroupsForBatching,
     resolveSchemaForPath,
     extractEnumValues,
     coerceToEnum,
@@ -750,5 +751,38 @@ describe('per-group QA prompts (prompt-caching layout)', () => {
         const schema = format.json_schema.schema;
         expect(schema.required).toEqual(['summary', 'issues']);
         expect(schema.properties.issues.items.properties.issue_type.enum).toContain('delete_row');
+    });
+});
+
+// ── partitionGroupsForBatching (cost lever: fewer prefix-sends) ────────────
+describe('partitionGroupsForBatching', () => {
+    const g = (name) => ({ name, schema: { type: 'array' } });
+    const groups = ['lith', 'samples', 'spt', 'remarks', 'meta'].map(g);
+
+    it('disabled → one unit per group (existing behavior)', () => {
+        const units = partitionGroupsForBatching(groups, {}, { enabled: false });
+        expect(units).toHaveLength(5);
+        expect(units.every((u) => u.groups.length === 1)).toBe(true);
+    });
+
+    it('enabled → critical/high stay solo, the rest batch together', () => {
+        const hints = { lith: { priority: 'critical' }, samples: { priority: 'high' }, spt: { priority: 'normal' } };
+        const units = partitionGroupsForBatching(groups, hints, { enabled: true });
+        expect(units.map((u) => u.groups.map((x) => x.name))).toEqual([
+            ['lith'], ['samples'], ['spt', 'remarks', 'meta'],
+        ]);
+    });
+
+    it('enabled → respects maxPerBatch chunking', () => {
+        const units = partitionGroupsForBatching(groups, {}, { enabled: true, maxPerBatch: 2 });
+        expect(units.map((u) => u.groups.map((x) => x.name))).toEqual([
+            ['lith', 'samples'], ['spt', 'remarks'], ['meta'],
+        ]);
+    });
+
+    it('enabled with all-high hints degrades to per-group calls', () => {
+        const hints = Object.fromEntries(groups.map((x) => [x.name, { priority: 'high' }]));
+        const units = partitionGroupsForBatching(groups, hints, { enabled: true });
+        expect(units).toHaveLength(5);
     });
 });
