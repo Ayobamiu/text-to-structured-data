@@ -19,6 +19,7 @@ import { deriveSelectedPagesAndMeta, resolveExtractionFlags } from './services/v
 import { extractAndProcessPerSection } from './services/perSectionExtractor.js';
 import { buildExtractionMetadata } from './services/fileProcessingContext.js';
 import { recordProcessingEvent } from './services/processingEventsService.js';
+import { parseQAMode, runFileQAJob } from './services/qaJobService.js';
 import { isDepthGeometryEnabled, recoverDepthGeometry } from './services/depthGeometryService.ts';
 import { refineExtractionData } from './services/depthRefinementService.ts';
 dotenv.config();
@@ -216,6 +217,16 @@ class FileProcessorWorker {
 
     async processFile(queueItem) {
         const { fileId, jobId, retries, mode = 'normal' } = queueItem;
+
+        // QA jobs share the queue but run a completely different pipeline:
+        // no extraction, no status columns, no retries (a retry would re-bill
+        // the whole VLM pass; transient OpenAI errors are already retried
+        // inside sectionQAService's callQAWithRetry).
+        const qaMode = parseQAMode(mode);
+        if (qaMode) {
+            return this.processQAJob(queueItem, qaMode);
+        }
+
         console.log(`🔄 Processing file: ${fileId} (attempt ${retries + 1}, mode: ${mode})`);
 
         // Declare confidentHits, preProcessingMetadata, usePageDetection, and jobProcessingConfig at function scope so they're accessible in all code paths
@@ -909,6 +920,57 @@ class FileProcessorWorker {
                     error.message
                 );
             }
+        }
+    }
+
+    /**
+     * Emit a QA progress event to the server (relayed to the job room as
+     * `qa-progress-event`). Not persisted — in-flight state is recoverable
+     * from the queue table (see getActiveQAJobs), findings from the QA tables.
+     */
+    emitQAProgress(jobId, fileId, evt) {
+        if (this.socket && this.socket.connected) {
+            this.socket.emit('qa-progress-event', {
+                jobId,
+                fileId,
+                timestamp: new Date().toISOString(),
+                ...evt,
+            });
+        }
+    }
+
+    /**
+     * Run a QA queue item (mode `qa:*` — see qaJobService). QA failures are
+     * terminal: the job is removed from the queue without retry so a broken
+     * file can't burn repeated VLM passes.
+     */
+    async processQAJob(queueItem, qaMode) {
+        const { fileId, jobId } = queueItem;
+        const { scope, sectionResultId, model } = qaMode;
+        console.log(`🔍 Processing QA job: ${fileId} (scope: ${scope}${sectionResultId ? `, section: ${sectionResultId.substring(0, 8)}...` : ''})`);
+
+        try {
+            await queueService.markFileAsProcessing(fileId);
+
+            await runFileQAJob({
+                fileId,
+                scope,
+                sectionResultId,
+                model,
+                onProgress: (evt) => this.emitQAProgress(jobId, fileId, { scope, ...evt }),
+            });
+
+            this.processedCount++;
+        } catch (error) {
+            console.error(`❌ QA job failed for ${fileId}:`, error.message);
+            this.errorCount++;
+            this.emitQAProgress(jobId, fileId, {
+                status: 'failed',
+                ...(sectionResultId ? { sectionResultId } : {}),
+                message: error.message,
+            });
+        } finally {
+            await queueService.removeFileFromProcessing(fileId);
         }
     }
 
