@@ -4,14 +4,9 @@
  * Every status write calls `adjustStats()` in the same transaction.
  * The summary endpoint reads a single row instead of COUNT(*).
  */
-import pg from 'pg';
-import dotenv from 'dotenv';
-import { getDatabaseUrl } from '../utils/pgConnection.js';
-
-dotenv.config();
-
-const { Pool } = pg;
-const pool = new Pool({ connectionString: getDatabaseUrl() });
+// Shared process-wide pool — do NOT create a local Pool here (the Supavisor
+// session-mode budget is tiny and shared across all processes).
+import pool from '../db/pool.js';
 
 /**
  * Ensure a stats row exists for the given job. Inserts with zeros if missing.

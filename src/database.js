@@ -1,28 +1,16 @@
-import pg from 'pg';
 import { v4 as uuidv4 } from 'uuid';
 import dotenv from 'dotenv';
 import { FileProcessingPipeline } from './pipeline/FileProcessingPipeline.js';
-import { resolvePgPoolConfig, getDatabaseUrl } from './utils/pgConnection.js';
 import { computeFlags } from './services/constraintsService.js';
 import { incrementTotal, adjustExtractionStatus, adjustProcessingStatus, decrementTotal, getStats } from './database/jobFileStats.js';
+// The one pool for this process — see src/db/pool.js for sizing rationale
+// (Supavisor session mode caps total sessions across ALL processes).
+import pool from './db/pool.js';
 
 // Only load .env file in development
 if (process.env.NODE_ENV !== 'production') {
     dotenv.config();
 }
-
-const { Pool } = pg;
-
-const defaultDbUrl = 'postgresql://postgres:password@localhost:5432/batch_processor';
-
-// Database connection pool (IPv4 + TLS SNI when needed — see resolvePgPoolConfig)
-const pool = new Pool(
-    await resolvePgPoolConfig(getDatabaseUrl(defaultDbUrl), {
-        max: 20,
-        idleTimeoutMillis: 30000,
-        connectionTimeoutMillis: 10000,
-    })
-);
 
 // Test database connection
 export async function testConnection() {

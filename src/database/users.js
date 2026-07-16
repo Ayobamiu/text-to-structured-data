@@ -4,26 +4,10 @@
  * Handles user CRUD operations, authentication, and session management
  */
 
-import pg from 'pg';
-import dotenv from 'dotenv';
 import { hashPassword, comparePassword, generateSecureToken } from '../auth.js';
-import { getDatabaseUrl } from '../utils/pgConnection.js';
-
-// Only load .env file in development
-if (process.env.NODE_ENV !== 'production') {
-    dotenv.config();
-}
-
-const { Pool } = pg;
-
-const pool = new Pool({
-    connectionString: getDatabaseUrl('postgresql://postgres:password@localhost:5432/batch_processor'),
-    // Force IPv4 to avoid Railway IPv6 issues
-    family: 4,
-    max: 20,
-    idleTimeoutMillis: 30000,
-    connectionTimeoutMillis: 10000,
-});
+// Shared process-wide pool — do NOT create a local Pool here (the Supavisor
+// session-mode budget is tiny and shared across all processes).
+import pool from '../db/pool.js';
 
 /**
  * Create a new user
