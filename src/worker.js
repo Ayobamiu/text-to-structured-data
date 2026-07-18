@@ -20,6 +20,7 @@ import { extractAndProcessPerSection } from './services/perSectionExtractor.js';
 import { buildExtractionMetadata } from './services/fileProcessingContext.js';
 import { recordProcessingEvent } from './services/processingEventsService.js';
 import { parseQAMode, runFileQAJob } from './services/qaJobService.js';
+import { parseRexMode, runDirectedReextractionJob } from './services/directedReextractionService.ts';
 import { isDepthGeometryEnabled, recoverDepthGeometry } from './services/depthGeometryService.ts';
 import { refineExtractionData } from './services/depthRefinementService.ts';
 dotenv.config();
@@ -225,6 +226,14 @@ class FileProcessorWorker {
         const qaMode = parseQAMode(mode);
         if (qaMode) {
             return this.processQAJob(queueItem, qaMode);
+        }
+
+        // Directed group re-extraction jobs (mode `rex:<requestId>`) — same
+        // share-the-queue trick as QA; the payload lives in
+        // directed_reextraction_requests.
+        const rexRequestId = parseRexMode(mode);
+        if (rexRequestId) {
+            return this.processReextractionJob(queueItem, rexRequestId);
         }
 
         console.log(`🔄 Processing file: ${fileId} (attempt ${retries + 1}, mode: ${mode})`);
@@ -969,6 +978,53 @@ class FileProcessorWorker {
                 ...(sectionResultId ? { sectionResultId } : {}),
                 message: error.message,
             });
+        } finally {
+            await queueService.removeFileFromProcessing(fileId);
+        }
+    }
+
+    /**
+     * Emit a directed re-extraction progress event to the server (relayed to
+     * the job room as `reextract-progress-event`). In-flight state is
+     * recoverable from directed_reextraction_requests; findings from the QA
+     * tables.
+     */
+    emitReextractProgress(jobId, fileId, evt) {
+        if (this.socket && this.socket.connected) {
+            this.socket.emit('reextract-progress-event', {
+                jobId,
+                fileId,
+                timestamp: new Date().toISOString(),
+                ...evt,
+            });
+        }
+    }
+
+    /**
+     * Run a directed re-extraction queue item (mode `rex:<requestId>`).
+     * Failures are terminal — no queue retry (transient OpenAI errors are
+     * retried inside the service; a retry here would re-bill vision calls).
+     * The request row records the outcome either way.
+     */
+    async processReextractionJob(queueItem, requestId) {
+        const { fileId, jobId } = queueItem;
+        console.log(`🎯 Processing directed re-extraction job: ${requestId.substring(0, 8)}... (file ${fileId})`);
+
+        try {
+            await queueService.markFileAsProcessing(fileId);
+
+            await runDirectedReextractionJob({
+                requestId,
+                onProgress: (evt) => this.emitReextractProgress(jobId, fileId, evt),
+            });
+
+            this.processedCount++;
+        } catch (error) {
+            console.error(`❌ Directed re-extraction job ${requestId.substring(0, 8)}... failed:`, error.message);
+            this.errorCount++;
+            // runDirectedReextractionJob already emitted 'failed' + updated the
+            // request row for its own errors; this catch also covers the case
+            // where the request row couldn't even be loaded.
         } finally {
             await queueService.removeFileFromProcessing(fileId);
         }

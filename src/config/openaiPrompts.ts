@@ -855,3 +855,124 @@ export function buildSectionQAUserText(
     }
     return `Review this extraction result against the source page.\n\nEXTRACTION RESULT:\n${json}`;
 }
+
+// ---------------------------------------------------------------------------
+// Directed group re-extraction (vision + strict json_schema)
+// ---------------------------------------------------------------------------
+// Operator-triggered repair tool: re-extract ONE top-level schema group from
+// the section's page images, optionally steered by an operator note about
+// what's wrong ("samples_collected is missing most rows; the table spans both
+// pages"). The model outputs the group VALUE in full (a pure extraction task
+// — the recipe that works when an operator does this by hand in ChatGPT);
+// directedReextractionService diffs it against the current value and turns
+// the differences into reviewable QA-style findings. It never overwrites data.
+
+export const DIRECTED_REEXTRACTION_RESPONSE_NAME = 'directed_group_reextraction';
+
+/**
+ * Strict response format wrapping the group's sub-schema. Active registry
+ * schemas are already strict-mode compliant (extraction uses them with
+ * strict:true), so the sub-schema needs no normalization — just a root
+ * object wrapper.
+ */
+export function buildDirectedReextractionResponseFormat(
+    groupName: string,
+    groupSchema: Record<string, unknown>
+): OpenAIResponseFormat {
+    return buildStrictJsonSchemaResponseFormat(DIRECTED_REEXTRACTION_RESPONSE_NAME, {
+        type: 'object',
+        additionalProperties: false,
+        required: [groupName],
+        properties: { [groupName]: groupSchema },
+    });
+}
+
+export function buildDirectedReextractionSystemPrompt(pageCount = 1): string {
+    const multi = pageCount > 1;
+    const pageWord = multi ? `${pageCount} page images (in order)` : 'page image';
+    return `You are re-extracting ONE field group of a structured document extraction, from scratch, using the source ${pageWord} as your ONLY source of truth.
+
+A previous automated extraction of this group has problems. An operator may include a note describing what is wrong — treat that note as authoritative about WHERE to look and what to focus on, but NEVER as data: every value you output must be readable on the ${multi ? 'pages' : 'page'}.
+
+EXTRACTION RULES:
+- The group's JSON schema is authoritative for field names, types, and enum lists. When a field declares an enum, output EXACTLY one of the declared values — pick the one that MEANS what the page shows, never a paraphrase.
+- Boolean fields: translate form labels and checkboxes ("Yes"/"No", "X", checked/blank) to literal true/false.
+- A field you cannot read on the ${multi ? 'pages' : 'page'} is null — never guess, never carry a value over from the previous extraction without seeing it on the page.
+
+FOR ARRAY GROUPS (tables) — exhaustiveness is the whole point of this request:
+- Transcribe EVERY row visible on the ${multi ? 'pages' : 'page'}. ${multi ? `Tables often continue from one page onto the next — walk ALL ${pageCount} pages before deciding you are done.` : 'Count the rows on the page before finalizing and make sure your output has the same number.'}
+- Keep rows in the order they appear in the document.
+- Do not merge adjacent rows, do not skip repeated-looking rows, do not stop early. If the table has 25 rows, output 25 rows.
+
+The previous (faulty) extraction of this group is included for context so you can interpret the operator's note — do NOT anchor on it. Read the ${multi ? 'pages' : 'page'} fresh.`;
+}
+
+/** Operator-note block shared by the full-read and patch instructions. */
+function buildOperatorNoteBlock(operatorPrompt?: string | null): string {
+    return operatorPrompt && operatorPrompt.trim()
+        ? `\n\nOPERATOR NOTE (authoritative about what needs fixing — not a source of data):\n${operatorPrompt.trim()}`
+        : '';
+}
+
+/**
+ * Shared leading user-message text for FULL-mode directed calls — identical
+ * across every group of one request (part of the prompt-cache prefix,
+ * together with the image parts the caller appends right after it). All
+ * group-specific content goes in the trailing instruction.
+ */
+export function buildDirectedReextractionSharedUserText(renderedPages: number[]): string {
+    const pagesNote = renderedPages.length > 1
+        ? `pages ${renderedPages.join(', ')}, in order — a group's data may continue across pages`
+        : `page ${renderedPages[0] ?? '?'}`;
+    return `SOURCE: ${pagesNote}. The image(s) follow this message. The group to re-extract is named after the images.`;
+}
+
+/**
+ * Trailing group-specific instruction for a FULL-mode directed call — kept
+ * LAST in the message content so the prefix (system → source note → images)
+ * stays byte-identical across a request's group calls.
+ */
+export function buildDirectedReextractionInstruction(opts: {
+    groupName: string;
+    groupSchema: unknown;
+    currentValue: unknown;
+    operatorPrompt?: string | null;
+}): string {
+    const { groupName, groupSchema, currentValue, operatorPrompt = null } = opts;
+    const currentJson = currentValue === undefined
+        ? 'null (not extracted)'
+        : JSON.stringify(currentValue, null, 2);
+
+    return `RE-EXTRACT THE GROUP "${groupName}" from the source page image(s) above.
+
+THE SCHEMA FOR "${groupName}" (authoritative — field names, types, enum lists):
+${JSON.stringify(groupSchema, null, 2)}
+
+PREVIOUS EXTRACTION OF "${groupName}" (known to have problems — context only, do NOT copy unverified values from it):
+${currentJson}${buildOperatorNoteBlock(operatorPrompt)}
+
+Output the complete corrected value for "${groupName}" — not a diff, not commentary. Every value must be readable on the page image(s).`;
+}
+
+/**
+ * Trailing instruction for a PATCH-mode directed call: a grouped-QA review
+ * of ONE group (same system prompt, shared user text, and response format as
+ * section QA's per-group calls) with the operator's note steering attention.
+ * Used for large, mostly-right arrays where re-emitting the whole value
+ * would cost output tokens ∝ array size and risk re-transcription errors in
+ * the correct rows — findings output scales with defect count instead.
+ */
+export function buildDirectedPatchInstruction(opts: {
+    groupName: string;
+    groupSchema: unknown;
+    groupValue?: unknown;
+    hint?: { priority?: string; ignore?: string[]; notes?: string } | null;
+    operatorPrompt?: string | null;
+}): string {
+    const { groupName, groupSchema, groupValue = undefined, hint = null, operatorPrompt = null } = opts;
+    const base = buildGroupQAGroupInstruction({ groupName, groupSchema, groupValue, hint });
+    const note = buildOperatorNoteBlock(operatorPrompt);
+    return `${base}${note}${note ? `
+- The operator asked for this review — prioritize what the note describes, but still report any other real discrepancy you can verify in "${groupName}".
+- Prefer row-level ops (add_row/update_row/delete_row) so each fix is independently applicable.` : ''}`;
+}

@@ -216,6 +216,12 @@ io.on('connection', (socket) => {
         if (!data?.jobId) return;
         io.to(`job-${data.jobId}`).emit('qa-progress-event', data);
     });
+
+    // Directed re-extraction progress from the worker → relay to the job room.
+    socket.on('reextract-progress-event', (data) => {
+        if (!data?.jobId) return;
+        io.to(`job-${data.jobId}`).emit('reextract-progress-event', data);
+    });
 });
 
 
@@ -3574,6 +3580,196 @@ app.post("/files/:id/sections/:sectionResultId/reprocess", authenticateToken, as
     }
 });
 
+// GET /reextract-prompts?slug=<slug>
+// Operator-note suggestions for the directed re-extraction modal, mined from
+// past requests: same-slug notes first (failure modes repeat within a doc
+// type), then most recent across all slugs.
+app.get("/reextract-prompts", authenticateToken, async (req, res) => {
+    try {
+        const slug = typeof req.query?.slug === 'string' ? req.query.slug : '';
+        const { getPromptSuggestions } = await import('./services/directedReextractionService.ts');
+        const prompts = await getPromptSuggestions({ slug, limit: 8 });
+        res.json({ status: 'success', prompts });
+    } catch (error) {
+        console.error('❌ reextract prompt suggestions:', error.message);
+        res.status(500).json({ status: 'error', message: error.message });
+    }
+});
+
+// POST /files/:id/sections/:sectionResultId/reextract-group
+// Directed group re-extraction: re-read up to 3 top-level schema groups from
+// the section's page images (vision), steered by an optional operator
+// prompt, and stage the differences as QA findings for review — never writes
+// data directly. Queued (mode `rex:<requestId>`) and executed by the worker;
+// progress arrives over Socket.IO as `reextract-progress-event`.
+// Body: { groups: string[] (or group: string), prompt?: string,
+//         pages?: number[], mode?: 'auto'|'full'|'patch', model?: string }
+app.post("/files/:id/sections/:sectionResultId/reextract-group", authenticateToken, async (req, res) => {
+    try {
+        const fileId = req.params.id;
+        const { sectionResultId } = req.params;
+
+        const {
+            MAX_REEXTRACT_GROUPS,
+            MAX_REEXTRACT_PAGES,
+            createReextractionRequest,
+            getActiveReextractionRequests,
+            buildRexMode,
+        } = await import('./services/directedReextractionService.ts');
+
+        // groups[] is the API; a single `group` string is accepted too.
+        const rawGroups = Array.isArray(req.body?.groups)
+            ? req.body.groups
+            : (typeof req.body?.group === 'string' ? [req.body.group] : []);
+        const groups = [...new Set(
+            rawGroups.map((g) => (typeof g === 'string' ? g.trim() : '')).filter(Boolean)
+        )];
+        if (groups.length === 0) {
+            return res.status(400).json({ status: 'error', message: "'groups' is required (1 to 3 group names)" });
+        }
+        if (groups.length > MAX_REEXTRACT_GROUPS) {
+            return res.status(400).json({
+                status: 'error',
+                message: `At most ${MAX_REEXTRACT_GROUPS} groups per request — each group gets its own focused call; batching more dilutes the attention that makes this work`,
+            });
+        }
+
+        const operatorPrompt = typeof req.body?.prompt === 'string' && req.body.prompt.trim()
+            ? req.body.prompt.trim()
+            : null;
+        const model = typeof req.body?.model === 'string' && req.body.model ? req.body.model : null;
+        const requestedMode = ['auto', 'full', 'patch'].includes(req.body?.mode) ? req.body.mode : 'auto';
+
+        const hasAccess = await checkFileAccess(fileId, req.user, res);
+        if (!hasAccess) return;
+
+        const file = await loadFileWithSections(fileId, res);
+        if (!file) return;
+        if (!file.s3_key) {
+            return res.status(400).json({ status: 'error', message: 'File has no S3 key — re-extraction needs the original PDF' });
+        }
+
+        const sectionIndex = resolveSectionIndex(file.detected_sections, sectionResultId);
+        if (sectionIndex < 0) {
+            return res.status(404).json({ status: 'error', message: 'Section not found' });
+        }
+        const section = file.detected_sections.sections[sectionIndex];
+        const slug = section.document_type_slug;
+        const extractionPages = Array.isArray(section.extraction_pages) ? section.extraction_pages : [];
+
+        // The record under repair, straight from the v2 envelope.
+        const envelopeArr = file.result?.[slug];
+        const record = Array.isArray(envelopeArr)
+            ? envelopeArr.find((r) => r?.section_result_id === sectionResultId)
+            : null;
+        if (!record) {
+            return res.status(404).json({ status: 'error', message: `No extraction record for section '${sectionResultId}'` });
+        }
+
+        const unknownGroups = groups.filter((g) => g === 'section_result_id' || !(g in record));
+        if (unknownGroups.length) {
+            return res.status(400).json({
+                status: 'error',
+                message: `Unknown group(s) for this section: ${unknownGroups.join(', ')}`,
+            });
+        }
+
+        // Pages: any page of the PDF is allowed (the classifier may have
+        // missed the page that actually holds the data — a known failure
+        // mode); extraction_pages is only the default. Over-cap selections
+        // fail loudly instead of being silently truncated.
+        let pages;
+        if (Array.isArray(req.body?.pages) && req.body.pages.length > 0) {
+            pages = [...new Set(req.body.pages)]
+                .filter((p) => Number.isInteger(p) && p >= 1)
+                .sort((a, b) => a - b);
+            if (!pages.length) {
+                return res.status(400).json({ status: 'error', message: "'pages' must be positive page numbers" });
+            }
+            if (pages.length > MAX_REEXTRACT_PAGES) {
+                return res.status(400).json({
+                    status: 'error',
+                    message: `At most ${MAX_REEXTRACT_PAGES} pages per request — pick the page(s) that actually hold the data`,
+                });
+            }
+            const pcRow = await pool.query(`SELECT page_count FROM job_files WHERE id = $1`, [fileId]);
+            const pageCount = pcRow.rows[0]?.page_count;
+            if (Number.isInteger(pageCount) && pageCount > 0) {
+                const beyond = pages.filter((p) => p > pageCount);
+                if (beyond.length) {
+                    return res.status(400).json({
+                        status: 'error',
+                        message: `Page(s) ${beyond.join(', ')} are beyond the PDF (${pageCount} pages)`,
+                    });
+                }
+            }
+        } else {
+            pages = extractionPages.slice(0, MAX_REEXTRACT_PAGES);
+            if (!pages.length) {
+                return res.status(400).json({ status: 'error', message: 'Section has no extraction pages — specify pages explicitly' });
+            }
+        }
+
+        // Dedupe: one active request per (section, group). Different groups
+        // of the same section may run concurrently.
+        const activeRequests = await getActiveReextractionRequests(fileId);
+        const conflict = activeRequests.find(
+            (r) => r.section_result_id === sectionResultId && r.groups.some((g) => groups.includes(g))
+        );
+        if (conflict) {
+            return res.status(409).json({
+                status: 'error',
+                message: `A re-extraction is already ${conflict.status} for group(s) ${conflict.groups.join(', ')} of this section`,
+                activeReextractions: activeRequests,
+            });
+        }
+
+        const request = await createReextractionRequest({
+            fileId,
+            sectionResultId,
+            slug,
+            groups,
+            pages,
+            prompt: operatorPrompt,
+            mode: requestedMode,
+            model,
+            requestedBy: req.user?.email ?? req.user?.id ?? null,
+        });
+
+        await queueService.addFileToQueue(fileId, file.job_id, 0, buildRexMode(request.id));
+
+        // Tell the job room immediately — the worker won't emit until it
+        // picks the job up on its next poll.
+        io.to(`job-${file.job_id}`).emit('reextract-progress-event', {
+            jobId: file.job_id,
+            fileId,
+            status: 'queued',
+            requestId: request.id,
+            sectionResultId,
+            groups,
+            timestamp: new Date().toISOString(),
+        });
+
+        console.log(
+            `📥 Directed re-extraction queued for ${file.filename} section ${sectionIndex}: ` +
+            `${groups.map((g) => `'${g}'`).join(', ')} (mode=${requestedMode}, pages=[${pages.join(', ')}])`
+        );
+
+        return res.status(202).json({
+            status: 'success',
+            queued: true,
+            requestId: request.id,
+            sectionResultId,
+            groups,
+            pages,
+            mode: requestedMode,
+        });
+    } catch (error) {
+        console.error('❌ directed group re-extraction enqueue:', error.message);
+        res.status(500).json({ status: 'error', message: error.message });
+    }
+});
+
 // Update file verification status
 app.put("/files/:id/verify", authenticateToken, requireRole('admin'), async (req, res) => {
     try {
@@ -3763,13 +3959,15 @@ app.get("/files/:id/qa-findings", authenticateToken, async (req, res) => {
 
         const { getQAFindings, getQARuns } = await import('./services/sectionQAService.js');
         const { getActiveQAJobs } = await import('./services/qaJobService.js');
-        const [grouped, qaRuns, activeQa] = await Promise.all([
+        const { getActiveReextractionRequests } = await import('./services/directedReextractionService.ts');
+        const [grouped, qaRuns, activeQa, activeReextractions] = await Promise.all([
             getQAFindings(fileId),
             getQARuns(fileId),
             getActiveQAJobs(fileId),
+            getActiveReextractionRequests(fileId),
         ]);
 
-        res.json({ status: 'success', findings: grouped, qaRuns, activeQa });
+        res.json({ status: 'success', findings: grouped, qaRuns, activeQa, activeReextractions });
     } catch (error) {
         console.error('❌ get QA findings:', error.message);
         res.status(500).json({ status: 'error', message: error.message });
