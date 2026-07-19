@@ -64,6 +64,13 @@ import {
     reextractSectionText,
     rebuildEnvelopeForSections,
 } from "./services/sectionReprocessService.js";
+import {
+    runSectionReextraction,
+    enqueueSectionReextraction,
+    computePendingSectionIndices,
+    recomputeFileReviewStatus,
+    cleanupOrphanSectionRows,
+} from "./services/sectionReextractService.ts";
 import groqService from "./services/groqService.js";
 import { recordCorrections } from "./services/correctionsService.js";
 import { getPdfPageCount } from "./utils/pdfUtils.js";
@@ -221,6 +228,13 @@ io.on('connection', (socket) => {
     socket.on('reextract-progress-event', (data) => {
         if (!data?.jobId) return;
         io.to(`job-${data.jobId}`).emit('reextract-progress-event', data);
+    });
+
+    // Section re-extraction (Save & Re-extract `sreex` jobs) progress from
+    // the worker → relay to the job room.
+    socket.on('section-reextract-progress-event', (data) => {
+        if (!data?.jobId) return;
+        io.to(`job-${data.jobId}`).emit('section-reextract-progress-event', data);
     });
 });
 
@@ -2920,265 +2934,43 @@ app.post("/files/:id/sections/save-and-reextract", authenticateToken, async (req
             });
         }
 
-        // Load pages for extraction
-        const pagesRow = await pool.query(
-            `SELECT pages FROM job_files WHERE id = $1`,
-            [fileId]
-        );
-        const filePages = pagesRow.rows[0]?.pages;
-
-        if (!filePages || !Array.isArray(filePages) || filePages.length === 0) {
-            return res.status(400).json({
-                status: 'error',
-                message: 'File has no extracted pages — run extraction first',
+        // ── Async (default for the new UI): enqueue a worker `sreex` job and
+        // return immediately. The job re-reads detected_sections at run time
+        // (we just persisted them), lands each section's result incrementally
+        // over the file-patch channel, and reports progress as
+        // `section-reextract-progress-event`. The file's processing_status is
+        // NOT flipped — the rest of the envelope stays valid and visible.
+        if (req.body?.async === true) {
+            await enqueueSectionReextraction(fileId, file.job_id);
+            emitDetectedSectionsUpdate(file, newDetectedSections);
+            return res.status(202).json({
+                status: 'queued',
+                detected_sections: newDetectedSections,
+                pending_section_indices: sectionIndices,
             });
         }
 
-        // Get job processing config
-        const jobRow = await pool.query(
-            `SELECT processing_config FROM jobs WHERE id = $1`,
-            [file.job_id]
-        );
-        if (jobRow.rows.length === 0) {
-            return res.status(404).json({ status: 'error', message: 'Job not found' });
-        }
-        // Some jobs persisted processing_config double-encoded (a JSON string
-        // stored in the jsonb column), so pg returns a string here. Normalize
-        // to an object so processing.method/options resolve instead of silently
-        // falling back to defaults.
-        let jobProcessingConfig = jobRow.rows[0].processing_config || {};
-        if (typeof jobProcessingConfig === 'string') {
-            try {
-                jobProcessingConfig = JSON.parse(jobProcessingConfig) || {};
-            } catch {
-                jobProcessingConfig = {};
-            }
-        }
-        const processingMethod = jobProcessingConfig.processing?.method || 'openai';
-        const processingOptions = jobProcessingConfig.processing?.options || {};
-
-        // ── Text-aware: pull in pages a reviewer newly assigned to a section
-        // whose text was never stored. `selected_pages[i]` is the original PDF
-        // page number whose text lives at `pages[i]`. A page in a section's
-        // extraction_pages that isn't in selected_pages has no stored text, so
-        // per-section extraction would skip it for "no content". Extract just
-        // those pages from the original PDF (scoped, using the file's original
-        // method) and merge the text into pages + selected_pages at the source.
-        let effectivePages = filePages;
-        let effectiveSelectedPages = file.selected_pages || null;
-        const pagesWithoutText = [];
-
-        if (Array.isArray(effectiveSelectedPages)) {
-            const haveText = new Set(effectiveSelectedPages);
-            const neededPages = new Set();
-            for (const i of sectionIndices) {
-                for (const p of (newDetectedSections.sections[i].extraction_pages || [])) {
-                    neededPages.add(p);
-                }
-            }
-            const missingPages = [...neededPages]
-                .filter(p => typeof p === 'number' && !haveText.has(p))
-                .sort((a, b) => a - b);
-
-            if (missingPages.length > 0) {
-                // Use the method the file was ACTUALLY extracted with (recorded
-                // on the file), so the new pages' text matches the existing
-                // pages. The job's processing_config may not carry an extraction
-                // method; default to extendai (the S3-native extractor) rather
-                // than paddleocr, which needs a running local service.
-                const exMethod = file.extraction_metadata?.extraction_method
-                    || jobProcessingConfig.extraction?.method
-                    || 'extendai';
-                const exOptions = jobProcessingConfig.extraction?.options || {};
-                console.log(
-                    `🔎 ${missingPages.length} newly-assigned page(s) lack stored text ` +
-                    `[${missingPages.join(', ')}] — scoped re-extract via ${exMethod}`
-                );
-
-                const scoped = await extractionService.extractScopedText(
-                    file.filename, file.s3_key, exMethod, exOptions, missingPages
-                );
-                if (!scoped.success) {
-                    return res.status(502).json({
-                        status: 'error',
-                        message: `Could not extract text for newly assigned page(s) [${missingPages.join(', ')}]: ${scoped.error}`,
-                    });
-                }
-
-                // Map returned pages (numbered 1..k within the filtered PDF) back
-                // to the original page via missingPages[n-1]. A page can yield
-                // several chunks, so concatenate text per original page.
-                const textByOriginal = new Map();
-                for (const pg of (scoped.pages || [])) {
-                    const n = typeof pg.page_number === 'number' ? pg.page_number : null;
-                    if (!n || n < 1 || n > missingPages.length) continue;
-                    const orig = missingPages[n - 1];
-                    const txt = (pg.text ?? pg.markdown ?? '').toString();
-                    textByOriginal.set(orig, (textByOriginal.get(orig) || '') + txt);
-                }
-
-                // Merge into the aligned (selected_pages[i] ↔ pages[i]) arrays,
-                // re-sorted by original page number and re-sequenced 1..N.
-                const merged = effectiveSelectedPages.map((orig, i) => ({
-                    orig,
-                    text: (effectivePages[i]?.text ?? effectivePages[i]?.markdown ?? '').toString(),
-                }));
-                for (const orig of missingPages) {
-                    const text = textByOriginal.get(orig) || '';
-                    if (!text.trim()) pagesWithoutText.push(orig);
-                    merged.push({ orig, text });
-                }
-                merged.sort((a, b) => a.orig - b.orig);
-                effectiveSelectedPages = merged.map(m => m.orig);
-                effectivePages = merged.map((m, i) => ({ page_number: i + 1, text: m.text }));
-
-                // Persist the enriched text at the source (not a read-time patch).
-                await updateFilePages(fileId, effectivePages);
-                await updateFileSelectedPages(fileId, effectiveSelectedPages);
-
-                if (pagesWithoutText.length > 0) {
-                    console.log(
-                        `⚠️ No extractable text for page(s) [${pagesWithoutText.join(', ')}] — ` +
-                        `their section(s) may report no content`
-                    );
-                }
-            }
-        }
-
-        // Build partial sections blob for extraction
-        const partialSections = {
-            ...newDetectedSections,
-            sections: sectionIndices.map(i => newDetectedSections.sections[i]),
-        };
-
-        const { extractAndProcessPerSection } = await import('./services/perSectionExtractor.js');
+        // ── Sync (legacy clients): same engine, in-request. ────────────
         const ProcessingService = (await import('./services/processingService.js')).default;
-        const processingService = new ProcessingService();
-
-        console.log(
-            `🔄 Save & re-extract for file ${file.filename}: ` +
-            `${sectionIndices.length} section(s) need extraction [${sectionIndices.join(', ')}]`
-        );
-
-        emitFilePatch(file.job_id, fileId, { processing_status: 'processing' });
-
-        const perSection = await extractAndProcessPerSection({
-            detectedSections: partialSections,
-            pages: effectivePages,
-            processingService,
-            processingMethod,
-            processingOptions,
-            selectedPages: effectiveSelectedPages,
-        });
-
-        if (!perSection.anySuccess) {
-            const firstError = perSection.sectionResults.find(r => r.error)?.error
-                || 'No section produced a result';
-            return res.status(500).json({ status: 'error', message: firstError });
-        }
-
-        // ID-based envelope rebuild (same logic as reextract-sections)
-        const newRecordById = new Map();
-        const slugCounters = {};
-        for (let pi = 0; pi < perSection.sectionResults.length; pi++) {
-            const sr = perSection.sectionResults[pi];
-            if (sr.status !== 'success' || !sr.section_result_id) continue;
-            const slug = sr.slug;
-            const slugArr = perSection.resultEnvelope[slug];
-            if (!slugArr) continue;
-            if (slugCounters[slug] == null) slugCounters[slug] = 0;
-            const record = slugArr[slugCounters[slug]++];
-            if (record) newRecordById.set(sr.section_result_id, { slug, record });
-        }
-
-        const oldRecordById = new Map();
-        const existingResult = file.result || {};
-        for (const [slug, arr] of Object.entries(existingResult)) {
-            if (!Array.isArray(arr)) continue;
-            for (const rec of arr) {
-                if (rec?.section_result_id) {
-                    oldRecordById.set(rec.section_result_id, { slug, record: rec });
-                }
-            }
-        }
-
-        // Write new section_result_ids to detected_sections
-        const finalDetectedSections = JSON.parse(JSON.stringify(newDetectedSections));
-        for (let pi = 0; pi < perSection.sectionResults.length; pi++) {
-            const sr = perSection.sectionResults[pi];
-            const originalIndex = sectionIndices[pi];
-            if (sr.status === 'success' && sr.section_result_id) {
-                finalDetectedSections.sections[originalIndex].section_result_id = sr.section_result_id;
-            }
-        }
-        finalDetectedSections.edits = [];
-        await updateFileDetectedSections(fileId, finalDetectedSections);
-
-        // Rebuild envelope by ID (superseded sections stay out — their
-        // canonical twin carries the data)
-        const mergedResult = {};
-        for (const section of finalDetectedSections.sections) {
-            const slug = section.document_type_slug;
-            const id = section.section_result_id;
-            if (!slug || section.superseded_by) continue;
-            if (!mergedResult[slug]) mergedResult[slug] = [];
-
-            const newEntry = id ? newRecordById.get(id) : null;
-            const oldEntry = id ? oldRecordById.get(id) : null;
-
-            if (newEntry) {
-                mergedResult[slug].push(newEntry.record);
-            } else if (oldEntry) {
-                mergedResult[slug].push(oldEntry.record);
-            }
-        }
-
-        const existingMeta = file.extraction_metadata || {};
-        const finalMetadata = {
-            ...existingMeta,
-            result_envelope: 'v2',
-            section_results: perSection.sectionResults.map((sr, pi) => ({
-                ...sr,
-                section_index: sectionIndices[pi],
-            })),
-        };
-
-        await updateFileProcessingStatus(
-            fileId, 'completed', mergedResult, null, finalMetadata,
-            perSection.totalAiTimeSeconds || null
-        );
-
-        // Sections deleted, superseded, or re-extracted under a new
-        // section_result_id leave verification/QA rows keyed to the old id —
-        // drop those and refresh the file-level review rollup.
-        await cleanupOrphanSectionRows(
+        const outcome = await runSectionReextraction({
             fileId,
-            finalDetectedSections.sections
-                .filter(s => !s.superseded_by)
-                .map(s => s.section_result_id)
-                .filter(Boolean)
-        );
-        const reviewStatus = await recomputeFileReviewStatus(fileId);
-
-        emitFilePatch(file.job_id, fileId, {
-            processing_status: 'completed',
-            result: mergedResult,
-            detected_sections: finalDetectedSections,
-            review_status: reviewStatus,
+            extractionService,
+            processingService: new ProcessingService(),
+            emitPatch: (patch) => emitFilePatch(file.job_id, fileId, patch),
         });
-        // Refresh derived list-row fields (record_count, section_review_counts)
-        await emitFileFullPatch(file.job_id, fileId, { review_status: reviewStatus });
 
-        console.log(
-            `✅ Save & re-extract completed for file ${file.filename}: ` +
-            `${perSection.sectionResults.filter(r => r.status === 'success').length} succeeded`
-        );
+        if (outcome.status === 'failed') {
+            return res.status(500).json({ status: 'error', message: outcome.error });
+        }
+
+        // Refresh derived list-row fields (record_count, section_review_counts)
+        await emitFileFullPatch(file.job_id, fileId, { review_status: outcome.reviewStatus });
 
         res.json({
             status: 'success',
-            detected_sections: finalDetectedSections,
-            sectionResults: perSection.sectionResults,
-            pages_without_text: pagesWithoutText,
+            detected_sections: outcome.detectedSections,
+            sectionResults: outcome.sectionResults,
+            pages_without_text: outcome.pagesWithoutText,
         });
     } catch (error) {
         console.error('❌ save-and-reextract:', error.message);
@@ -3207,45 +2999,13 @@ app.post("/files/:id/reextract-sections", authenticateToken, async (req, res) =>
         const file = await loadFileWithSections(fileId, res);
         if (!file) return;
 
-        // getFileResult omits the (large) pages column, so load it separately.
-        const pagesRow = await pool.query(
-            `SELECT pages FROM job_files WHERE id = $1`,
-            [fileId]
-        );
-        const filePages = pagesRow.rows[0]?.pages;
-
-        if (!filePages || !Array.isArray(filePages) || filePages.length === 0) {
+        const allSections = file.detected_sections?.sections;
+        if (!Array.isArray(allSections)) {
             return res.status(400).json({
                 status: 'error',
-                message: 'File has no extracted pages — run extraction first',
+                message: 'File has no detected_sections',
             });
         }
-
-        // Get the job's processing config
-        const jobRow = await pool.query(
-            `SELECT processing_config, schema_data FROM jobs WHERE id = $1`,
-            [file.job_id]
-        );
-        if (jobRow.rows.length === 0) {
-            return res.status(404).json({ status: 'error', message: 'Job not found' });
-        }
-        // Some jobs persisted processing_config double-encoded (a JSON string
-        // stored in the jsonb column), so pg returns a string here. Normalize
-        // to an object so processing.method/options resolve instead of silently
-        // falling back to defaults.
-        let jobProcessingConfig = jobRow.rows[0].processing_config || {};
-        if (typeof jobProcessingConfig === 'string') {
-            try {
-                jobProcessingConfig = JSON.parse(jobProcessingConfig) || {};
-            } catch {
-                jobProcessingConfig = {};
-            }
-        }
-        const processingMethod = jobProcessingConfig.processing?.method || 'openai';
-        const processingOptions = jobProcessingConfig.processing?.options || {};
-
-        // Build a subset of detected_sections containing only the requested indices
-        const allSections = file.detected_sections.sections;
         const invalidIndices = sectionIndices.filter(i => i < 0 || i >= allSections.length);
         if (invalidIndices.length > 0) {
             return res.status(400).json({
@@ -3254,169 +3014,33 @@ app.post("/files/:id/reextract-sections", authenticateToken, async (req, res) =>
             });
         }
 
-        // Create a partial detected_sections blob with only the target sections
-        const partialSections = {
-            ...file.detected_sections,
-            sections: sectionIndices.map(i => allSections[i]),
-        };
+        // Mark the requested sections as needing extraction (the service
+        // extracts exactly the null-section_result_id set), persist, run.
+        const pendingDetected = JSON.parse(JSON.stringify(file.detected_sections));
+        for (const i of sectionIndices) {
+            pendingDetected.sections[i].section_result_id = null;
+        }
+        await updateFileDetectedSections(fileId, pendingDetected);
 
-        // Import services
-        const { extractAndProcessPerSection } = await import('./services/perSectionExtractor.js');
         const ProcessingService = (await import('./services/processingService.js')).default;
-        const processingService = new ProcessingService();
-
-        console.log(
-            `🔄 Re-extracting ${sectionIndices.length} section(s) for file ${file.filename}: ` +
-            `indices [${sectionIndices.join(', ')}]`
-        );
-
-        // Emit status update
-        emitFilePatch(file.job_id, fileId, { processing_status: 'processing' });
-
-        const perSection = await extractAndProcessPerSection({
-            detectedSections: partialSections,
-            pages: filePages,
-            processingService,
-            processingMethod,
-            processingOptions,
-            selectedPages: file.selected_pages || null,
+        const outcome = await runSectionReextraction({
+            fileId,
+            extractionService,
+            processingService: new ProcessingService(),
+            emitPatch: (patch) => emitFilePatch(file.job_id, fileId, patch),
         });
 
-        if (!perSection.anySuccess) {
-            const firstError = perSection.sectionResults.find(r => r.error)?.error
-                || 'No section produced a result';
-            return res.status(500).json({ status: 'error', message: firstError });
+        if (outcome.status === 'failed') {
+            return res.status(500).json({ status: 'error', message: outcome.error });
         }
 
-        // ── ID-based envelope rebuild ──────────────────────────────────
-        //
-        // Each section in detected_sections carries a `section_result_id`
-        // (set during extraction, nulled by split/merge/slug-change).
-        // Each record in the envelope carries the same ID.
-        //
-        // Strategy:
-        // 1. Build a lookup of NEW records by section_result_id (from re-extract).
-        // 2. Build a lookup of OLD records by section_result_id (from existing envelope).
-        // 3. Write new section_result_ids back to detected_sections.
-        // 4. Walk all sections in order, pick each record by its ID.
-
-        // 1. Index new records by section_result_id
-        const newRecordById = new Map();
-        const slugCounters = {};
-        for (let pi = 0; pi < perSection.sectionResults.length; pi++) {
-            const sr = perSection.sectionResults[pi];
-            if (sr.status !== 'success' || !sr.section_result_id) continue;
-            const slug = sr.slug;
-            const slugArr = perSection.resultEnvelope[slug];
-            if (!slugArr) continue;
-
-            if (slugCounters[slug] == null) slugCounters[slug] = 0;
-            const record = slugArr[slugCounters[slug]++];
-            if (record) newRecordById.set(sr.section_result_id, { slug, record });
-        }
-
-        // 2. Index old records by section_result_id
-        const oldRecordById = new Map();
-        const existingResult = file.result || {};
-        for (const [slug, arr] of Object.entries(existingResult)) {
-            if (!Array.isArray(arr)) continue;
-            for (const rec of arr) {
-                if (rec?.section_result_id) {
-                    oldRecordById.set(rec.section_result_id, { slug, record: rec });
-                }
-            }
-        }
-
-        // 3. Write new section_result_ids back to detected_sections
-        const updatedDetectedSections = JSON.parse(JSON.stringify(file.detected_sections));
-        for (let pi = 0; pi < perSection.sectionResults.length; pi++) {
-            const sr = perSection.sectionResults[pi];
-            const originalIndex = sectionIndices[pi];
-            if (sr.status === 'success' && sr.section_result_id) {
-                updatedDetectedSections.sections[originalIndex].section_result_id = sr.section_result_id;
-            }
-        }
-        // Clear the edits array — the re-extract resolves them.
-        updatedDetectedSections.edits = [];
-        await updateFileDetectedSections(fileId, updatedDetectedSections);
-
-        // 4. Rebuild envelope: walk ALL sections, pick record by ID
-        // (superseded sections stay out — their canonical twin carries the data)
-        const mergedResult = {};
-        for (const section of updatedDetectedSections.sections) {
-            const slug = section.document_type_slug;
-            const id = section.section_result_id;
-            if (!slug || section.superseded_by) continue;
-            if (!mergedResult[slug]) mergedResult[slug] = [];
-
-            const newEntry = id ? newRecordById.get(id) : null;
-            const oldEntry = id ? oldRecordById.get(id) : null;
-
-            if (newEntry) {
-                mergedResult[slug].push(newEntry.record);
-            } else if (oldEntry) {
-                mergedResult[slug].push(oldEntry.record);
-            }
-            // If neither exists (section_result_id is null and wasn't re-extracted),
-            // the section has no record yet — skip. This is visible in the UI as a
-            // section that still needs extraction.
-        }
-
-        // Update metadata
-        const existingMeta = file.extraction_metadata || {};
-        const finalMetadata = {
-            ...existingMeta,
-            result_envelope: 'v2',
-            section_results: perSection.sectionResults.map((sr, pi) => ({
-                ...sr,
-                section_index: sectionIndices[pi],
-            })),
-            last_reextract: {
-                section_indices: sectionIndices,
-                timestamp: new Date().toISOString(),
-            },
-        };
-
-        await updateFileProcessingStatus(
-            fileId,
-            'completed',
-            mergedResult,
-            null,
-            finalMetadata,
-            perSection.totalAiTimeSeconds || null
-        );
-
-        // Re-extracted sections get a new section_result_id; drop
-        // verification/QA rows keyed to the replaced ids (and to superseded
-        // sections) and refresh the file-level review rollup.
-        await cleanupOrphanSectionRows(
-            fileId,
-            updatedDetectedSections.sections
-                .filter(s => !s.superseded_by)
-                .map(s => s.section_result_id)
-                .filter(Boolean)
-        );
-        const reviewStatus = await recomputeFileReviewStatus(fileId);
-
-        // Emit completion
-        emitFilePatch(file.job_id, fileId, {
-            processing_status: 'completed',
-            result: mergedResult,
-            detected_sections: updatedDetectedSections,
-            review_status: reviewStatus,
-        });
         // Refresh derived list-row fields (record_count, section_review_counts)
-        await emitFileFullPatch(file.job_id, fileId, { review_status: reviewStatus });
-
-        console.log(
-            `✅ Re-extraction completed for file ${file.filename}: ` +
-            `${perSection.sectionResults.filter(r => r.status === 'success').length} succeeded`
-        );
+        await emitFileFullPatch(file.job_id, fileId, { review_status: outcome.reviewStatus });
 
         res.json({
             status: 'success',
-            sectionResults: perSection.sectionResults,
-            detected_sections: updatedDetectedSections,
+            sectionResults: outcome.sectionResults,
+            detected_sections: outcome.detectedSections,
         });
     } catch (error) {
         console.error('❌ section re-extract:', error.message);
@@ -4071,59 +3695,9 @@ app.patch("/files/:id/qa-findings/:findingId", authenticateToken, async (req, re
  * compared against the total sections in the result envelope (sections never
  * verified have no row). Persists and returns the new status.
  */
-async function recomputeFileReviewStatus(fileId, client = pool) {
-    const [verRows, totalRow] = await Promise.all([
-        client.query(`SELECT status FROM section_verifications WHERE file_id = $1`, [fileId]),
-        client.query(
-            `SELECT COALESCE(SUM(jsonb_array_length(v)), 0)::int AS total
-             FROM job_files, jsonb_each(result) AS kv(k, v)
-             WHERE id = $1 AND jsonb_typeof(result) = 'object'`,
-            [fileId]
-        ),
-    ]);
-    const statuses = verRows.rows.map(r => r.status);
-    const totalSections = totalRow.rows[0]?.total ?? 0;
-    let fileReviewStatus = 'pending';
-    if (statuses.length > 0) {
-        if (statuses.every(s => s === 'approved') && statuses.length >= totalSections) {
-            fileReviewStatus = 'approved';
-        } else if (statuses.some(s => s === 'rejected')) {
-            fileReviewStatus = 'rejected';
-        } else if (statuses.some(s => s === 'approved' || s === 'in_review')) {
-            fileReviewStatus = 'in_review';
-        }
-    }
-    await client.query(
-        `UPDATE job_files SET review_status = $1, updated_at = NOW() WHERE id = $2`,
-        [fileReviewStatus, fileId]
-    );
-    return fileReviewStatus;
-}
-
-/**
- * Delete verification / QA rows keyed to section_result_ids that no longer
- * exist on the file (section deleted or re-extracted under a new id).
- * Without this, stale rows skew per-file review counts and the
- * review_status rollup. `currentIds` is the set of section_result_ids still
- * live on the file; an empty set removes all rows for the file.
- */
-async function cleanupOrphanSectionRows(fileId, currentIds) {
-    const ids = (currentIds || []).filter(Boolean);
-    const where = `file_id = $1 AND NOT (section_result_id = ANY($2::uuid[]))`;
-    const [ver, runs, findings] = await Promise.all([
-        pool.query(`DELETE FROM section_verifications WHERE ${where}`, [fileId, ids]),
-        pool.query(`DELETE FROM section_qa_runs WHERE ${where}`, [fileId, ids]),
-        pool.query(`DELETE FROM section_qa_findings WHERE ${where}`, [fileId, ids]),
-    ]);
-    const removed = (ver.rowCount || 0) + (runs.rowCount || 0) + (findings.rowCount || 0);
-    if (removed > 0) {
-        console.log(
-            `🧹 Removed ${ver.rowCount} verification / ${runs.rowCount} QA-run / ` +
-            `${findings.rowCount} QA-finding row(s) orphaned on file ${fileId}`
-        );
-    }
-    return removed;
-}
+// recomputeFileReviewStatus and cleanupOrphanSectionRows moved to
+// services/sectionReextractService.ts (imported above) so worker-run
+// re-extraction can use them too.
 
 // GET  /files/:id/section-verifications
 // Returns all verification rows for a file, keyed by section_result_id.
