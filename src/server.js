@@ -2732,7 +2732,9 @@ app.post("/files/:id/sections/:index/split", authenticateToken, async (req, res)
     }
 });
 
-// Merge two adjacent sections into one.
+// Merge two sections into one. Adjacency is NOT required: merging a log
+// section with its appendix-figure section yields a non-contiguous section
+// (member_pages union). indexA is the anchor (slug/threshold inherited).
 app.post("/files/:id/sections/merge", authenticateToken, async (req, res) => {
     try {
         const fileId = req.params.id;
@@ -2763,6 +2765,46 @@ app.post("/files/:id/sections/merge", authenticateToken, async (req, res) => {
         res.json({ status: 'success', detected_sections: updated });
     } catch (error) {
         console.error('❌ section merge:', error.message);
+        res.status(400).json({ status: 'error', message: error.message });
+    }
+});
+
+// Attach free pages (pages in no section, e.g. classified 'none') to a
+// section. The gesture for wiring an appendix page to its log when the
+// appendix never formed a section of its own. Body:
+//   { pageNumbers: number[], markAsData?: boolean }
+app.post("/files/:id/sections/:index/attach-pages", authenticateToken, async (req, res) => {
+    try {
+        const fileId = req.params.id;
+        const index = parseSectionIndex(req.params.index, res);
+        if (index === null) return;
+
+        const pageNumbers = req.body?.pageNumbers;
+        if (!Array.isArray(pageNumbers) || pageNumbers.length === 0 ||
+            !pageNumbers.every((p) => Number.isInteger(p) && p >= 1)) {
+            return res.status(400).json({
+                status: 'error',
+                message: 'pageNumbers must be a non-empty array of positive page numbers',
+            });
+        }
+
+        const markAsData = req.body?.markAsData !== false;
+
+        const hasAccess = await checkFileAccess(fileId, req.user, res);
+        if (!hasAccess) return;
+
+        const file = await loadFileWithSections(fileId, res);
+        if (!file) return;
+
+        const { applyAttachPages } = await import('./services/sectionRoutingEdits.js');
+        const updated = applyAttachPages(file.detected_sections, { index, pageNumbers, markAsData });
+
+        await updateFileDetectedSections(fileId, updated);
+        emitDetectedSectionsUpdate(file, updated);
+
+        res.json({ status: 'success', detected_sections: updated });
+    } catch (error) {
+        console.error('❌ section attach-pages:', error.message);
         res.status(400).json({ status: 'error', message: error.message });
     }
 });

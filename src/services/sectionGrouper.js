@@ -62,7 +62,15 @@ const DEFAULT_THRESHOLD = 0.75;
 // strategy v3: still slug-only boundaries; now also derives per-section
 // extraction_pages and skipped_pages from page_purpose + duplicate_of
 // (approach A + C). Boundary logic itself unchanged from v2.
-const STRATEGY_VERSION = 3;
+// strategy v4: sections carry explicit `member_pages` (sorted page numbers).
+// The grouper still only produces contiguous runs, but routing edits
+// (merge/attach in sectionRoutingEdits.js) can make sections
+// NON-CONTIGUOUS — e.g. a log on pp 2–3 plus its appendix figure on p 7.
+// From v4 on, `page_range` is a derived [min, max] display span, and
+// `page_count` counts member pages (== span width only when contiguous).
+// Readers must use member_pages (or extraction_pages) for membership,
+// never range containment.
+const STRATEGY_VERSION = 4;
 const STRATEGY_NAME = 'slug_only';
 
 // A page is included in the extractor's working set only when both:
@@ -119,6 +127,7 @@ function buildSkipEntry(page) {
  *
  * @returns {Array<{
  *   document_type_slug: string,
+ *   member_pages: number[],
  *   page_range: [number, number],
  *   page_count: number,
  *   extraction_pages: number[],
@@ -158,6 +167,7 @@ export function groupIntoSections(pages, opts = {}) {
 
         sections.push({
             document_type_slug: current.document_type_slug,
+            member_pages: current.pages.map((p) => p.page_number),
             page_range: [current.startPage, current.endPage],
             page_count: current.endPage - current.startPage + 1,
             extraction_pages,

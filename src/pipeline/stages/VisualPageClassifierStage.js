@@ -160,7 +160,10 @@ export class VisualPageClassifierStage extends PipelineStage {
 
         return {
             classifier: classification.classifier,
-            grouper: { strategy: 'record_id', version: 4 },
+            // v5: sections carry explicit member_pages (non-contiguous
+            // sections supported via routing edits; page_range is a derived
+            // [min, max] display span from v5 on).
+            grouper: { strategy: 'record_id', version: 5 },
             candidate_slugs: documentTypes.map((dt) => dt.slug),
             pages: classification.pages,
             sections,
