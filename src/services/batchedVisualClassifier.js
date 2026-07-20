@@ -353,6 +353,12 @@ export function deriveSectionsFromClassification(pageResults, opts = {}) {
         sections.push({
             document_type_slug: currentSection.document_type_slug,
             record_id: currentSection.record_id,
+            // Explicit membership (includes absorbed 'none' gap pages). The
+            // classifier only produces contiguous runs, but routing edits
+            // (merge/attach) can make member_pages non-contiguous, at which
+            // point page_range is just the [min, max] display span — never
+            // infer membership from the range.
+            member_pages: pageNumbers,
             page_range: [pageNumbers[0], pageNumbers[pageNumbers.length - 1]],
             page_count: pageNumbers.length,
             extraction_pages,
