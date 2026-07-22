@@ -34,9 +34,24 @@ const poolMax = Number.parseInt(process.env.PG_POOL_MAX || '', 10);
 const pool = new Pool(
     await resolvePgPoolConfig(getDatabaseUrl(defaultDbUrl), {
         max: Number.isFinite(poolMax) && poolMax > 0 ? poolMax : 6,
-        idleTimeoutMillis: 30000,
+        // Supabase session pooler (5432) can drop idle TLS sessions; recycle
+        // before that happens so we don't hit ssl/tls alert bad_record_mac.
+        idleTimeoutMillis: 10000,
         connectionTimeoutMillis: 10000,
+        maxLifetimeSeconds: 300,
+        keepAlive: true,
+        keepAliveInitialDelayMillis: 10000,
     })
 );
+
+// Idle clients emit 'error' when the pooler/network kills the TLS socket.
+// Without a listener, Node treats that as an unhandled error and crashes
+// (nodemon: "app crashed"). Log and let pg discard the dead client.
+pool.on('error', (err) => {
+    console.error(
+        '⚠️ Unexpected idle Postgres client error (pool will replace the connection):',
+        err.code || err.message
+    );
+});
 
 export default pool;
