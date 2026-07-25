@@ -1715,9 +1715,19 @@ app.get("/files/:id/pages/:n/thumbnail.jpg", authenticateToken, async (req, res)
             return res.status(400).json({ status: "error", message: "Invalid page number" });
         }
 
-        // Width clamped to a sane range (the classifier itself uses 768).
-        const widthPx = Math.max(128, Math.min(2048, parseInt(req.query.width, 10) || 480));
-        const jpegQuality = Math.max(40, Math.min(95, parseInt(req.query.q, 10) || 75));
+        const {
+            normalizeThumbnailRequest,
+            thumbnailKey,
+            readThumbnailManifest,
+            ensureThumbnails,
+        } = await import("./services/thumbnailService.js");
+
+        // Snap onto the cached variant ladder so arbitrary widths can't each
+        // trigger their own whole-document render.
+        const { width: widthPx, quality: jpegQuality } = normalizeThumbnailRequest({
+            width: req.query.width,
+            quality: req.query.q,
+        });
 
         // Look up the file row (need s3_key + access check).
         const client = await pool.connect();
@@ -1749,26 +1759,57 @@ app.get("/files/:id/pages/:n/thumbnail.jpg", authenticateToken, async (req, res)
             return res.status(503).json({ status: "error", message: "S3 storage disabled on this server" });
         }
 
-        const pdfBuffer = await s3.downloadFile(file.s3_key);
+        const cacheKey = thumbnailKey(file.s3_key, pageNumber, widthPx, jpegQuality);
 
-        const { rasterizePdf } = await import("./services/pdfRasterizer.js");
-        const pages = await rasterizePdf(pdfBuffer, {
-            widthPx,
-            jpegQuality,
-            firstPage: pageNumber,
-            lastPage: pageNumber,
-        });
+        // Fast path: the thumbnail already exists. One small S3 GET, streamed
+        // straight through — the source PDF is never touched.
+        let cached = await s3.getObjectStream(cacheKey);
 
-        if (pages.length === 0) {
-            return res.status(404).json({ status: "error", message: `Page ${pageNumber} not found in PDF` });
+        if (!cached) {
+            // Miss. If the document has already been rendered at this variant,
+            // the page simply doesn't exist — answer without re-rendering.
+            const manifest = await readThumbnailManifest(s3, file.s3_key, widthPx, jpegQuality);
+            if (manifest && pageNumber > manifest.pageCount) {
+                return res.status(404).json({ status: "error", message: `Page ${pageNumber} not found in PDF` });
+            }
+
+            // Cold cache: render the WHOLE document once. Concurrent requests
+            // for this file share this single render rather than each pulling
+            // their own copy of the PDF.
+            //
+            // A manifest that covers this page while the object itself is gone
+            // means the cache lost an entry (lifecycle expiry, manual delete);
+            // force a rebuild rather than 404-ing that page forever.
+            const { pageCount } = await ensureThumbnails(s3, file.s3_key, {
+                width: widthPx,
+                quality: jpegQuality,
+                force: Boolean(manifest),
+            });
+
+            if (pageNumber > pageCount) {
+                return res.status(404).json({ status: "error", message: `Page ${pageNumber} not found in PDF` });
+            }
+
+            cached = await s3.getObjectStream(cacheKey);
+            if (!cached) {
+                return res.status(404).json({ status: "error", message: `Page ${pageNumber} not found in PDF` });
+            }
         }
 
-        const jpeg = pages[0].jpeg;
         // Browser cache: thumbnails are deterministic for a given file+page+options.
         res.set('Content-Type', 'image/jpeg');
         res.set('Cache-Control', 'private, max-age=86400, immutable');
-        res.set('Content-Length', String(jpeg.length));
-        res.send(jpeg);
+        if (cached.contentLength != null) res.set('Content-Length', String(cached.contentLength));
+        if (cached.etag) res.set('ETag', cached.etag);
+
+        cached.body.on('error', (err) => {
+            console.error(`❌ Error streaming thumbnail ${cacheKey}:`, err.message);
+            res.destroy(err);
+        });
+        // The page rail aborts in-flight thumbnail fetches while scrolling;
+        // tear the S3 stream down with the response instead of leaking it.
+        res.on('close', () => cached.body.destroy());
+        cached.body.pipe(res);
     } catch (error) {
         console.error(`❌ Error rendering page thumbnail:`, error.message);
         res.status(500).json({ status: "error", message: error.message });
