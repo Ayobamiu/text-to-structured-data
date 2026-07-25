@@ -3,6 +3,7 @@ import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import crypto from 'crypto';
 import path from 'path';
 import fs from 'fs';
+import { pipeline } from 'stream/promises';
 import dotenv from 'dotenv';
 
 dotenv.config();
@@ -241,6 +242,82 @@ class S3Service {
             console.error(`❌ Error downloading file from S3 (${s3Key}):`, error.message);
             throw error;
         }
+    }
+
+    /**
+     * Stream an object straight to a local path — never materialises it on
+     * the heap. Use this instead of `downloadFile` for anything large where
+     * the consumer wants a file path anyway (e.g. pdftoppm). Returns the
+     * number of bytes written.
+     */
+    async downloadToFile(s3Key, destPath) {
+        if (!this.enabled) {
+            throw new Error('S3 storage is disabled');
+        }
+
+        try {
+            const command = new GetObjectCommand({
+                Bucket: this.bucketName,
+                Key: s3Key
+            });
+
+            const response = await this.s3Client.send(command);
+            await pipeline(response.Body, fs.createWriteStream(destPath));
+
+            const { size } = fs.statSync(destPath);
+            console.log(`✅ File streamed from S3 to disk: ${s3Key} (${size} bytes)`);
+            return size;
+        } catch (error) {
+            console.error(`❌ Error streaming file from S3 (${s3Key}):`, error.message);
+            throw error;
+        }
+    }
+
+    /**
+     * Open an object for reading without buffering it. Returns null when the
+     * key does not exist, so callers can treat "cache miss" as a normal path
+     * rather than an exception. The caller owns the returned stream.
+     */
+    async getObjectStream(s3Key) {
+        if (!this.enabled) {
+            throw new Error('S3 storage is disabled');
+        }
+
+        try {
+            const response = await this.s3Client.send(new GetObjectCommand({
+                Bucket: this.bucketName,
+                Key: s3Key
+            }));
+
+            return {
+                body: response.Body,
+                contentType: response.ContentType,
+                contentLength: response.ContentLength,
+                etag: response.ETag,
+            };
+        } catch (error) {
+            if (error.name === 'NoSuchKey' || error.name === 'NotFound' || error.$metadata?.httpStatusCode === 404) {
+                return null;
+            }
+            throw error;
+        }
+    }
+
+    /** Put an already-in-memory buffer at an exact key (no filename mangling). */
+    async uploadBuffer(s3Key, buffer, contentType = 'application/octet-stream', metadata = {}) {
+        if (!this.enabled) {
+            throw new Error('S3 storage is disabled');
+        }
+
+        await this.s3Client.send(new PutObjectCommand({
+            Bucket: this.bucketName,
+            Key: s3Key,
+            Body: buffer,
+            ContentType: contentType,
+            Metadata: metadata,
+        }));
+
+        return s3Key;
     }
 
     // Delete file from S3
