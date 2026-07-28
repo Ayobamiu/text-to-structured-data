@@ -278,6 +278,66 @@ describe('applyAttachPages', () => {
         expect(() => applyAttachPages(blob, { index: 0, pageNumbers: [0] }))
             .toThrow(/non-empty|positive/);
     });
+
+    // "Include skipped pages": the page is ALREADY a member of this section,
+    // it was just left out of extraction_pages because the classifier called
+    // it attachment/unknown/figure. The ownership guard must not treat that as
+    // a conflict — doing so made the gesture impossible for every section.
+    it('includes a skipped page that is already a member of this section', () => {
+        const blob = makeBlob();
+        // p2 is a member of section 0 but classified 'figure' => skipped.
+        blob.pages[1] = page(2, 'borehole_log', { purpose: 'figure' });
+        blob.sections[0] = section({
+            document_type_slug: 'borehole_log',
+            member_pages: [1, 2],
+            page_range: [1, 2],
+            extraction_pages: [1],
+            skipped_pages: [{ page_number: 2, reason: 'figure' }],
+        });
+
+        const out = applyAttachPages(blob, { index: 0, pageNumbers: [2] });
+        const s = out.sections[0];
+        expect(s.member_pages).toEqual([1, 2]);       // membership unchanged
+        expect(s.extraction_pages).toEqual([1, 2]);   // pulled back in
+        expect(s.skipped_pages).toEqual([]);
+        expect(s.section_result_id).toBeNull();       // queued for re-extract
+        // Neighbouring section untouched.
+        expect(out.sections[1].extraction_pages).toEqual([4, 5, 6]);
+    });
+
+    // The MW-1 shape from job_files dedf446d: every member page classified
+    // non-data, so extraction_pages is empty and the section yields NO record.
+    // This is the repair path — it must be reachable.
+    it('repairs a section whose pages were all skipped (zero extraction pages)', () => {
+        const blob = makeBlob();
+        blob.pages[0] = page(1, 'none', { purpose: 'unknown', confidence: 0.8 });
+        blob.pages[1] = page(2, 'borehole_log', { purpose: 'attachment' });
+        blob.sections[0] = section({
+            document_type_slug: 'borehole_log',
+            member_pages: [1, 2],
+            page_range: [1, 2],
+            extraction_pages: [],
+            skipped_pages: [
+                { page_number: 1, reason: 'unknown' },
+                { page_number: 2, reason: 'attachment' },
+            ],
+            section_result_id: null,
+        });
+
+        const out = applyAttachPages(blob, { index: 0, pageNumbers: [1, 2] });
+        const s = out.sections[0];
+        expect(s.extraction_pages).toEqual([1, 2]);
+        expect(s.skipped_pages).toEqual([]);
+        expect(getMemberPages(s)).toEqual([1, 2]);
+        // Input blob must not be mutated.
+        expect(blob.sections[0].extraction_pages).toEqual([]);
+    });
+
+    it('rejects a page that is already being extracted in this section', () => {
+        const blob = makeBlob();
+        expect(() => applyAttachPages(blob, { index: 0, pageNumbers: [1] }))
+            .toThrow(/already extracted/);
+    });
 });
 
 // ---------------------------------------------------------------------------
