@@ -3,10 +3,14 @@
  * shared by the HTTP endpoints (sync legacy path) and the worker (queued
  * `sreex` jobs, the default path for the routing UI).
  *
- * Job state lives in `detected_sections` itself, NOT a request table:
- * "what needs extraction" is exactly `section_result_id == null &&
- * !superseded_by`, and the save endpoint persists the edited sections
- * BEFORE anything is enqueued. That makes the job:
+ * Job state lives in `detected_sections` itself, NOT a request table. Two
+ * independent per-section markers say what a section still owes:
+ *   - `section_result_id == null && !superseded_by` → needs AI extraction
+ *   - `needs_text_reextract === true`               → needs its pages re-OCR'd
+ * The endpoints persist the edited sections BEFORE anything is enqueued.
+ * Single-section reprocess ("Re-run Text Extraction" / "Re-run AI
+ * Processing") is just those two markers set on one section, which is why it
+ * needs no mode of its own. That makes the job:
  *   - idempotent      (re-running extracts only still-null sections),
  *   - crash-resumable (each finished section persists incrementally),
  *   - edit-tolerant   (the worker re-reads the latest sections at run time,
@@ -40,12 +44,19 @@ export const SECTION_REEXTRACT_MODE = 'sreex';
 
 type AnyRecord = Record<string, any>;
 
+/** Per-section marker: re-OCR this section's extraction_pages before extracting.
+ *  Set by "Reprocess section → Re-run Text Extraction"; cleared by the job once
+ *  the fresh text is persisted. */
+export const TEXT_REEXTRACT_FLAG = 'needs_text_reextract';
+
 export interface SectionReextractProgress {
     phase: 'started' | 'section' | 'done' | 'failed';
     completed: number;
     total: number;
     section_index?: number;
     slug?: string;
+    /** 'success' | 'error' from extraction, or 'text_reextracted' for a
+     *  section whose only work was a re-OCR. */
     status?: string;
     error?: string;
 }
@@ -68,6 +79,8 @@ export interface RunSectionReextractionArgs {
 export interface RunSectionReextractionResult {
     status: 'success' | 'no_sections' | 'failed';
     sectionIndices: number[];
+    /** Sections whose pages were force re-OCR'd this run. */
+    textReextractIndices: number[];
     sectionResults: AnyRecord[];
     pagesWithoutText: number[];
     detectedSections: AnyRecord | null;
@@ -86,6 +99,32 @@ export function computePendingSectionIndices(sections: AnyRecord[] | null | unde
     return sections
         .map((s, i) => (s?.section_result_id == null && !s?.superseded_by ? i : -1))
         .filter((i) => i >= 0);
+}
+
+/**
+ * Indices of sections whose pages must be re-OCR'd before extraction — the
+ * "Re-run Text Extraction" half of single-section reprocess. Independent of
+ * the AI-pending set: a section can need only the re-OCR (keeps its record),
+ * only extraction, or both.
+ */
+export function computeTextReextractIndices(sections: AnyRecord[] | null | undefined): number[] {
+    if (!Array.isArray(sections)) return [];
+    return sections
+        .map((s, i) => (s?.[TEXT_REEXTRACT_FLAG] === true && !s?.superseded_by ? i : -1))
+        .filter((i) => i >= 0);
+}
+
+/**
+ * Every section this job will touch, in document order — the AI-pending set
+ * plus the re-OCR set. Drives the progress denominator so a text-only
+ * reprocess still reports 0/1 → 1/1 rather than 0/0.
+ */
+export function computeTouchedSectionIndices(sections: AnyRecord[] | null | undefined): number[] {
+    const union = new Set([
+        ...computePendingSectionIndices(sections),
+        ...computeTextReextractIndices(sections),
+    ]);
+    return [...union].sort((a, b) => a - b);
 }
 
 /**
@@ -130,8 +169,9 @@ export function indexRecordsById(
 /**
  * Enqueue a section re-extraction job for the file. Deduped: if a `sreex`
  * item is already queued for this file, this is a no-op (the queued run
- * re-reads detected_sections at run time, so it picks the new edits up).
- * Returns true when a new queue item was created.
+ * re-reads detected_sections at run time, so it picks up markers set after
+ * it was enqueued — a second Save, or a reprocess on another section, folds
+ * into the pending run). Returns true when a new queue item was created.
  */
 export async function enqueueSectionReextraction(fileId: string, jobId: string): Promise<boolean> {
     const existing = await pool.query(
@@ -257,10 +297,13 @@ export async function runSectionReextraction({
     }
 
     const sectionIndices = computePendingSectionIndices(detectedSections.sections);
-    if (sectionIndices.length === 0) {
+    const textReextractIndices = computeTextReextractIndices(detectedSections.sections);
+    const touchedIndices = computeTouchedSectionIndices(detectedSections.sections);
+    if (touchedIndices.length === 0) {
         return {
             status: 'no_sections',
             sectionIndices: [],
+            textReextractIndices: [],
             sectionResults: [],
             pagesWithoutText: [],
             detectedSections,
@@ -288,89 +331,143 @@ export async function runSectionReextraction({
         ? file.selected_pages
         : (parseMaybeJson(file.selected_pages) as number[] | null);
 
-    progress({ phase: 'started', completed: 0, total: sectionIndices.length });
+    progress({ phase: 'started', completed: 0, total: touchedIndices.length });
 
-    // ── Text backfill for newly-assigned pages ─────────────────────────
-    // `selected_pages[i]` is the original PDF page number whose text lives at
-    // `pages[i]`. A page a reviewer newly assigned to a section has no stored
-    // text, so per-section extraction would skip it for "no content". Extract
-    // just those pages from the original PDF and merge at the source.
+    // ── Page text: backfill + forced re-OCR ────────────────────────────
+    // Two reasons a page needs OCR before extraction can run:
+    //   1. BACKFILL — a page a reviewer newly assigned to a section has no
+    //      stored text (`selected_pages[i]` is the original PDF page whose
+    //      text lives at `pages[i]`), so per-section extraction would skip it
+    //      for "no content".
+    //   2. FORCED — the operator asked for "Re-run Text Extraction" on a
+    //      section, so its pages are re-OCR'd even though text already exists.
+    // Both are the same operation on different page sets, so they run as ONE
+    // scoped extraction through reextractSectionText (which replaces existing
+    // page text in place and inserts missing pages, aligned or not).
     let effectivePages = filePages;
     let effectiveSelectedPages = selectedPages;
-    const pagesWithoutText: number[] = [];
+    let pagesWithoutText: number[] = [];
 
+    const pagesToOcr = new Set<number>();
+    // Forced: every page of every section flagged for re-OCR.
+    for (const i of textReextractIndices) {
+        for (const p of (detectedSections.sections[i].extraction_pages || [])) {
+            if (typeof p === 'number') pagesToOcr.add(p);
+        }
+    }
+    // Backfill: pages of pending sections with no stored text. Only
+    // determinable when selected_pages exists — without it, pages[] is keyed
+    // by original page number and nothing is "missing" by construction.
     if (Array.isArray(effectiveSelectedPages)) {
         const haveText = new Set(effectiveSelectedPages);
-        const neededPages = new Set<number>();
         for (const i of sectionIndices) {
             for (const p of (detectedSections.sections[i].extraction_pages || [])) {
-                neededPages.add(p);
+                if (typeof p === 'number' && !haveText.has(p)) pagesToOcr.add(p);
             }
         }
-        const missingPages = [...neededPages]
-            .filter((p) => typeof p === 'number' && !haveText.has(p))
-            .sort((a, b) => a - b);
+    }
 
-        if (missingPages.length > 0) {
-            // Use the method the file was ACTUALLY extracted with, so the new
-            // pages' text matches the existing pages. Default extendai (the
-            // S3-native extractor) rather than paddleocr, which needs a
-            // running local service.
-            const existingMeta = parseMaybeJson(file.extraction_metadata) || {};
-            const exMethod = existingMeta.extraction_method
-                || jobProcessingConfig.extraction?.method
-                || 'extendai';
-            const exOptions = jobProcessingConfig.extraction?.options || {};
-            console.log(
-                `🔎 ${missingPages.length} newly-assigned page(s) lack stored text ` +
-                `[${missingPages.join(', ')}] — scoped re-extract via ${exMethod}`,
+    if (pagesToOcr.size > 0) {
+        const targets = [...pagesToOcr].sort((a, b) => a - b);
+        // Use the method the file was ACTUALLY extracted with, so the new
+        // pages' text matches the existing pages. Default extendai (the
+        // S3-native extractor) rather than paddleocr, which needs a
+        // running local service.
+        const existingMeta = parseMaybeJson(file.extraction_metadata) || {};
+        const exMethod = existingMeta.extraction_method
+            || jobProcessingConfig.extraction?.method
+            || 'extendai';
+        const exOptions = jobProcessingConfig.extraction?.options || {};
+        console.log(
+            `🔎 Scoped text extraction for ${targets.length} page(s) ` +
+            `[${targets.join(', ')}] via ${exMethod} ` +
+            `(${textReextractIndices.length} section(s) forced, rest backfill)`,
+        );
+
+        const { reextractSectionText } = await import('./sectionReprocessService.js');
+        const re = await reextractSectionText({
+            extractionService,
+            file,
+            pages: effectivePages,
+            selectedPages: effectiveSelectedPages,
+            pageNumbers: targets,
+            exMethod,
+            exOptions,
+        });
+        if (!re.success) {
+            throw new Error(
+                `Could not extract text for page(s) [${targets.join(', ')}]: ${re.error}`,
             );
+        }
 
-            const scoped = await extractionService.extractScopedText(
-                file.filename, file.s3_key, exMethod, exOptions, missingPages,
-            );
-            if (!scoped.success) {
-                throw new Error(
-                    `Could not extract text for newly assigned page(s) ` +
-                    `[${missingPages.join(', ')}]: ${scoped.error}`,
-                );
-            }
+        // Every success path in reextractSectionText returns pages; the
+        // fallback only satisfies its optional JSDoc type.
+        effectivePages = re.pages ?? effectivePages;
+        effectiveSelectedPages = re.selectedPages ?? null;
+        pagesWithoutText = re.pagesWithoutText || [];
 
-            // Returned pages are numbered 1..k within the filtered PDF; map
-            // back via missingPages[n-1]. A page can yield several chunks.
-            const textByOriginal = new Map<number, string>();
-            for (const pg of (scoped.pages || [])) {
-                const n = typeof pg.page_number === 'number' ? pg.page_number : null;
-                if (!n || n < 1 || n > missingPages.length) continue;
-                const orig = missingPages[n - 1];
-                const txt = (pg.text ?? pg.markdown ?? '').toString();
-                textByOriginal.set(orig, (textByOriginal.get(orig) || '') + txt);
-            }
-
-            const merged = effectiveSelectedPages.map((orig: number, i: number) => ({
-                orig,
-                text: (effectivePages[i]?.text ?? effectivePages[i]?.markdown ?? '').toString(),
-            }));
-            for (const orig of missingPages) {
-                const text = textByOriginal.get(orig) || '';
-                if (!text.trim()) pagesWithoutText.push(orig);
-                merged.push({ orig, text });
-            }
-            merged.sort((a, b) => a.orig - b.orig);
-            effectiveSelectedPages = merged.map((m) => m.orig);
-            effectivePages = merged.map((m, i) => ({ page_number: i + 1, text: m.text }));
-
-            // Persist the enriched text at the source (not a read-time patch).
-            await updateFilePages(fileId, effectivePages);
+        // Persist the enriched text at the source (not a read-time patch).
+        await updateFilePages(fileId, effectivePages);
+        if (Array.isArray(effectiveSelectedPages)) {
             await updateFileSelectedPages(fileId, effectiveSelectedPages);
-
-            if (pagesWithoutText.length > 0) {
-                console.log(
-                    `⚠️ No extractable text for page(s) [${pagesWithoutText.join(', ')}] — ` +
-                    `their section(s) may report no content`,
-                );
-            }
         }
+
+        if (pagesWithoutText.length > 0) {
+            console.log(
+                `⚠️ No extractable text for page(s) [${pagesWithoutText.join(', ')}] — ` +
+                `their section(s) may report no content`,
+            );
+        }
+    }
+
+    // Clone once — every downstream write (cleared re-OCR markers, new
+    // section ids, consumed edits) lands on this copy.
+    const finalDetectedSections = JSON.parse(JSON.stringify(detectedSections));
+    let completedCount = 0;
+
+    // The re-OCR is done and persisted, so drop the markers now: a crash
+    // between here and the AI pass must not re-bill the OCR on resume.
+    if (textReextractIndices.length > 0) {
+        for (const i of textReextractIndices) {
+            delete finalDetectedSections.sections[i][TEXT_REEXTRACT_FLAG];
+        }
+        await updateFileDetectedSections(fileId, finalDetectedSections);
+
+        // Sections whose ONLY work was the re-OCR are finished here — they
+        // keep their existing record and never enter the AI pass.
+        for (const i of textReextractIndices) {
+            if (sectionIndices.includes(i)) continue;
+            completedCount += 1;
+            progress({
+                phase: 'section',
+                completed: completedCount,
+                total: touchedIndices.length,
+                section_index: i,
+                slug: finalDetectedSections.sections[i]?.document_type_slug,
+                status: 'text_reextracted',
+            });
+        }
+    }
+
+    if (sectionIndices.length === 0) {
+        // Text-only reprocess: fresh page text is persisted and no record
+        // changes, so the envelope and review rollup stay as they were.
+        patch({ detected_sections: finalDetectedSections });
+        progress({ phase: 'done', completed: completedCount, total: touchedIndices.length });
+        console.log(
+            `✅ Section text re-extraction completed for file ${file.filename}: ` +
+            `${textReextractIndices.length} section(s), no AI pass needed`,
+        );
+        return {
+            status: 'success',
+            sectionIndices: [],
+            textReextractIndices,
+            sectionResults: [],
+            pagesWithoutText,
+            detectedSections: finalDetectedSections,
+            result: parseMaybeJson(file.result),
+            reviewStatus: null,
+        };
     }
 
     // ── Per-section extraction with incremental persistence ────────────
@@ -386,14 +483,12 @@ export async function runSectionReextraction({
         `${sectionIndices.length} section(s) [${sectionIndices.join(', ')}]`,
     );
 
-    const finalDetectedSections = JSON.parse(JSON.stringify(detectedSections));
     const oldRecordById = indexRecordsById(parseMaybeJson(file.result));
     const newRecordById = new Map<string, { slug: string; record: AnyRecord }>();
 
     // Sections run in parallel; incremental writes are serialized through
     // this chain so result/detected_sections updates never interleave.
     let writeChain: Promise<void> = Promise.resolve();
-    let completedCount = 0;
 
     const perSection = await extractAndProcessPerSection({
         detectedSections: partialSections,
@@ -408,7 +503,7 @@ export async function runSectionReextraction({
             progress({
                 phase: 'section',
                 completed: completedCount,
-                total: sectionIndices.length,
+                total: touchedIndices.length,
                 section_index: originalIndex,
                 slug: info.slug,
                 status: info.status,
@@ -445,11 +540,12 @@ export async function runSectionReextraction({
         const firstError = perSection.sectionResults.find((r: AnyRecord) => r.error)?.error
             || 'No section produced a result';
         progress({
-            phase: 'failed', completed: completedCount, total: sectionIndices.length, error: firstError,
+            phase: 'failed', completed: completedCount, total: touchedIndices.length, error: firstError,
         });
         return {
             status: 'failed',
             sectionIndices,
+            textReextractIndices,
             sectionResults: perSection.sectionResults,
             pagesWithoutText,
             detectedSections: finalDetectedSections,
@@ -500,7 +596,7 @@ export async function runSectionReextraction({
         detected_sections: finalDetectedSections,
         review_status: reviewStatus,
     });
-    progress({ phase: 'done', completed: completedCount, total: sectionIndices.length });
+    progress({ phase: 'done', completed: completedCount, total: touchedIndices.length });
 
     console.log(
         `✅ Section re-extraction completed for file ${file.filename}: ` +
@@ -510,6 +606,7 @@ export async function runSectionReextraction({
     return {
         status: 'success',
         sectionIndices,
+        textReextractIndices,
         sectionResults: perSection.sectionResults,
         pagesWithoutText,
         detectedSections: finalDetectedSections,
@@ -520,7 +617,10 @@ export async function runSectionReextraction({
 
 export default {
     SECTION_REEXTRACT_MODE,
+    TEXT_REEXTRACT_FLAG,
     computePendingSectionIndices,
+    computeTextReextractIndices,
+    computeTouchedSectionIndices,
     rebuildEnvelopeById,
     indexRecordsById,
     enqueueSectionReextraction,

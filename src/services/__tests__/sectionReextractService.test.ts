@@ -1,9 +1,12 @@
 import { describe, it, expect } from 'vitest';
 import {
     computePendingSectionIndices,
+    computeTextReextractIndices,
+    computeTouchedSectionIndices,
     rebuildEnvelopeById,
     indexRecordsById,
     SECTION_REEXTRACT_MODE,
+    TEXT_REEXTRACT_FLAG,
 } from '../sectionReextractService.ts';
 
 describe('computePendingSectionIndices', () => {
@@ -22,6 +25,47 @@ describe('computePendingSectionIndices', () => {
         expect(computePendingSectionIndices([])).toEqual([]);
         expect(computePendingSectionIndices(null)).toEqual([]);
         expect(computePendingSectionIndices(undefined)).toEqual([]);
+    });
+});
+
+describe('computeTextReextractIndices', () => {
+    it('picks sections flagged for re-OCR, ignoring superseded ones', () => {
+        const sections = [
+            { section_result_id: 'a' },
+            { section_result_id: 'b', [TEXT_REEXTRACT_FLAG]: true },
+            { section_result_id: 'c', [TEXT_REEXTRACT_FLAG]: false },
+            { section_result_id: null, [TEXT_REEXTRACT_FLAG]: true },
+            { section_result_id: 'e', [TEXT_REEXTRACT_FLAG]: true, superseded_by: 'a' },
+        ];
+        expect(computeTextReextractIndices(sections)).toEqual([1, 3]);
+    });
+
+    it('handles empty / missing input', () => {
+        expect(computeTextReextractIndices([])).toEqual([]);
+        expect(computeTextReextractIndices(null)).toEqual([]);
+        expect(computeTextReextractIndices(undefined)).toEqual([]);
+    });
+});
+
+describe('computeTouchedSectionIndices', () => {
+    it('unions the AI-pending and re-OCR sets in document order', () => {
+        const sections = [
+            { section_result_id: 'a', [TEXT_REEXTRACT_FLAG]: true }, // OCR only
+            { section_result_id: 'b' },                              // nothing
+            { section_result_id: null },                             // AI only
+            { section_result_id: null, [TEXT_REEXTRACT_FLAG]: true },// both — counted once
+        ];
+        expect(computeTouchedSectionIndices(sections)).toEqual([0, 2, 3]);
+    });
+
+    it('is empty when nothing is marked — the job short-circuits', () => {
+        expect(computeTouchedSectionIndices([{ section_result_id: 'a' }])).toEqual([]);
+    });
+
+    it('a text-only reprocess still yields work (regression: total would be 0)', () => {
+        const sections = [{ section_result_id: 'a', [TEXT_REEXTRACT_FLAG]: true }];
+        expect(computePendingSectionIndices(sections)).toEqual([]);
+        expect(computeTouchedSectionIndices(sections)).toEqual([0]);
     });
 });
 

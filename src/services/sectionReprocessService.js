@@ -153,6 +153,13 @@ export async function reextractSectionText({
  * reextract-sections endpoint so single-section reprocess reuses identical
  * logic. Pure — returns the new blobs; caller persists.
  *
+ * DEPRECATED (no runtime callers). Every re-extraction path now runs through
+ * sectionReextractService, whose `rebuildEnvelopeById` does the same job over
+ * the full section list instead of an index-paired subset. Kept — not
+ * deleted — until the sync fallbacks on save-and-reextract / reextract-sections
+ * / section reprocess are dropped, since a rollback to those handlers would
+ * need it back.
+ *
  * @returns {{ mergedResult:object, updatedDetectedSections:object,
  *   sectionResults:object[] }}
  */

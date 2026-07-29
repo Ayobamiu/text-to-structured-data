@@ -37,8 +37,6 @@ import pool, {
     updateFileDetectedSections,
     userHasJobAccess,
     getFileSkinnyRow,
-    updateFileSelectedPages,
-    updateFilePages
 } from "./database.js";
 import { getUserById } from "./database/users.js";
 import { getUserOrganizations } from "./database/userOrganizationMemberships.js";
@@ -61,8 +59,6 @@ import ExtractionService from "./services/extractionService.js";
 import {
     resolveSectionIndex,
     sliceSectionMarkdown,
-    reextractSectionText,
-    rebuildEnvelopeForSections,
 } from "./services/sectionReprocessService.js";
 import {
     runSectionReextraction,
@@ -70,6 +66,7 @@ import {
     computePendingSectionIndices,
     recomputeFileReviewStatus,
     cleanupOrphanSectionRows,
+    TEXT_REEXTRACT_FLAG,
 } from "./services/sectionReextractService.ts";
 import groqService from "./services/groqService.js";
 import { recordCorrections } from "./services/correctionsService.js";
@@ -235,6 +232,13 @@ io.on('connection', (socket) => {
     socket.on('section-reextract-progress-event', (data) => {
         if (!data?.jobId) return;
         io.to(`job-${data.jobId}`).emit('section-reextract-progress-event', data);
+    });
+
+    // Post-processing backfill (`psvc:<requestId>` jobs) progress from the
+    // worker → relay to the job room.
+    socket.on('postprocess-progress-event', (data) => {
+        if (!data?.jobId) return;
+        io.to(`job-${data.jobId}`).emit('postprocess-progress-event', data);
     });
 });
 
@@ -1103,6 +1107,27 @@ app.post("/jobs/:id/run-service", authenticateToken, async (req, res) => {
             });
         }
 
+        // ── Async (default for the new UI): queue one worker item per file.
+        // Progress and the accumulated summary arrive as
+        // `postprocess-progress-event`; GET /jobs/:id/post-processing on reload.
+        if (req.body?.async === true) {
+            const { enqueuePostProcessingRequest } = await import('./services/postProcessingJobService.ts');
+            const { request, queued } = await enqueuePostProcessingRequest({
+                jobId: id,
+                service: name,
+                slug,
+                options,
+                apply: Boolean(apply),
+                force: Boolean(force),
+                requestedBy: req.user?.email || req.user?.id || null,
+            });
+            return res.status(202).json({
+                status: "queued",
+                data: { requestId: request.id, totalFiles: request.total_files, queued },
+            });
+        }
+
+        // ── Sync (legacy clients): scans every completed file in-request.
         // Gather this job's completed files (records only exist for completed files).
         const filesRes = await pool.query(
             `SELECT id FROM job_files WHERE job_id = $1 AND processing_status = 'completed'`,
@@ -1122,6 +1147,24 @@ app.post("/jobs/:id/run-service", authenticateToken, async (req, res) => {
         res.json({ status: "success", data: result });
     } catch (error) {
         console.error('❌ Error running post-processing service for job:', error.message);
+        res.status(500).json({ status: "error", message: error.message });
+    }
+});
+
+// GET /jobs/:id/post-processing — the job's latest backfill request, so the
+// settings page can show a run that is still going (or its summary) after a
+// reload, when the progress events have already been missed.
+app.get("/jobs/:id/post-processing", authenticateToken, async (req, res) => {
+    try {
+        const { id } = req.params;
+        const hasAccess = await checkJobAccess(id, req.user, res);
+        if (!hasAccess) return;
+
+        const { getLatestPostProcessingRequest } = await import('./services/postProcessingJobService.ts');
+        const request = await getLatestPostProcessingRequest(id);
+        res.json({ status: "success", request: request || null });
+    } catch (error) {
+        console.error('❌ Error loading post-processing request:', error.message);
         res.status(500).json({ status: "error", message: error.message });
     }
 });
@@ -3020,8 +3063,10 @@ app.post("/files/:id/sections/save-and-reextract", authenticateToken, async (req
 });
 
 // Re-extract specific sections (after split/merge/slug-change).
-// Runs per-section extraction on only the requested section indices,
-// then merges results into the existing V2 envelope.
+// Nulls the requested sections' ids and runs the shared re-extraction service
+// over everything pending, merging results into the existing V2 envelope.
+// Body: { sectionIndices: number[], async?: bool } — `async: true` queues the
+// worker job and returns 202 instead of blocking for the run.
 app.post("/files/:id/reextract-sections", authenticateToken, async (req, res) => {
     try {
         const fileId = req.params.id;
@@ -3062,6 +3107,17 @@ app.post("/files/:id/reextract-sections", authenticateToken, async (req, res) =>
             pendingDetected.sections[i].section_result_id = null;
         }
         await updateFileDetectedSections(fileId, pendingDetected);
+
+        // ── Async: hand off to the worker (same job as Save & Re-extract).
+        if (req.body?.async === true) {
+            await enqueueSectionReextraction(fileId, file.job_id);
+            emitDetectedSectionsUpdate(file, pendingDetected);
+            return res.status(202).json({
+                status: 'queued',
+                detected_sections: pendingDetected,
+                pending_section_indices: computePendingSectionIndices(pendingDetected.sections),
+            });
+        }
 
         const ProcessingService = (await import('./services/processingService.js')).default;
         const outcome = await runSectionReextraction({
@@ -3136,6 +3192,12 @@ app.get("/files/:id/sections/:sectionResultId/markdown", authenticateToken, asyn
 // POST /files/:id/sections/:sectionResultId/reprocess
 // Reprocess a SINGLE section: re-extract its text (re-OCR its pages), re-run AI
 // on it, or both — the section-scoped analogue of POST /files/reprocess.
+//
+// Both halves are just per-section markers on detected_sections, which is why
+// this shares the `sreex` worker job rather than owning a mode:
+//   reProcessAi   → section_result_id = null   (needs extraction)
+//   reExtractText → needs_text_reextract: true (needs its pages re-OCR'd)
+// Body: { reExtractText?: bool, reProcessAi?: bool, async?: bool }
 app.post("/files/:id/sections/:sectionResultId/reprocess", authenticateToken, async (req, res) => {
     try {
         const fileId = req.params.id;
@@ -3163,114 +3225,63 @@ app.post("/files/:id/sections/:sectionResultId/reprocess", authenticateToken, as
         const section = file.detected_sections.sections[sectionIndex];
         const extractionPages = Array.isArray(section.extraction_pages) ? section.extraction_pages : [];
 
-        // pages is a large column omitted by getFileResult — load it directly.
-        const pagesRow = await pool.query(`SELECT pages FROM job_files WHERE id = $1`, [fileId]);
-        let filePages = pagesRow.rows[0]?.pages || [];
-        let selectedPages = file.selected_pages || null;
-
-        // Normalize processing_config (some rows were double-encoded).
-        const jobRow = await pool.query(`SELECT processing_config FROM jobs WHERE id = $1`, [file.job_id]);
-        let jpc = jobRow.rows[0]?.processing_config || {};
-        if (typeof jpc === 'string') { try { jpc = JSON.parse(jpc) || {}; } catch { jpc = {}; } }
-        const processingMethod = jpc.processing?.method || 'openai';
-        const processingOptions = jpc.processing?.options || {};
-
-        emitFilePatch(file.job_id, fileId, { processing_status: 'processing' });
-
-        // 1. Re-extract text (re-OCR the section's pages), persist at the source.
-        if (reExtractText) {
-            if (extractionPages.length === 0) {
-                return res.status(400).json({
-                    status: 'error',
-                    message: 'Section has no extraction_pages to re-extract',
-                });
-            }
-            const exMethod = file.extraction_metadata?.extraction_method
-                || jpc.extraction?.method
-                || 'extendai';
-            const exOptions = jpc.extraction?.options || {};
-            console.log(
-                `🔄 Section reprocess (text) for ${file.filename}: re-extracting pages ` +
-                `[${extractionPages.join(', ')}] via ${exMethod}`
-            );
-            const re = await reextractSectionText({
-                extractionService, file, pages: filePages, selectedPages,
-                pageNumbers: extractionPages, exMethod, exOptions,
+        if (reExtractText && extractionPages.length === 0) {
+            return res.status(400).json({
+                status: 'error',
+                message: 'Section has no extraction_pages to re-extract',
             });
-            if (!re.success) {
-                emitFilePatch(file.job_id, fileId, { processing_status: 'completed' });
-                return res.status(502).json({
-                    status: 'error',
-                    message: `Could not re-extract text for pages [${extractionPages.join(', ')}]: ${re.error}`,
-                });
-            }
-            filePages = re.pages;
-            selectedPages = re.selectedPages;
-            await updateFilePages(fileId, filePages);
-            if (Array.isArray(selectedPages)) await updateFileSelectedPages(fileId, selectedPages);
         }
 
-        // 2. Re-run AI on the section, rebuild the envelope by section_result_id.
-        let responseResult = file.result;
-        let responseDetectedSections = file.detected_sections;
-        if (reProcessAi) {
-            const partialSections = { ...file.detected_sections, sections: [section] };
-            const { extractAndProcessPerSection } = await import('./services/perSectionExtractor.js');
-            const ProcessingService = (await import('./services/processingService.js')).default;
-            const processingService = new ProcessingService();
+        // Mark the work, persist, THEN queue — the job re-reads sections at run
+        // time, so the markers are the entire payload.
+        const marked = JSON.parse(JSON.stringify(file.detected_sections));
+        if (reExtractText) marked.sections[sectionIndex][TEXT_REEXTRACT_FLAG] = true;
+        if (reProcessAi) marked.sections[sectionIndex].section_result_id = null;
+        await updateFileDetectedSections(fileId, marked);
 
-            console.log(
-                `🔄 Section reprocess (AI) for ${file.filename}: section ${sectionIndex} ` +
-                `(${section.document_type_slug})`
-            );
+        console.log(
+            `🔄 Section reprocess for ${file.filename}: section ${sectionIndex} ` +
+            `(${section.document_type_slug})` +
+            `${reExtractText ? ' +text' : ''}${reProcessAi ? ' +ai' : ''}`
+        );
 
-            const perSection = await extractAndProcessPerSection({
-                detectedSections: partialSections,
-                pages: filePages,
-                processingService,
-                processingMethod,
-                processingOptions,
-                selectedPages: selectedPages || null,
+        // ── Async (default for the new UI): the worker runs it. ────────
+        if (req.body?.async === true) {
+            await enqueueSectionReextraction(fileId, file.job_id);
+            emitDetectedSectionsUpdate(file, marked);
+            // pending_section_indices is usually just this section, but the
+            // job extracts EVERY pending section on the file — 15% of
+            // completed files carry 1–4 already-pending ones (measured
+            // 2026-07-28). Returned so the UI can say so rather than
+            // surprising the operator with extra sections re-extracting.
+            return res.status(202).json({
+                status: 'queued',
+                sectionResultId,
+                reExtractText,
+                reProcessAi,
+                section_index: sectionIndex,
+                pending_section_indices: computePendingSectionIndices(marked.sections),
+                detected_sections: marked,
             });
-
-            if (!perSection.anySuccess) {
-                const firstError = perSection.sectionResults.find(r => r.error)?.error
-                    || 'No section produced a result';
-                emitFilePatch(file.job_id, fileId, { processing_status: 'completed' });
-                return res.status(500).json({ status: 'error', message: firstError });
-            }
-
-            const rebuilt = rebuildEnvelopeForSections({
-                file, perSection, sectionIndices: [sectionIndex],
-            });
-            const finalMetadata = {
-                ...(file.extraction_metadata || {}),
-                result_envelope: 'v2',
-                section_results: rebuilt.sectionResults,
-                last_reextract: {
-                    section_indices: [sectionIndex],
-                    timestamp: new Date().toISOString(),
-                },
-            };
-
-            await updateFileDetectedSections(fileId, rebuilt.updatedDetectedSections);
-            await updateFileProcessingStatus(
-                fileId, 'completed', rebuilt.mergedResult, null, finalMetadata,
-                perSection.totalAiTimeSeconds || null,
-            );
-
-            responseResult = rebuilt.mergedResult;
-            responseDetectedSections = rebuilt.updatedDetectedSections;
-            emitFilePatch(file.job_id, fileId, {
-                processing_status: 'completed',
-                result: rebuilt.mergedResult,
-                detected_sections: rebuilt.updatedDetectedSections,
-            });
-        } else {
-            // Text-only: result unchanged; the new page text feeds the markdown
-            // view and any future AI run.
-            emitFilePatch(file.job_id, fileId, { processing_status: 'completed' });
         }
+
+        // ── Sync (legacy clients): same engine, in-request. Note this now
+        // also sweeps any OTHER section already pending on the file, which
+        // is the same widening reextract-sections took — those sections
+        // needed extracting anyway.
+        const ProcessingService = (await import('./services/processingService.js')).default;
+        const outcome = await runSectionReextraction({
+            fileId,
+            extractionService,
+            processingService: new ProcessingService(),
+            emitPatch: (patch) => emitFilePatch(file.job_id, fileId, patch),
+        });
+
+        if (outcome.status === 'failed') {
+            return res.status(500).json({ status: 'error', message: outcome.error });
+        }
+
+        await emitFileFullPatch(file.job_id, fileId, { review_status: outcome.reviewStatus });
 
         console.log(`✅ Section reprocess complete for ${file.filename} (section ${sectionIndex})`);
         res.json({
@@ -3278,8 +3289,8 @@ app.post("/files/:id/sections/:sectionResultId/reprocess", authenticateToken, as
             sectionResultId,
             reExtractText,
             reProcessAi,
-            result: responseResult,
-            detected_sections: responseDetectedSections,
+            result: outcome.result,
+            detected_sections: outcome.detectedSections,
         });
     } catch (error) {
         console.error('❌ section reprocess:', error.message);
