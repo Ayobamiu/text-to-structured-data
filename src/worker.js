@@ -632,13 +632,51 @@ class FileProcessorWorker {
                 const skippedCount = perSection.sectionResults.filter((r) => r.status?.startsWith('skipped_')).length;
                 const successCount = perSection.sectionResults.filter((r) => r.status === 'success').length;
 
+                // Sections whose pages were ALL classified non-data (attachment,
+                // unknown, figure…) reach here with empty extraction_pages and
+                // produce no record at all. Before, they were folded into a bare
+                // "N skipped" count and vanished — a 2026-07-28 closure report
+                // silently dropped two boreholes (MW-1, MW-2) that way. Name
+                // them, at warning level, so the gap is visible and an operator
+                // can pull the pages back in via "Include skipped pages".
+                const noPageSections = perSection.sectionResults.filter(
+                    (r) => r.status === 'skipped_no_pages'
+                );
+                if (noPageSections.length > 0) {
+                    const describe = (r) => {
+                        const span = Array.isArray(r.page_range) && r.page_range[0] != null
+                            ? `pp ${r.page_range[0]}${r.page_range[1] !== r.page_range[0] ? `–${r.page_range[1]}` : ''}`
+                            : 'unknown pages';
+                        return `${r.record_id ? `${r.record_id} ` : ''}${r.slug || 'unrouted'} (${span})`;
+                    };
+                    await this.emitProcessingEvent(file.id, file.job_id, {
+                        phase: 'ai_extraction', status: 'info', level: 'warning',
+                        message: `${noPageSections.length} section${noPageSections.length === 1 ? '' : 's'} produced no record — `
+                            + `every page was classified non-data: ${noPageSections.map(describe).join('; ')}`,
+                        data: {
+                            reason: 'no_extraction_pages',
+                            sections: noPageSections.map((r) => ({
+                                section_index: r.section_index, slug: r.slug,
+                                record_id: r.record_id || null, page_range: r.page_range,
+                            })),
+                        },
+                    });
+                    console.warn(
+                        `⚠️ ${noPageSections.length} section(s) had zero extraction pages and produced no record: `
+                        + noPageSections.map(describe).join('; ')
+                    );
+                }
+
                 await this.emitProcessingEvent(file.id, file.job_id, {
                     phase: 'ai_extraction', status: 'done',
                     progress: { current: sectionTotal, total: sectionTotal },
                     message: `${successCount} of ${sectionTotal} section${sectionTotal === 1 ? '' : 's'} extracted`
                         + (failedCount ? `, ${failedCount} failed` : '')
                         + (skippedCount ? `, ${skippedCount} skipped` : ''),
-                    data: { successCount, failedCount, skippedCount },
+                    data: {
+                        successCount, failedCount, skippedCount,
+                        noExtractionPagesCount: noPageSections.length,
+                    },
                 });
 
                 console.log(
