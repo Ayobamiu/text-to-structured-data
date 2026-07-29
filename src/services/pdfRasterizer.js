@@ -127,28 +127,30 @@ function extractPageNumber(filename) {
 }
 
 /**
- * Rasterize a PDF buffer to JPEG buffers, one per page.
+ * Rasterize a PDF that already lives on disk.
  *
- * @param {Buffer} pdfBuffer
+ * Prefer this over `rasterizePdf` whenever the source is remote (S3): the
+ * caller can stream bytes straight to a temp file instead of materialising
+ * the whole PDF on the heap. pdftoppm reads from a path either way, so the
+ * intermediate Buffer buys nothing — on a 183 MB PDF it is the difference
+ * between ~0 and 183 MB of heap per call, which is what OOM-killed the
+ * container when the page rail requested thumbnails concurrently.
+ *
+ * @param {string} pdfPath                  Path to an existing PDF file.
  * @param {Object} [options]
  * @param {number} [options.widthPx=768]
  * @param {number} [options.jpegQuality=75]
  * @param {number} [options.firstPage]      1-indexed; default = whole doc start
  * @param {number} [options.lastPage]       1-indexed; default = whole doc end
+ * @param {(page: { pageNumber: number, jpeg: Buffer, byteLength: number }) => Promise<void>} [options.onPage]
+ *        If supplied, each page is handed over and then dropped, so peak
+ *        memory stays at one JPEG rather than the whole document. The
+ *        returned array is empty in this mode.
  *
  * @returns {Promise<Array<{ pageNumber: number, jpeg: Buffer, byteLength: number }>>}
- *          Sorted ascending by pageNumber.
- *
- * Memory note: holds all page JPEGs in memory at once. For our typical
- * page sizes (~30-80 KB at 768px wide, q=75) and biggest expected PDFs
- * (~200 pages), peak memory is ~6-16 MB. Comfortable. If this ever needs
- * to handle 1000+ page PDFs, switch to a streaming/iterator API.
+ *          Sorted ascending by pageNumber. Empty when `onPage` is used.
  */
-export async function rasterizePdf(pdfBuffer, options = {}) {
-    if (!Buffer.isBuffer(pdfBuffer) || pdfBuffer.length === 0) {
-        throw new Error('rasterizePdf requires a non-empty Buffer');
-    }
-
+export async function rasterizePdfFile(pdfPath, options = {}) {
     const ok = await isRasterizerAvailable();
     if (!ok) {
         throw new Error(
@@ -157,33 +159,77 @@ export async function rasterizePdf(pdfBuffer, options = {}) {
     }
 
     const opts = { ...DEFAULT_OPTIONS, ...options };
-    const tempDir = makeTempDir();
-    const pdfPath = path.join(tempDir, 'input.pdf');
+    const { onPage } = opts;
+
+    // Output goes to its own directory so we never re-read the input PDF
+    // (or anything else the caller happens to keep next to it).
+    const outputDir = makeTempDir();
 
     try {
-        fs.writeFileSync(pdfPath, pdfBuffer);
-
         const startedAt = Date.now();
-        const filenames = await runPdftoppm(pdfPath, tempDir, opts);
+        const filenames = await runPdftoppm(pdfPath, outputDir, opts);
         const renderMs = Date.now() - startedAt;
 
-        const pages = filenames.map((name) => {
-            const pageNumber = extractPageNumber(name);
-            const jpeg = fs.readFileSync(path.join(tempDir, name));
-            return { pageNumber, jpeg, byteLength: jpeg.length };
-        });
-
-        if (pages.length === 0) {
+        if (filenames.length === 0) {
             throw new Error('pdftoppm produced no output pages');
+        }
+
+        const pages = [];
+        for (const name of filenames) {
+            const pageNumber = extractPageNumber(name);
+            const filePath = path.join(outputDir, name);
+            const jpeg = fs.readFileSync(filePath);
+            const page = { pageNumber, jpeg, byteLength: jpeg.length };
+
+            if (onPage) {
+                await onPage(page);
+                // Release both the buffer and the file as we go: a 400-page
+                // document should not cost 400 JPEGs of resident memory.
+                fs.rmSync(filePath, { force: true });
+            } else {
+                pages.push(page);
+            }
         }
 
         // Useful telemetry for classifier callers; not on the return shape
         // because we don't want to leak it into persisted JSON unintentionally.
         console.log(
-            `🖼️  rasterized ${pages.length} page(s) at ${opts.widthPx}px wide, q=${opts.jpegQuality} in ${renderMs}ms (avg ${Math.round(renderMs / pages.length)}ms/page)`
+            `🖼️  rasterized ${filenames.length} page(s) at ${opts.widthPx}px wide, q=${opts.jpegQuality} in ${renderMs}ms (avg ${Math.round(renderMs / filenames.length)}ms/page)`
         );
 
         return pages;
+    } finally {
+        cleanupTempDir(outputDir);
+    }
+}
+
+/**
+ * Rasterize a PDF buffer to JPEG buffers, one per page.
+ *
+ * @param {Buffer} pdfBuffer
+ * @param {Object} [options]  Same options as `rasterizePdfFile`.
+ *
+ * @returns {Promise<Array<{ pageNumber: number, jpeg: Buffer, byteLength: number }>>}
+ *          Sorted ascending by pageNumber.
+ *
+ * Memory note: holds all page JPEGs in memory at once (plus the incoming
+ * PDF buffer). For our typical page sizes (~30-80 KB at 768px wide, q=75)
+ * and biggest expected PDFs (~200 pages), peak memory is ~6-16 MB.
+ * Comfortable for in-pipeline callers that already hold the PDF. Callers
+ * fetching from S3 should use `rasterizePdfFile` instead and never build
+ * the buffer at all.
+ */
+export async function rasterizePdf(pdfBuffer, options = {}) {
+    if (!Buffer.isBuffer(pdfBuffer) || pdfBuffer.length === 0) {
+        throw new Error('rasterizePdf requires a non-empty Buffer');
+    }
+
+    const tempDir = makeTempDir();
+    const pdfPath = path.join(tempDir, 'input.pdf');
+
+    try {
+        fs.writeFileSync(pdfPath, pdfBuffer);
+        return await rasterizePdfFile(pdfPath, options);
     } finally {
         cleanupTempDir(tempDir);
     }
@@ -191,5 +237,6 @@ export async function rasterizePdf(pdfBuffer, options = {}) {
 
 export default {
     rasterizePdf,
+    rasterizePdfFile,
     isRasterizerAvailable,
 };

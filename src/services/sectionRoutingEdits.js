@@ -427,18 +427,35 @@ export function applyAttachPages(detectedSections, { index, pageNumbers, markAsD
         throw new Error(`Page(s) ${unknown.join(', ')} not found in this file's classified pages`);
     }
 
-    // A page may belong to at most one section — reject pages already owned
-    // (including by superseded sections: their pages are spoken for as
+    // A page may belong to at most one section — reject pages owned by ANOTHER
+    // section (including superseded ones: their pages are spoken for as
     // provenance of the canonical twin). Use merge to combine sections.
+    //
+    // Pages already owned by THIS section are allowed through: that is the
+    // "include skipped pages" gesture, where the page is already a member but
+    // was left out of extraction_pages because the classifier called it
+    // attachment/unknown/figure. Re-stamping page_purpose_override below and
+    // rebuilding moves it into extraction_pages. Rejecting those made the
+    // gesture impossible for every section (a skipped page is always a member).
     const owned = new Set();
-    for (const s of blob.sections) {
-        for (const p of getMemberPages(s)) owned.add(p);
+    for (let i = 0; i < blob.sections.length; i++) {
+        if (i === index) continue;
+        for (const p of getMemberPages(blob.sections[i])) owned.add(p);
     }
     const taken = pageNumbers.filter((p) => owned.has(p));
     if (taken.length > 0) {
         throw new Error(
-            `Page(s) ${taken.join(', ')} already belong to a section — ` +
+            `Page(s) ${taken.join(', ')} already belong to another section — ` +
             `merge sections instead of attaching`
+        );
+    }
+
+    const alreadyExtracting = pageNumbers.filter(
+        (p) => (section.extraction_pages || []).includes(p)
+    );
+    if (alreadyExtracting.length > 0) {
+        throw new Error(
+            `Page(s) ${alreadyExtracting.join(', ')} are already extracted in this section`
         );
     }
 
