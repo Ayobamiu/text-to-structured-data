@@ -21,6 +21,7 @@ import { buildExtractionMetadata } from './services/fileProcessingContext.js';
 import { recordProcessingEvent } from './services/processingEventsService.js';
 import { parseQAMode, runFileQAJob } from './services/qaJobService.js';
 import { parseRexMode, runDirectedReextractionJob } from './services/directedReextractionService.ts';
+import { SECTION_REEXTRACT_MODE, runSectionReextraction } from './services/sectionReextractService.ts';
 import { isDepthGeometryEnabled, recoverDepthGeometry } from './services/depthGeometryService.ts';
 import { refineExtractionData } from './services/depthRefinementService.ts';
 dotenv.config();
@@ -234,6 +235,13 @@ class FileProcessorWorker {
         const rexRequestId = parseRexMode(mode);
         if (rexRequestId) {
             return this.processReextractionJob(queueItem, rexRequestId);
+        }
+
+        // Section re-extraction jobs (mode `sreex` — Save & Re-extract from
+        // the routing UI). State lives in detected_sections itself: the job
+        // extracts every section with a null section_result_id.
+        if (mode === SECTION_REEXTRACT_MODE) {
+            return this.processSectionReextractJob(queueItem);
         }
 
         console.log(`🔄 Processing file: ${fileId} (attempt ${retries + 1}, mode: ${mode})`);
@@ -1044,6 +1052,66 @@ class FileProcessorWorker {
      * retried inside the service; a retry here would re-bill vision calls).
      * The request row records the outcome either way.
      */
+    /**
+     * Run a section re-extraction queue item (mode `sreex` — Save &
+     * Re-extract). Idempotent and crash-resumable: state lives in
+     * detected_sections (null section_result_id = pending), and each
+     * finished section persists incrementally. Failures are terminal — no
+     * queue retry (transient AI errors are handled inside extraction; the
+     * operator can hit Save & Re-extract again, which just re-enqueues).
+     *
+     * Data updates ride the normal file-patch channel (`file-status-update`
+     * relayed by the server as patches); progress rides
+     * `section-reextract-progress-event`. processing_status is never
+     * flipped — the rest of the envelope stays valid and visible.
+     */
+    async processSectionReextractJob(queueItem) {
+        const { fileId, jobId } = queueItem;
+        console.log(`🧩 Processing section re-extraction job for file ${fileId}`);
+
+        const emitProgress = (evt) => {
+            if (this.socket && this.socket.connected) {
+                this.socket.emit('section-reextract-progress-event', {
+                    jobId,
+                    fileId,
+                    ...evt,
+                    timestamp: new Date().toISOString(),
+                });
+            }
+        };
+
+        try {
+            await queueService.markFileAsProcessing(fileId);
+
+            const outcome = await runSectionReextraction({
+                fileId,
+                extractionService: this.extractionService,
+                processingService: this.processingService,
+                emitPatch: (patch) => {
+                    if (this.socket && this.socket.connected) {
+                        // The server converts file-status-update into the
+                        // standardized file-patch shape for job-room clients.
+                        this.socket.emit('file-status-update', { jobId, fileId, ...patch });
+                    }
+                },
+                onProgress: emitProgress,
+            });
+
+            if (outcome.status === 'failed') {
+                console.error(`❌ Section re-extraction failed for file ${fileId}: ${outcome.error}`);
+                this.errorCount++;
+            } else {
+                this.processedCount++;
+            }
+        } catch (error) {
+            console.error(`❌ Section re-extraction job for file ${fileId} threw:`, error.message);
+            this.errorCount++;
+            emitProgress({ phase: 'failed', completed: 0, total: 0, error: error.message });
+        } finally {
+            await queueService.removeFileFromProcessing(fileId);
+        }
+    }
+
     async processReextractionJob(queueItem, requestId) {
         const { fileId, jobId } = queueItem;
         console.log(`🎯 Processing directed re-extraction job: ${requestId.substring(0, 8)}... (file ${fileId})`);

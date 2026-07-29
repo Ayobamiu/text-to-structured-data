@@ -59,6 +59,18 @@ const DEFAULT_MAX_CONCURRENCY = 6;
  *                                            schemaRegistry export. Override
  *                                            in tests so we can drive the
  *                                            orchestrator without a DB.
+ * @param {number[]|null} [args.selectedPages]
+ *                                            Original PDF page numbers aligned
+ *                                            with `pages` (text page i ↔
+ *                                            selectedPages[i]); null when
+ *                                            pages already carry original
+ *                                            numbering.
+ * @param {((info: Object) => void)|null} [args.onSectionComplete]
+ *                                            Fired as each section finishes
+ *                                            (completion order). Carries
+ *                                            status/slug/section_result_id and,
+ *                                            on success, the extracted `data`
+ *                                            for incremental persistence.
  * @param {Object|null} [args.depthGeometry]  Recovered depth geometry
  *                                            (depthGeometryService), in the
  *                                            extraction result's page space;
@@ -184,6 +196,12 @@ export async function extractAndProcessPerSection({
                         warning: r.completeness_warning || null,
                         escalated: r.escalated_to_claude || false,
                         completeness: r.completeness || null,
+                        // For incremental persistence (sectionReextractService):
+                        // the new record id and the extracted data, so callers
+                        // can land each section's result as it finishes instead
+                        // of waiting for the whole batch.
+                        section_result_id: r.section_result_id || null,
+                        data: r.status === 'success' ? r.data : undefined,
                     });
                 } catch { /* never let telemetry break extraction */ }
             }
