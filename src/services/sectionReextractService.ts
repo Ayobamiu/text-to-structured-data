@@ -89,6 +89,136 @@ export interface RunSectionReextractionResult {
     error?: string;
 }
 
+// ── Run marker ──────────────────────────────────────────────────────────
+// Progress used to live only in socket events, so the UI lost it on every
+// remount (tab switch, pane toggle, reload) and had nothing to re-read.
+// The marker makes a run part of the file's persisted state, exactly like
+// the pending set itself: it rides the existing file-patch channel and the
+// initial file load, so the client re-derives progress instead of
+// remembering it. No request table, no new endpoint (2026-07-29).
+//
+// It answers only the two questions the pending set can't:
+//   - is a run actually in flight? (15% of files carry idle pending
+//     sections, so "something is null" is not the same as "a job is running")
+//   - how many sections did it START with? (so the bar reads 3/7 rather
+//     than counting down from an unknown total)
+
+export const SREEX_RUN_KEY = 'sreex_run';
+
+export type SreexRunOrigin = 'save' | 'reprocess' | 'reextract';
+
+export interface SreexRun {
+    section_indices: number[];
+    total: number;
+    started_at: string;
+    origin: SreexRunOrigin;
+    finished_at?: string | null;
+    error?: string | null;
+}
+
+export interface SreexRunProgress {
+    total: number;
+    done: number;
+    doneIndices: number[];
+    pendingIndices: number[];
+    /** Every section resolved, or the worker explicitly finished/failed. */
+    finished: boolean;
+    error: string | null;
+    origin: SreexRunOrigin;
+    startedAt: string;
+}
+
+/**
+ * Stamp a run marker onto a detected_sections blob. Pure — returns a copy;
+ * the caller persists it in the same write that marks the sections pending,
+ * so the marker and the pending set can never disagree.
+ */
+export function withSreexRun(
+    detectedSections: AnyRecord,
+    sectionIndices: number[],
+    origin: SreexRunOrigin,
+): AnyRecord {
+    const run: SreexRun = {
+        section_indices: [...sectionIndices],
+        total: sectionIndices.length,
+        started_at: new Date().toISOString(),
+        origin,
+        finished_at: null,
+        error: null,
+    };
+    return { ...detectedSections, [SREEX_RUN_KEY]: run };
+}
+
+/**
+ * Mark the run finished (or failed). Pure. Kept rather than deleted so the
+ * card can show a terminal state; the client drops it on dismiss.
+ */
+export function finishSreexRun(detectedSections: AnyRecord, error: string | null = null): AnyRecord {
+    const run = detectedSections?.[SREEX_RUN_KEY];
+    if (!run) return detectedSections;
+    return {
+        ...detectedSections,
+        [SREEX_RUN_KEY]: { ...run, finished_at: new Date().toISOString(), error: error ?? null },
+    };
+}
+
+/**
+ * Finalize a run by file id, for callers that don't hold the blob — the
+ * worker's catch, where runSectionReextraction threw before it could
+ * finalize. Without this the card would sit spinning until the client's
+ * "nothing pending" fallback caught it.
+ */
+export async function finalizeSreexRunById(fileId: string, error: string | null = null): Promise<AnyRecord | null> {
+    const row = await pool.query(`SELECT detected_sections FROM job_files WHERE id = $1`, [fileId]);
+    const detected = parseMaybeJson(row.rows[0]?.detected_sections);
+    if (!detected?.[SREEX_RUN_KEY]) return null;
+    const finalized = finishSreexRun(detected, error);
+    await updateFileDetectedSections(fileId, finalized);
+    return finalized;
+}
+
+/**
+ * Re-derive progress from persisted state alone — the whole point of the
+ * marker. A section counts as done once it has an id (or was superseded
+ * mid-run); `finished` also goes true when nothing is left pending, so a
+ * worker that died without finalizing can't strand the card forever.
+ *
+ * Mirrored on the web side (sreexRun.ts) — keep the two in step.
+ */
+export function computeSreexRunProgress(
+    detectedSections: AnyRecord | null | undefined,
+): SreexRunProgress | null {
+    const run = detectedSections?.[SREEX_RUN_KEY] as SreexRun | undefined;
+    if (!run || !Array.isArray(run.section_indices)) return null;
+
+    const sections = Array.isArray(detectedSections?.sections) ? detectedSections!.sections : [];
+    const doneIndices: number[] = [];
+    const pendingIndices: number[] = [];
+    for (const i of run.section_indices) {
+        const section = sections[i];
+        // A section deleted mid-run leaves nothing to wait for.
+        if (!section) continue;
+        // Two kinds of outstanding work, and a text-only reprocess has the
+        // second WITHOUT the first: the section keeps its id while its pages
+        // are re-OCR'd, so id-alone would report it done before it started.
+        const awaitingAi = section.section_result_id == null && !section.superseded_by;
+        const awaitingText = section[TEXT_REEXTRACT_FLAG] === true;
+        if (awaitingAi || awaitingText) pendingIndices.push(i);
+        else doneIndices.push(i);
+    }
+
+    return {
+        total: typeof run.total === 'number' ? run.total : run.section_indices.length,
+        done: doneIndices.length,
+        doneIndices,
+        pendingIndices,
+        finished: Boolean(run.finished_at) || pendingIndices.length === 0,
+        error: run.error ?? null,
+        origin: run.origin ?? 'save',
+        startedAt: run.started_at,
+    };
+}
+
 /**
  * Indices of sections that need extraction: no extraction record yet and
  * not superseded (superseded sections never extract — their canonical twin
@@ -422,7 +552,7 @@ export async function runSectionReextraction({
 
     // Clone once — every downstream write (cleared re-OCR markers, new
     // section ids, consumed edits) lands on this copy.
-    const finalDetectedSections = JSON.parse(JSON.stringify(detectedSections));
+    let finalDetectedSections = JSON.parse(JSON.stringify(detectedSections));
     let completedCount = 0;
 
     // The re-OCR is done and persisted, so drop the markers now: a crash
@@ -452,6 +582,8 @@ export async function runSectionReextraction({
     if (sectionIndices.length === 0) {
         // Text-only reprocess: fresh page text is persisted and no record
         // changes, so the envelope and review rollup stay as they were.
+        finalDetectedSections = finishSreexRun(finalDetectedSections);
+        await updateFileDetectedSections(fileId, finalDetectedSections);
         patch({ detected_sections: finalDetectedSections });
         progress({ phase: 'done', completed: completedCount, total: touchedIndices.length });
         console.log(
@@ -539,6 +671,9 @@ export async function runSectionReextraction({
     if (!perSection.anySuccess) {
         const firstError = perSection.sectionResults.find((r: AnyRecord) => r.error)?.error
             || 'No section produced a result';
+        finalDetectedSections = finishSreexRun(finalDetectedSections, firstError);
+        await updateFileDetectedSections(fileId, finalDetectedSections);
+        patch({ detected_sections: finalDetectedSections });
         progress({
             phase: 'failed', completed: completedCount, total: touchedIndices.length, error: firstError,
         });
@@ -558,6 +693,7 @@ export async function runSectionReextraction({
     // ── Finalize ────────────────────────────────────────────────────────
     // Edits were consumed by this pass (same semantics as the old endpoint).
     finalDetectedSections.edits = [];
+    finalDetectedSections = finishSreexRun(finalDetectedSections);
     await updateFileDetectedSections(fileId, finalDetectedSections);
 
     const mergedResult = rebuildEnvelopeById(
@@ -617,6 +753,11 @@ export async function runSectionReextraction({
 
 export default {
     SECTION_REEXTRACT_MODE,
+    SREEX_RUN_KEY,
+    withSreexRun,
+    finishSreexRun,
+    finalizeSreexRunById,
+    computeSreexRunProgress,
     TEXT_REEXTRACT_FLAG,
     computePendingSectionIndices,
     computeTextReextractIndices,

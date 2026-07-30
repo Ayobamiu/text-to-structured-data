@@ -21,7 +21,7 @@ import { buildExtractionMetadata } from './services/fileProcessingContext.js';
 import { recordProcessingEvent } from './services/processingEventsService.js';
 import { parseQAMode, runFileQAJob } from './services/qaJobService.js';
 import { parseRexMode, runDirectedReextractionJob } from './services/directedReextractionService.ts';
-import { SECTION_REEXTRACT_MODE, runSectionReextraction } from './services/sectionReextractService.ts';
+import { SECTION_REEXTRACT_MODE, runSectionReextraction, finalizeSreexRunById } from './services/sectionReextractService.ts';
 import { parsePsvcMode, runPostProcessingFile } from './services/postProcessingJobService.ts';
 import { isDepthGeometryEnabled, recoverDepthGeometry } from './services/depthGeometryService.ts';
 import { refineExtractionData } from './services/depthRefinementService.ts';
@@ -1117,6 +1117,17 @@ class FileProcessorWorker {
         } catch (error) {
             console.error(`❌ Section re-extraction job for file ${fileId} threw:`, error.message);
             this.errorCount++;
+            // The service finalizes the run marker on its own terminal paths;
+            // this covers a throw before it got there, so the progress card
+            // reaches a terminal state instead of spinning.
+            try {
+                const finalized = await finalizeSreexRunById(fileId, error.message);
+                if (finalized && this.socket && this.socket.connected) {
+                    this.socket.emit('file-status-update', { jobId, fileId, detected_sections: finalized });
+                }
+            } catch (finalizeErr) {
+                console.error(`⚠️ could not finalize sreex run marker: ${finalizeErr.message}`);
+            }
             emitProgress({ phase: 'failed', completed: 0, total: 0, error: error.message });
         } finally {
             await queueService.removeFileFromProcessing(fileId);

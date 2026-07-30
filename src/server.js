@@ -67,6 +67,7 @@ import {
     recomputeFileReviewStatus,
     cleanupOrphanSectionRows,
     TEXT_REEXTRACT_FLAG,
+    withSreexRun,
 } from "./services/sectionReextractService.ts";
 import groqService from "./services/groqService.js";
 import { recordCorrections } from "./services/correctionsService.js";
@@ -2953,8 +2954,15 @@ app.post("/files/:id/sections/save-and-reextract", authenticateToken, async (req
             .map((s, i) => (s.section_result_id == null && !s.superseded_by ? i : -1))
             .filter(i => i >= 0);
 
-        // Save the updated detected_sections first (even if no extraction needed)
-        await updateFileDetectedSections(fileId, newDetectedSections);
+        // Save the updated detected_sections first (even if no extraction
+        // needed). On the async path the run marker goes in the SAME write,
+        // so the marker and the pending set can never disagree — the UI
+        // re-derives progress from this blob after any remount or reload.
+        const runAsync = req.body?.async === true && sectionIndices.length > 0;
+        const persistedSections = runAsync
+            ? withSreexRun(newDetectedSections, sectionIndices, 'save')
+            : newDetectedSections;
+        await updateFileDetectedSections(fileId, persistedSections);
 
         if (sectionIndices.length === 0) {
             // No extraction needed — but the save may have REMOVED sections
@@ -3026,10 +3034,10 @@ app.post("/files/:id/sections/save-and-reextract", authenticateToken, async (req
         // NOT flipped — the rest of the envelope stays valid and visible.
         if (req.body?.async === true) {
             await enqueueSectionReextraction(fileId, file.job_id);
-            emitDetectedSectionsUpdate(file, newDetectedSections);
+            emitDetectedSectionsUpdate(file, persistedSections);
             return res.status(202).json({
                 status: 'queued',
-                detected_sections: newDetectedSections,
+                detected_sections: persistedSections,
                 pending_section_indices: sectionIndices,
             });
         }
@@ -3102,9 +3110,15 @@ app.post("/files/:id/reextract-sections", authenticateToken, async (req, res) =>
 
         // Mark the requested sections as needing extraction (the service
         // extracts exactly the null-section_result_id set), persist, run.
-        const pendingDetected = JSON.parse(JSON.stringify(file.detected_sections));
+        let pendingDetected = JSON.parse(JSON.stringify(file.detected_sections));
         for (const i of sectionIndices) {
             pendingDetected.sections[i].section_result_id = null;
+        }
+        // Async path: stamp the run marker in the same write (see
+        // save-and-reextract) so the progress card survives remounts.
+        const allPending = computePendingSectionIndices(pendingDetected.sections);
+        if (req.body?.async === true && allPending.length > 0) {
+            pendingDetected = withSreexRun(pendingDetected, allPending, 'reextract');
         }
         await updateFileDetectedSections(fileId, pendingDetected);
 
@@ -3115,7 +3129,7 @@ app.post("/files/:id/reextract-sections", authenticateToken, async (req, res) =>
             return res.status(202).json({
                 status: 'queued',
                 detected_sections: pendingDetected,
-                pending_section_indices: computePendingSectionIndices(pendingDetected.sections),
+                pending_section_indices: allPending,
             });
         }
 
@@ -3234,9 +3248,18 @@ app.post("/files/:id/sections/:sectionResultId/reprocess", authenticateToken, as
 
         // Mark the work, persist, THEN queue — the job re-reads sections at run
         // time, so the markers are the entire payload.
-        const marked = JSON.parse(JSON.stringify(file.detected_sections));
+        let marked = JSON.parse(JSON.stringify(file.detected_sections));
         if (reExtractText) marked.sections[sectionIndex][TEXT_REEXTRACT_FLAG] = true;
         if (reProcessAi) marked.sections[sectionIndex].section_result_id = null;
+        // The run touches this section plus anything already pending on the
+        // file; the marker lists them all so the card can name each row.
+        const touchedIndices = [...new Set([
+            sectionIndex,
+            ...computePendingSectionIndices(marked.sections),
+        ])].sort((a, b) => a - b);
+        if (req.body?.async === true) {
+            marked = withSreexRun(marked, touchedIndices, 'reprocess');
+        }
         await updateFileDetectedSections(fileId, marked);
 
         console.log(
