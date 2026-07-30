@@ -1,9 +1,15 @@
 import { describe, it, expect } from 'vitest';
 import {
+    withSreexRun,
+    finishSreexRun,
+    computeSreexRunProgress,
     computePendingSectionIndices,
+    computeTextReextractIndices,
+    computeTouchedSectionIndices,
     rebuildEnvelopeById,
     indexRecordsById,
     SECTION_REEXTRACT_MODE,
+    TEXT_REEXTRACT_FLAG,
 } from '../sectionReextractService.ts';
 
 describe('computePendingSectionIndices', () => {
@@ -22,6 +28,47 @@ describe('computePendingSectionIndices', () => {
         expect(computePendingSectionIndices([])).toEqual([]);
         expect(computePendingSectionIndices(null)).toEqual([]);
         expect(computePendingSectionIndices(undefined)).toEqual([]);
+    });
+});
+
+describe('computeTextReextractIndices', () => {
+    it('picks sections flagged for re-OCR, ignoring superseded ones', () => {
+        const sections = [
+            { section_result_id: 'a' },
+            { section_result_id: 'b', [TEXT_REEXTRACT_FLAG]: true },
+            { section_result_id: 'c', [TEXT_REEXTRACT_FLAG]: false },
+            { section_result_id: null, [TEXT_REEXTRACT_FLAG]: true },
+            { section_result_id: 'e', [TEXT_REEXTRACT_FLAG]: true, superseded_by: 'a' },
+        ];
+        expect(computeTextReextractIndices(sections)).toEqual([1, 3]);
+    });
+
+    it('handles empty / missing input', () => {
+        expect(computeTextReextractIndices([])).toEqual([]);
+        expect(computeTextReextractIndices(null)).toEqual([]);
+        expect(computeTextReextractIndices(undefined)).toEqual([]);
+    });
+});
+
+describe('computeTouchedSectionIndices', () => {
+    it('unions the AI-pending and re-OCR sets in document order', () => {
+        const sections = [
+            { section_result_id: 'a', [TEXT_REEXTRACT_FLAG]: true }, // OCR only
+            { section_result_id: 'b' },                              // nothing
+            { section_result_id: null },                             // AI only
+            { section_result_id: null, [TEXT_REEXTRACT_FLAG]: true },// both — counted once
+        ];
+        expect(computeTouchedSectionIndices(sections)).toEqual([0, 2, 3]);
+    });
+
+    it('is empty when nothing is marked — the job short-circuits', () => {
+        expect(computeTouchedSectionIndices([{ section_result_id: 'a' }])).toEqual([]);
+    });
+
+    it('a text-only reprocess still yields work (regression: total would be 0)', () => {
+        const sections = [{ section_result_id: 'a', [TEXT_REEXTRACT_FLAG]: true }];
+        expect(computePendingSectionIndices(sections)).toEqual([]);
+        expect(computeTouchedSectionIndices(sections)).toEqual([0]);
     });
 });
 
@@ -107,5 +154,89 @@ describe('rebuildEnvelopeById', () => {
 describe('SECTION_REEXTRACT_MODE', () => {
     it('is a stable queue-mode string distinct from qa:/rex: prefixes', () => {
         expect(SECTION_REEXTRACT_MODE).toBe('sreex');
+    });
+});
+
+describe('sreex run marker', () => {
+    const sections = [
+        { document_type_slug: 'borehole_log', section_result_id: 'a' },
+        { document_type_slug: 'borehole_log', section_result_id: null },
+        { document_type_slug: 'borehole_log', section_result_id: null },
+    ];
+
+    it('returns null when no run is stamped', () => {
+        expect(computeSreexRunProgress({ sections })).toBeNull();
+        expect(computeSreexRunProgress(null)).toBeNull();
+        expect(computeSreexRunProgress({ sections, sreex_run: {} })).toBeNull();
+    });
+
+    it('stamps the touched set and total, leaving sections untouched', () => {
+        const blob = withSreexRun({ sections }, [1, 2], 'save');
+        expect(blob.sreex_run.section_indices).toEqual([1, 2]);
+        expect(blob.sreex_run.total).toBe(2);
+        expect(blob.sreex_run.origin).toBe('save');
+        expect(blob.sreex_run.finished_at).toBeNull();
+        expect(blob.sections).toBe(sections);
+    });
+
+    it('counts a section done once it gains an id', () => {
+        const blob = withSreexRun({ sections }, [1, 2], 'save');
+        const midRun = {
+            ...blob,
+            sections: [sections[0], { ...sections[1], section_result_id: 'b' }, sections[2]],
+        };
+        const p = computeSreexRunProgress(midRun)!;
+        expect(p.total).toBe(2);
+        expect(p.done).toBe(1);
+        expect(p.pendingIndices).toEqual([2]);
+        expect(p.finished).toBe(false);
+    });
+
+    it('keeps a text-only section pending until the OCR flag clears', () => {
+        // The section keeps its id the whole time, so id-alone would call it
+        // done before the re-OCR even started.
+        const base = [{ document_type_slug: 'borehole_log', section_result_id: 'a', needs_text_reextract: true }];
+        const blob = withSreexRun({ sections: base }, [0], 'reprocess');
+        expect(computeSreexRunProgress(blob)!.done).toBe(0);
+        expect(computeSreexRunProgress(blob)!.finished).toBe(false);
+
+        const cleared = { ...blob, sections: [{ document_type_slug: 'borehole_log', section_result_id: 'a' }] };
+        const after = computeSreexRunProgress(cleared)!;
+        expect(after.done).toBe(1);
+        expect(after.finished).toBe(true);
+    });
+
+    it('treats a superseded section as resolved, and a deleted one as gone', () => {
+        const blob = withSreexRun({ sections }, [1, 2], 'save');
+        const edited = {
+            ...blob,
+            sections: [sections[0], { ...sections[1], superseded_by: 'a' }],
+        };
+        const p = computeSreexRunProgress(edited)!;
+        expect(p.doneIndices).toEqual([1]);
+        expect(p.pendingIndices).toEqual([]);
+        expect(p.finished).toBe(true);
+        expect(p.total).toBe(2); // total is what the run STARTED with
+    });
+
+    it('reports finished when the worker died without finalizing', () => {
+        // No finished_at, but nothing is left pending — the card must not spin
+        // forever waiting on a worker that is gone.
+        const blob = withSreexRun({ sections }, [1], 'save');
+        const done = { ...blob, sections: [sections[0], { ...sections[1], section_result_id: 'b' }, sections[2]] };
+        expect(computeSreexRunProgress(done)!.finished).toBe(true);
+    });
+
+    it('surfaces the failure and stays finished once finalized with an error', () => {
+        const blob = finishSreexRun(withSreexRun({ sections }, [1, 2], 'save'), 'model timeout');
+        const p = computeSreexRunProgress(blob)!;
+        expect(p.error).toBe('model timeout');
+        expect(p.finished).toBe(true);
+        expect(p.pendingIndices).toEqual([1, 2]); // still unextracted, and now terminal
+    });
+
+    it('finishSreexRun is a no-op without a marker', () => {
+        const blob = { sections };
+        expect(finishSreexRun(blob)).toBe(blob);
     });
 });

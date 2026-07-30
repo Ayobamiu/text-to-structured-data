@@ -21,7 +21,8 @@ import { buildExtractionMetadata } from './services/fileProcessingContext.js';
 import { recordProcessingEvent } from './services/processingEventsService.js';
 import { parseQAMode, runFileQAJob } from './services/qaJobService.js';
 import { parseRexMode, runDirectedReextractionJob } from './services/directedReextractionService.ts';
-import { SECTION_REEXTRACT_MODE, runSectionReextraction } from './services/sectionReextractService.ts';
+import { SECTION_REEXTRACT_MODE, runSectionReextraction, finalizeSreexRunById } from './services/sectionReextractService.ts';
+import { parsePsvcMode, runPostProcessingFile } from './services/postProcessingJobService.ts';
 import { isDepthGeometryEnabled, recoverDepthGeometry } from './services/depthGeometryService.ts';
 import { refineExtractionData } from './services/depthRefinementService.ts';
 dotenv.config();
@@ -237,11 +238,21 @@ class FileProcessorWorker {
             return this.processReextractionJob(queueItem, rexRequestId);
         }
 
-        // Section re-extraction jobs (mode `sreex` — Save & Re-extract from
-        // the routing UI). State lives in detected_sections itself: the job
-        // extracts every section with a null section_result_id.
+        // Section re-extraction jobs (mode `sreex` — Save & Re-extract and
+        // single-section reprocess from the review UI). State lives in
+        // detected_sections itself: the job re-OCRs every section marked
+        // needs_text_reextract and extracts every section with a null
+        // section_result_id.
         if (mode === SECTION_REEXTRACT_MODE) {
             return this.processSectionReextractJob(queueItem);
+        }
+
+        // Post-processing backfills (mode `psvc:<requestId>` — "Run service"
+        // in job settings). One queue item per file so a 4000-file backfill
+        // interleaves with normal processing instead of blocking it.
+        const psvcRequestId = parsePsvcMode(mode);
+        if (psvcRequestId) {
+            return this.processPostProcessingJob(queueItem, psvcRequestId);
         }
 
         console.log(`🔄 Processing file: ${fileId} (attempt ${retries + 1}, mode: ${mode})`);
@@ -1106,7 +1117,61 @@ class FileProcessorWorker {
         } catch (error) {
             console.error(`❌ Section re-extraction job for file ${fileId} threw:`, error.message);
             this.errorCount++;
+            // The service finalizes the run marker on its own terminal paths;
+            // this covers a throw before it got there, so the progress card
+            // reaches a terminal state instead of spinning.
+            try {
+                const finalized = await finalizeSreexRunById(fileId, error.message);
+                if (finalized && this.socket && this.socket.connected) {
+                    this.socket.emit('file-status-update', { jobId, fileId, detected_sections: finalized });
+                }
+            } catch (finalizeErr) {
+                console.error(`⚠️ could not finalize sreex run marker: ${finalizeErr.message}`);
+            }
             emitProgress({ phase: 'failed', completed: 0, total: 0, error: error.message });
+        } finally {
+            await queueService.removeFileFromProcessing(fileId);
+        }
+    }
+
+    /**
+     * Run one file of a post-processing backfill (mode `psvc:<requestId>`).
+     * The request row carries the payload and accumulates the summary across
+     * files, so this item is just "apply the service to this one file".
+     *
+     * No queue retries: services hit paid APIs (geocoding), and a retry after
+     * a partial apply would re-bill. A failure marks the whole request failed;
+     * the remaining items short-circuit, and the operator re-runs.
+     */
+    async processPostProcessingJob(queueItem, requestId) {
+        const { fileId, jobId } = queueItem;
+
+        try {
+            await queueService.markFileAsProcessing(fileId);
+
+            const outcome = await runPostProcessingFile({
+                requestId,
+                fileId,
+                onProgress: (evt) => {
+                    if (this.socket && this.socket.connected) {
+                        this.socket.emit('postprocess-progress-event', {
+                            jobId,
+                            fileId,
+                            timestamp: new Date().toISOString(),
+                            ...evt,
+                        });
+                    }
+                },
+            });
+
+            if (outcome.status === 'failed') this.errorCount++;
+            else this.processedCount++;
+        } catch (error) {
+            console.error(
+                `❌ Post-processing job ${requestId.substring(0, 8)}... (file ${fileId}) threw:`,
+                error.message,
+            );
+            this.errorCount++;
         } finally {
             await queueService.removeFileFromProcessing(fileId);
         }
