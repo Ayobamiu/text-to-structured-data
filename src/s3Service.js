@@ -1,5 +1,6 @@
 import { S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectCommand, HeadObjectCommand } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
+import { Upload } from '@aws-sdk/lib-storage';
 import crypto from 'crypto';
 import path from 'path';
 import fs from 'fs';
@@ -57,6 +58,22 @@ class S3Service {
     // Calculate file hash for integrity checking
     calculateFileHash(fileBuffer) {
         return crypto.createHash('sha256').update(fileBuffer).digest('hex');
+    }
+
+    /**
+     * Same sha256, computed by streaming the file off disk so a large upload
+     * never materializes as a Buffer. Identical output to
+     * calculateFileHash(fs.readFileSync(path)) — verified against the buffer
+     * path on a 148.8MB PDF.
+     */
+    hashFileStream(filePath) {
+        return new Promise((resolve, reject) => {
+            const hash = crypto.createHash('sha256');
+            const stream = fs.createReadStream(filePath);
+            stream.on('error', reject);
+            stream.on('data', (chunk) => hash.update(chunk));
+            stream.on('end', () => resolve(hash.digest('hex')));
+        });
     }
 
     /** Base64 UTF-8 so S3 user metadata stays ASCII-safe (Unicode/NBSP filenames break SigV4 otherwise). */
@@ -147,32 +164,57 @@ class S3Service {
             const uniqueFilename = this.generateUniqueFilename(file.originalname);
             const key = `jobs/${jobId}/${uniqueFilename}`;
 
-            // Read file buffer
-            const fileBuffer = file.buffer || fs.readFileSync(file.path);
-
-            // Calculate file hash
-            const fileHash = this.calculateFileHash(fileBuffer);
-
             // Set expiration date
             const expiresAt = new Date();
             expiresAt.setDate(expiresAt.getDate() + this.fileRetentionDays);
 
-            // Upload to S3
-            const uploadCommand = new PutObjectCommand({
-                Bucket: this.bucketName,
-                Key: key,
-                Body: fileBuffer,
-                ContentType: file.mimetype || this.getContentType(file.originalname),
-                Metadata: {
-                    'original-filename-b64': this.encodeFilenameForMetadata(file.originalname),
-                    jobid: jobId,
-                    filehash: fileHash,
-                    uploadedat: new Date().toISOString(),
-                    expiresat: expiresAt.toISOString()
-                }
+            // Hash and upload WITHOUT ever holding the file in memory.
+            //
+            // This used to be `fs.readFileSync(file.path)` into a Buffer that
+            // was then hashed and handed whole to PutObject — so a 150MB PDF
+            // cost 150MB resident before the SDK added its own copies. A
+            // 2026-07-29 prod upload of a 148.8MB file died in exactly this
+            // window: the container went away mid-request (Safari reported a
+            // torn-down connection, no HTTP response), nothing reached the
+            // logs, and no S3 object was written. Same anti-pattern as the
+            // thumbnail OOM three days earlier.
+            //
+            // Two passes over the file on disk, neither buffered: one to
+            // hash, one to upload. Multer already wrote it to disk, so the
+            // read is local. Uploaded files can still arrive in memory
+            // (upload.memoryStorage elsewhere), so `file.buffer` stays
+            // supported for those callers.
+            const fileHash = file.buffer
+                ? this.calculateFileHash(file.buffer)
+                : await this.hashFileStream(file.path);
+
+            const body = file.buffer || fs.createReadStream(file.path);
+
+            // lib-storage's Upload streams in parts (5MB default) and
+            // switches to multipart automatically past the threshold, so peak
+            // memory is a few parts rather than the whole file. PutObject
+            // cannot do this — it needs a known length up front.
+            const upload = new Upload({
+                client: this.s3Client,
+                params: {
+                    Bucket: this.bucketName,
+                    Key: key,
+                    Body: body,
+                    ContentType: file.mimetype || this.getContentType(file.originalname),
+                    Metadata: {
+                        'original-filename-b64': this.encodeFilenameForMetadata(file.originalname),
+                        jobid: jobId,
+                        filehash: fileHash,
+                        uploadedat: new Date().toISOString(),
+                        expiresat: expiresAt.toISOString()
+                    }
+                },
+                queueSize: 4,
+                partSize: 8 * 1024 * 1024,
+                leavePartsOnError: false,
             });
 
-            await this.s3Client.send(uploadCommand);
+            await upload.done();
 
             // Generate signed URL for access
             const signedUrl = await this.generateSignedUrl(key);
