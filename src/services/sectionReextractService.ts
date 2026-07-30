@@ -413,7 +413,7 @@ export async function runSectionReextraction({
     // ── Load state ──────────────────────────────────────────────────────
     const fileRow = await pool.query(
         `SELECT id, job_id, filename, s3_key, selected_pages, detected_sections,
-                result, extraction_metadata, pages
+                result, extraction_metadata, processing_metadata, pages
          FROM job_files WHERE id = $1`,
         [fileId],
     );
@@ -700,9 +700,17 @@ export async function runSectionReextraction({
         finalDetectedSections.sections, newRecordById, oldRecordById,
     );
 
-    const existingMeta = parseMaybeJson(file.extraction_metadata) || {};
+    // Seed from processing_metadata — the column this write lands in
+    // (updateFileProcessingStatus writes processing_metadata, NOT
+    // extraction_metadata). Seeding from the extraction blob instead meant
+    // every re-extract replaced the worker's processing metadata with parser
+    // fields, dropping visual_page_classifier / per_section_extraction /
+    // schemas_used / depth_geometry: 39 of 184 v2 files (21%) had been
+    // stripped that way by 2026-07-30. Nothing user-facing broke, but it
+    // destroyed exactly the provenance you need to debug a bad extraction.
+    const existingProcessingMeta = parseMaybeJson(file.processing_metadata) || {};
     const finalMetadata = {
-        ...existingMeta,
+        ...existingProcessingMeta,
         result_envelope: 'v2',
         section_results: perSection.sectionResults.map((sr: AnyRecord, pi: number) => ({
             ...sr,
