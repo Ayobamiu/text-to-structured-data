@@ -29,6 +29,8 @@ dotenv.config();
 
 
 const WORKER_INTERVAL_MS = parseInt(process.env.WORKER_INTERVAL_MS || '5000'); // Poll every 5 seconds
+// Lease renewal. Must be comfortably under QUEUE_LEASE_STALE_SECONDS (120s).
+const HEARTBEAT_INTERVAL_MS = parseInt(process.env.WORKER_HEARTBEAT_MS || '30000');
 const MAX_RETRIES = parseInt(process.env.WORKER_MAX_RETRIES || '3');
 const SERVER_URL = process.env.SERVER_URL || "http://localhost:3000";
 
@@ -203,7 +205,20 @@ class FileProcessorWorker {
 
                 const queueItem = await queueService.getNextFile();
                 if (queueItem) {
-                    await this.processFile(queueItem);
+                    // Hold the lease for as long as this item is actually being
+                    // worked on. Wrapping processFile (rather than each branch)
+                    // covers every mode — normal, sreex, rex, qa, psvc — with
+                    // one timer. Without this a booting worker cannot tell a
+                    // live job from an abandoned one, which is how a rolling
+                    // deploy handed the same file to two workers.
+                    const beat = setInterval(() => {
+                        queueService.heartbeat(queueItem.fileId).catch(() => {});
+                    }, HEARTBEAT_INTERVAL_MS);
+                    try {
+                        await this.processFile(queueItem);
+                    } finally {
+                        clearInterval(beat);
+                    }
                 } else {
                     // No files in queue, wait before checking again
                     await new Promise(resolve => setTimeout(resolve, WORKER_INTERVAL_MS));

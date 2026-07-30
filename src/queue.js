@@ -1,4 +1,5 @@
 import dotenv from 'dotenv';
+import os from 'os';
 import pool from './database.js';
 
 dotenv.config();
@@ -12,6 +13,16 @@ class QueueService {
         this.schemaLoaded = false;
         this.availableAtColumn = 'updated_at';
         this.processingStartedAtColumn = 'updated_at';
+        this.hasLeaseColumns = false;
+        // Identifies THIS process as the owner of the items it claims, so a
+        // second worker can tell "someone is actively working on this" from
+        // "whoever had this is gone".
+        this.workerId = process.env.WORKER_ID
+            || `${os.hostname()}-${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
+        // A lease is stale after this long without a heartbeat. Sized off the
+        // heartbeat interval (30s), NOT off how long a job takes — that's the
+        // whole point of leasing over a timeout.
+        this.leaseStaleSeconds = Number(process.env.QUEUE_LEASE_STALE_SECONDS || 120);
         this.hasQueueControl = false;
         // Queue shard: isolates dev/staging/production workers sharing the
         // same database. When QUEUE_SHARD is set (e.g. "dev", "production"),
@@ -66,6 +77,10 @@ class QueueService {
 
             const processingCandidates = ['processing_started_at', 'started_at', 'processing_at'];
             this.processingStartedAtColumn = processingCandidates.find(col => columns.includes(col)) || 'updated_at';
+
+            // Lease columns (add_queue_lease migration). Detected rather than
+            // assumed so the code is safe to deploy before the migration runs.
+            this.hasLeaseColumns = columns.includes('worker_id') && columns.includes('heartbeat_at');
 
             const queueControlResult = await client.query(`SELECT to_regclass('public.queue_control') AS name`);
             this.hasQueueControl = Boolean(queueControlResult.rows[0]?.name);
@@ -214,6 +229,11 @@ class QueueService {
                 if (this.processingStartedAtColumn !== 'updated_at') {
                     updateFields.push(`${this.processingStartedAtColumn} = NOW()`);
                 }
+                // Take the lease: this row is mine, and it is alive as of now.
+                if (this.hasLeaseColumns) {
+                    updateFields.push(`worker_id = '${this.workerId.replace(/'/g, "")}'`);
+                    updateFields.push(`heartbeat_at = NOW()`);
+                }
 
                 const updateQuery = `
                     UPDATE file_processing_queue
@@ -314,26 +334,82 @@ class QueueService {
         }
     }
 
-    // Requeue files stuck in 'processing' (e.g. after a worker crash / restart).
-    // Unlike clearAllProcessingFiles (which deletes them), this resets them
-    // back to 'queued' so the worker picks them up on the next poll.
+    /**
+     * Renew the lease on an item this worker is actively processing. Called on
+     * a timer by the worker; failure is non-fatal (the next tick retries).
+     */
+    async heartbeat(fileId) {
+        if (!this.hasLeaseColumns) return false;
+        try {
+            const res = await pool.query(
+                `UPDATE file_processing_queue
+                 SET heartbeat_at = NOW()
+                 WHERE file_id = $1 AND status = 'processing' AND worker_id = $2`,
+                [fileId, this.workerId],
+            );
+            return (res.rowCount || 0) > 0;
+        } catch (error) {
+            console.warn(`⚠️ queue heartbeat failed for ${fileId}: ${error.message}`);
+            return false;
+        }
+    }
+
+    // Requeue files stuck in 'processing' by a worker that is genuinely GONE.
+    //
+    // This used to reset EVERY row in 'processing' on boot, on the assumption
+    // that a booting worker means the previous one died. That is false during
+    // a rolling deploy: the new container starts while the old one is still
+    // mid-file, so the item got handed to a second worker and both ran it.
+    // On 2026-07-30 that cost file 924215a5 its 12-section v2 envelope — the
+    // duplicate run finished last and overwrote it with a single flat record
+    // (and at 01:07 the same thing re-ran a directed re-extraction, re-billing
+    // the vision call).
+    //
+    // Liveness is now proven by a heartbeat rather than assumed from uptime.
+    // A timeout on processing_started_at was the obvious alternative and is
+    // not good enough: real files legitimately run ~30 min of extraction+AI
+    // (plus ~14 min of classification on a 640-page document), so any
+    // threshold safe against false steals would leave genuine crashes
+    // unrecovered for an hour. The heartbeat is sized off the heartbeat
+    // interval instead, so recovery stays ~2 minutes no matter how long the
+    // job itself takes.
     async requeueStaleProcessingFiles() {
         try {
             const client = await pool.connect();
             try {
-                // Reset queue items stuck in 'processing' back to 'queued'.
+                await this.ensureSchemaInfo();
                 // When QUEUE_SHARD is set, only requeue items from this shard.
-                const shardFilter = this.queueShard
-                    ? `AND queue_shard = $1`
-                    : '';
-                const shardParams = this.queueShard ? [this.queueShard] : [];
+                const params = [];
+                let shardFilter = '';
+                if (this.queueShard) {
+                    params.push(this.queueShard);
+                    shardFilter = `AND queue_shard = $${params.length}`;
+                }
+
+                let livenessFilter = '';
+                if (this.hasLeaseColumns) {
+                    params.push(this.leaseStaleSeconds);
+                    // Stale = no heartbeat for longer than the lease window.
+                    // Rows predating the migration have a null heartbeat; fall
+                    // back to when they were claimed so they can still recover.
+                    livenessFilter = `AND COALESCE(heartbeat_at, ${this.processingStartedAtColumn}, updated_at)
+                                        < NOW() - ($${params.length} * INTERVAL '1 second')`;
+                } else {
+                    console.warn(
+                        '⚠️ queue lease columns missing (run migrations/add_queue_lease.js) — ' +
+                        'skipping stale requeue rather than risk stealing a live job'
+                    );
+                    return [];
+                }
+
                 const result = await client.query(
                     `UPDATE file_processing_queue
-                     SET status = 'queued', updated_at = NOW()
+                     SET status = 'queued', updated_at = NOW(), worker_id = NULL, heartbeat_at = NULL
                      WHERE status = 'processing'
                      ${shardFilter}
+                     ${livenessFilter}
                      RETURNING file_id, job_id`,
-                    shardParams
+                    params
                 );
                 if (result.rows.length === 0) {
                     console.log('✅ No stale processing files to requeue');
