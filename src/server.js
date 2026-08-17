@@ -47,6 +47,7 @@ import queueService from "./queue.js";
 import authRoutes from "./routes/auth.js";
 import organizationRoutes from "./routes/organizations.js";
 import previewRoutes, { setWebSocketInstance } from "./routes/previews.js";
+import demoRoutes from "./routes/demo.js";
 import { applyServicesToPreview } from "./services/postProcessing/applyToFiles.ts";
 import { getService, listServices } from "./services/postProcessing/index.ts";
 import mgsRoutes from "./routes/mgs.js";
@@ -96,6 +97,8 @@ const corsOrigins = [
     'http://localhost:3002',
     'http://localhost:8080',
     'https://workspace.coreextract.app',
+    'https://coreextract.app',
+    'https://www.coreextract.app',
     ...(process.env.CORS_ORIGINS || '')
         .split(',')
         .map((s) => s.trim())
@@ -158,6 +161,10 @@ app.use('/organizations', organizationRoutes);
 // Preview routes
 app.use('/previews', express.json());
 app.use('/previews', previewRoutes);
+
+// Public self-serve demo (no JWT). JSON is applied inside the router after
+// the multipart upload route so multer can read the body first.
+app.use('/demo', demoRoutes);
 
 app.use('/mgs', express.json());
 app.use('/mgs', authenticateToken, mgsRoutes);
