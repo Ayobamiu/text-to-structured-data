@@ -29,10 +29,17 @@
  *   node scripts/goldSetSample.mjs --n 60 --fields all
  *   node scripts/goldSetSample.mjs --n 40 --slug borehole_log --seed 7
  *   node scripts/goldSetSample.mjs --estimate        # effort only, no CSV
+ *   node scripts/goldSetSample.mjs --n 60 --write --batch b1   # seed the UI
+ *
+ * --write is the only mode that touches the database: it seeds gold_labels
+ * with verdict NULL for the review panel to fill in. Re-running the same
+ * --batch --seed is safe (ON CONFLICT DO NOTHING) and adds nothing, so a
+ * partly-reviewed batch cannot be clobbered by a re-seed.
  */
 import dotenv from 'dotenv'; dotenv.config({ quiet: true });
 import pg from 'pg';
 import { CORE_FIELDS, CORE_TABLES, EXCLUDED_PREFIXES } from './lib/goldSetFields.mjs';
+import { getAtFieldPath, serializeExtractedValue } from '../src/utils/goldSetPaths.mjs';
 
 const args = process.argv.slice(2);
 const has = (n) => args.includes(`--${n}`);
@@ -48,6 +55,8 @@ const SEED = Number(argOf('seed', '42'));
 const MODE = argOf('fields', 'core');
 const INCLUDE_QAD = has('include-qad');
 const ESTIMATE = has('estimate');
+const WRITE = has('write');
+const BATCH = argOf('batch', null);
 
 const pool = new pg.Pool({
     connectionString: process.env.DEV_DATABASE_URL || process.env.DATABASE_URL,
@@ -68,11 +77,6 @@ function rng(seed) {
 const csv = (v) =>
     `"${String(v ?? '').replace(/\s*\n\s*/g, ' ⏎ ').replace(/"/g, '""')}"`;
 
-const flat = (v) => {
-    if (v === null || v === undefined) return '';
-    return typeof v === 'object' ? JSON.stringify(v) : String(v);
-};
-
 /** Every checkable leaf path in a record, honouring the exclusion list. */
 function allLeafPaths(record, prefix = '') {
     const out = [];
@@ -85,10 +89,64 @@ function allLeafPaths(record, prefix = '') {
     return out;
 }
 
-const getPath = (obj, path) =>
-    path.split('.').reduce((o, k) => (o == null ? undefined : o[k]), obj);
+/**
+ * Seed the drawn sample into gold_labels for the review panel to fill in.
+ *
+ * ON CONFLICT DO NOTHING on (batch, section_result_id, field_path): re-running
+ * a seed must never overwrite a verdict somebody already recorded. Adding
+ * fields to a live batch is therefore safe and additive.
+ */
+async function writeBatch(client, rows, sample, perFileCount) {
+    await client.query('BEGIN');
+    try {
+        await client.query(
+            `INSERT INTO gold_batches
+                 (batch, slug, n_sections, per_file, seed, field_mode, include_qad, notes)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+             ON CONFLICT (batch) DO NOTHING`,
+            [
+                BATCH, SLUG, sample.length, PER_FILE, SEED, MODE, INCLUDE_QAD,
+                `${sample.length} sections from ${perFileCount} files, ≤${PER_FILE}/file, ` +
+                `${INCLUDE_QAD ? 'incl.' : 'excl.'} QA'd sections`,
+            ]
+        );
+
+        // One multi-row INSERT per section keeps the statement small enough to
+        // read in a log while still being a handful of round trips, not 2,000.
+        let inserted = 0;
+        for (let i = 0; i < rows.length; i += 500) {
+            const chunk = rows.slice(i, i + 500);
+            const values = [];
+            const params = [];
+            chunk.forEach((r, j) => {
+                const b = j * 8;
+                values.push(`($${b + 1},$${b + 2},$${b + 3},$${b + 4},$${b + 5},$${b + 6},$${b + 7},$${b + 8})`);
+                params.push(BATCH, r.file_id, r.job_id, r.sid, SLUG, r.field_path, r.extracted_value, r.qa_ran);
+            });
+            const res = await client.query(
+                `INSERT INTO gold_labels
+                     (batch, file_id, job_id, section_result_id, slug, field_path, extracted_value, qa_ran)
+                 VALUES ${values.join(',')}
+                 ON CONFLICT (batch, section_result_id, field_path) DO NOTHING`,
+                params
+            );
+            inserted += res.rowCount;
+        }
+
+        await client.query('COMMIT');
+        return inserted;
+    } catch (err) {
+        await client.query('ROLLBACK');
+        throw err;
+    }
+}
 
 async function main() {
+    if (WRITE && !BATCH) {
+        console.error('--write needs --batch <name> (e.g. --batch b1).');
+        process.exitCode = 1;
+        return;
+    }
     // Pool of candidate sections. LEFT JOIN marks which ones QA has touched;
     // qa_ran is carried into the CSV either way so the scorer can split on it.
     const { rows: pool_ } = await pool.query(
@@ -131,22 +189,30 @@ async function main() {
     const scalarFields = CORE_FIELDS[SLUG] ?? [];
     const tables = CORE_TABLES[SLUG] ?? [];
 
-    // Expand to one row per field.
-    const lines = [];
+    // Expand to one row per field. Rows are built once and then either
+    // printed as CSV or seeded into gold_labels — the sample a reviewer sees
+    // in the UI is byte-for-byte the sample the CSV would have contained.
+    const rows = [];
     let scalarChecks = 0, rowChecks = 0;
     for (const s of sample) {
         const rec = s.record;
-        const paths =
-            MODE === 'all' ? allLeafPaths(rec) : scalarFields;
+        const paths = MODE === 'all' ? allLeafPaths(rec) : scalarFields;
+        const wellId = getAtFieldPath(rec, 'site_identification.boring_well_id') ?? '';
+
+        const push = (field_path, value) => rows.push({
+            filename: s.filename,
+            job_id: s.job_id,
+            file_id: s.file_id,
+            sid: s.sid,
+            well_id: wellId,
+            qa_ran: !!s.qa_ran,
+            field_path,
+            // NULL means blank — and blank is frequently the CORRECT answer.
+            extracted_value: serializeExtractedValue(value),
+        });
 
         for (const p of paths) {
-            lines.push([
-                s.filename, s.job_id, s.file_id, s.sid,
-                getPath(rec, 'site_identification.boring_well_id') ?? '',
-                s.qa_ran ? 'yes' : 'no',
-                p, flat(getPath(rec, p)),
-                '', '', '',
-            ]);
+            push(p, getAtFieldPath(rec, p));
             scalarChecks++;
         }
 
@@ -155,13 +221,7 @@ async function main() {
             if (!Array.isArray(arr)) continue;
             for (let i = 0; i < Math.min(arr.length, t.maxRows); i++) {
                 for (const f of t.fields) {
-                    lines.push([
-                        s.filename, s.job_id, s.file_id, s.sid,
-                        getPath(rec, 'site_identification.boring_well_id') ?? '',
-                        s.qa_ran ? 'yes' : 'no',
-                        `${t.path}[${i}].${f}`, flat(arr[i]?.[f]),
-                        '', '', '',
-                    ]);
+                    push(`${t.path}[${i}].${f}`, arr[i]?.[f]);
                     rowChecks++;
                 }
             }
@@ -179,12 +239,35 @@ async function main() {
         return;
     }
 
+    if (WRITE) {
+        const client = await pool.connect();
+        try {
+            const inserted = await writeBatch(client, rows, sample, perFile.size);
+            const skipped = rows.length - inserted;
+            console.log(
+                `✅ batch "${BATCH}": ${inserted} rows seeded ` +
+                `(${sample.length} sections from ${perFile.size} files, ${rows.length} checks)` +
+                (skipped > 0 ? `\n   ${skipped} already existed and were left untouched.` : '')
+            );
+            console.log(`   Score it later with: node scripts/goldSetScore.mjs --batch ${BATCH}`);
+        } finally {
+            client.release();
+        }
+        return;
+    }
+
     console.log([
         'filename', 'job_id', 'file_id', 'section_result_id', 'well_id', 'qa_ran',
         'field_path', 'extracted_value',
         'verdict', 'true_value', 'notes',
     ].join(','));
-    for (const l of lines) console.log(l.map(csv).join(','));
+    for (const r of rows) {
+        console.log([
+            r.filename, r.job_id, r.file_id, r.sid, r.well_id, r.qa_ran ? 'yes' : 'no',
+            r.field_path, r.extracted_value ?? '',
+            '', '', '',
+        ].map(csv).join(','));
+    }
 
     console.error(
         `\n${sample.length} sections from ${perFile.size} files → ` +

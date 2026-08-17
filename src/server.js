@@ -3763,6 +3763,156 @@ app.patch("/files/:id/qa-findings/:findingId", authenticateToken, async (req, re
     }
 });
 
+// ── Gold-set review ──────────────────────────────────────────────
+//
+// Human verdicts on every field in a stratified sample — including the fields
+// that are RIGHT. Those negatives are the denominator per-field accuracy needs
+// and the thing production data can never supply, since section_qa_findings
+// only ever records errors somebody caught.
+//
+// Nothing under this heading writes job_files.result. Gold review judges the
+// extraction; repairing it is the QA apply path's job.
+
+// GET /files/:id/gold-labels?batch=b1
+// Every gold row for this file in a batch, each carrying the live value so the
+// panel can flag rows whose extraction changed after they were seeded.
+app.get("/files/:id/gold-labels", authenticateToken, requireRole('admin'), async (req, res) => {
+    try {
+        const { id: fileId } = req.params;
+        const batch = req.query.batch;
+        if (!batch) {
+            return res.status(400).json({ status: 'error', message: 'batch is required' });
+        }
+
+        const hasAccess = await checkFileAccess(fileId, req.user, res);
+        if (!hasAccess) return;
+
+        const { getGoldLabelsForFile } = await import('./services/goldSetService.ts');
+        const labels = await getGoldLabelsForFile(fileId, batch);
+
+        res.json({ status: 'success', labels });
+    } catch (error) {
+        console.error('❌ get gold labels:', error.message);
+        res.status(500).json({ status: 'error', message: error.message });
+    }
+});
+
+// PATCH /files/:id/gold-labels
+// Record (or clear) a verdict for one or more rows. Takes an array because
+// judging a whole object or array writes one row per seeded leaf beneath it —
+// a verdict stored against the container would collapse several observations
+// into one and no per-field accuracy could be recovered from it.
+app.patch("/files/:id/gold-labels", authenticateToken, requireRole('admin'), async (req, res) => {
+    try {
+        const { id: fileId } = req.params;
+        const { ids, verdict, trueValue, notes } = req.body;
+
+        if (!Array.isArray(ids) || ids.length === 0) {
+            return res.status(400).json({ status: 'error', message: 'ids must be a non-empty array' });
+        }
+
+        const { setGoldVerdicts, clearGoldVerdicts, GOLD_VERDICTS } =
+            await import('./services/goldSetService.ts');
+
+        if (verdict !== null && !GOLD_VERDICTS.includes(verdict)) {
+            return res.status(400).json({
+                status: 'error',
+                message: `verdict must be null or one of: ${GOLD_VERDICTS.join(', ')}`,
+            });
+        }
+
+        const hasAccess = await checkFileAccess(fileId, req.user, res);
+        if (!hasAccess) return;
+
+        if (verdict === null) {
+            const cleared = await clearGoldVerdicts(ids, fileId);
+            return res.json({ status: 'success', cleared });
+        }
+
+        const labels = await setGoldVerdicts(ids, fileId, verdict, req.user.id, { trueValue, notes });
+        res.json({ status: 'success', labels });
+    } catch (error) {
+        console.error('❌ update gold labels:', error.message);
+        res.status(500).json({ status: 'error', message: error.message });
+    }
+});
+
+// POST /files/:id/gold-labels
+// Label a field the sample never drew. Lands in the reserved `adhoc` batch and
+// is never scored as part of a draw — the headline number depends on the
+// sample being the one that was drawn.
+app.post("/files/:id/gold-labels", authenticateToken, requireRole('admin'), async (req, res) => {
+    try {
+        const { id: fileId } = req.params;
+        const { jobId, sectionResultId, slug, fieldPath, verdict, trueValue, notes } = req.body;
+
+        if (!sectionResultId || !slug || !fieldPath) {
+            return res.status(400).json({
+                status: 'error',
+                message: 'sectionResultId, slug and fieldPath are required',
+            });
+        }
+
+        const { createAdhocGoldLabel, GOLD_VERDICTS } = await import('./services/goldSetService.ts');
+        if (!GOLD_VERDICTS.includes(verdict)) {
+            return res.status(400).json({
+                status: 'error',
+                message: `verdict must be one of: ${GOLD_VERDICTS.join(', ')}`,
+            });
+        }
+
+        const hasAccess = await checkFileAccess(fileId, req.user, res);
+        if (!hasAccess) return;
+
+        const label = await createAdhocGoldLabel({
+            fileId, jobId: jobId ?? null, sectionResultId, slug, fieldPath,
+            verdict, trueValue, notes, userId: req.user.id,
+        });
+        res.json({ status: 'success', label });
+    } catch (error) {
+        console.error('❌ create adhoc gold label:', error.message);
+        res.status(500).json({ status: 'error', message: error.message });
+    }
+});
+
+// GET /gold-batches
+app.get("/gold-batches", authenticateToken, requireRole('admin'), async (req, res) => {
+    try {
+        const { listGoldBatches } = await import('./services/goldSetService.ts');
+        const batches = await listGoldBatches();
+        res.json({ status: 'success', batches });
+    } catch (error) {
+        console.error('❌ list gold batches:', error.message);
+        res.status(500).json({ status: 'error', message: error.message });
+    }
+});
+
+// GET /gold-batches/:batch/queue
+// The review queue plus progress. Ordered by file so consecutive sections
+// share an already-loaded PDF — loading a scanned log is the most expensive
+// step in a review pass by a wide margin.
+app.get("/gold-batches/:batch/queue", authenticateToken, requireRole('admin'), async (req, res) => {
+    try {
+        const { batch } = req.params;
+        const { getGoldBatchQueue, getGoldBatchProgress } =
+            await import('./services/goldSetService.ts');
+
+        const [queue, progress] = await Promise.all([
+            getGoldBatchQueue(batch),
+            getGoldBatchProgress(batch),
+        ]);
+
+        if (!progress) {
+            return res.status(404).json({ status: 'error', message: `Unknown batch "${batch}"` });
+        }
+
+        res.json({ status: 'success', queue, progress });
+    } catch (error) {
+        console.error('❌ gold batch queue:', error.message);
+        res.status(500).json({ status: 'error', message: error.message });
+    }
+});
+
 // ── Section-level verification ───────────────────────────────────
 
 /**

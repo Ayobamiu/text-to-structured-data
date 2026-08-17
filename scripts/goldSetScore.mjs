@@ -20,9 +20,16 @@
  * 100%). Wilson stays inside [0,1] and is honest about small n.
  *
  * Usage (from ai/):
- *   node scripts/goldSetScore.mjs checklist.csv
- *   node scripts/goldSetScore.mjs checklist.csv --by-qa    # split QA'd vs not
+ *   node scripts/goldSetScore.mjs --batch b1               # reviewed in the UI
+ *   node scripts/goldSetScore.mjs --batch b1 --by-qa       # split QA'd vs not
+ *   node scripts/goldSetScore.mjs checklist.csv            # legacy CSV fill
  *   node scripts/goldSetScore.mjs checklist.csv --min-n 30
+ *
+ * Scoring deliberately stays a CLI report rather than a page in the app. The
+ * headline number is meaningless without its interval and its n, and a figure
+ * rendered in the UI gets screenshotted and quoted as "our accuracy" — which
+ * is the exact confusion (precision reported as accuracy) this whole exercise
+ * exists to end.
  */
 import fs from 'node:fs';
 
@@ -34,9 +41,13 @@ const argOf = (n, d) => {
     return i >= 0 && args[i + 1] ? args[i + 1] : d;
 };
 const MIN_N = Number(argOf('min-n', '30'));
+const BATCH = argOf('batch', null);
 
-if (!file) {
-    console.error('usage: node scripts/goldSetScore.mjs <filled-checklist.csv> [--by-qa] [--min-n 30]');
+if (!file && !BATCH) {
+    console.error(
+        'usage: node scripts/goldSetScore.mjs <filled-checklist.csv> [--by-qa] [--min-n 30]\n' +
+        '       node scripts/goldSetScore.mjs --batch b1 [--by-qa] [--min-n 30]'
+    );
     process.exit(1);
 }
 
@@ -141,10 +152,46 @@ function score(rows, label) {
     }
 }
 
-const rows = parseCsv(fs.readFileSync(file, 'utf8'));
+/**
+ * Read a batch out of gold_labels, shaped exactly like a parsed CSV row so
+ * score() cannot tell the two sources apart. The reviewing moved into the UI;
+ * the maths did not change.
+ */
+async function loadBatch(batch) {
+    const { default: pg } = await import('pg');
+    const dotenv = await import('dotenv');
+    dotenv.config({ quiet: true });
+
+    const pool = new pg.Pool({
+        connectionString: process.env.DEV_DATABASE_URL || process.env.DATABASE_URL,
+        ssl: { rejectUnauthorized: false },
+    });
+    try {
+        const { rows } = await pool.query(
+            `SELECT field_path, verdict, true_value, notes,
+                    CASE WHEN qa_ran THEN 'yes' ELSE 'no' END AS qa_ran
+               FROM gold_labels
+              WHERE batch = $1`,
+            [batch]
+        );
+        if (rows.length === 0) {
+            console.error(`Batch "${batch}" has no rows. Seed it first:\n` +
+                `  node scripts/goldSetSample.mjs --n 60 --write --batch ${batch}`);
+            process.exitCode = 1;
+        }
+        return rows.map((r) => ({ ...r, verdict: r.verdict ?? '' }));
+    } finally {
+        await pool.end();
+    }
+}
+
+const rows = BATCH
+    ? await loadBatch(BATCH)
+    : parseCsv(fs.readFileSync(file, 'utf8'));
+
 if (has('by-qa')) {
     score(rows.filter((r) => r.qa_ran === 'no'), "RAW EXTRACTION (sections QA never touched)");
     score(rows.filter((r) => r.qa_ran === 'yes'), "POST-QA (errors already corrected — expect higher)");
 } else {
-    score(rows, `GOLD SET — ${file}`);
+    score(rows, BATCH ? `GOLD SET — batch ${BATCH}` : `GOLD SET — ${file}`);
 }
