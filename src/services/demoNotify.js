@@ -13,6 +13,12 @@ function notifyFrom() {
     return process.env.DEMO_FROM_EMAIL || 'Core Extract <hello@coreextract.app>';
 }
 
+/** Human inbox for replies. From may be a send-only subdomain (mail.coreextract.app). */
+export function demoReplyTo() {
+    const raw = String(process.env.DEMO_REPLY_TO || 'hello@coreextract.app').trim();
+    return raw || 'hello@coreextract.app';
+}
+
 export function demoAppOrigin() {
     const raw = String(process.env.DEMO_APP_URL || '').trim();
     if (raw) return raw.replace(/\/$/, '');
@@ -42,6 +48,7 @@ async function sendResend({ to, subject, text, html }) {
             body: JSON.stringify({
                 from: notifyFrom(),
                 to: Array.isArray(to) ? to : [to],
+                reply_to: demoReplyTo(),
                 subject,
                 text,
                 ...(html ? { html } : {}),
