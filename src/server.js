@@ -50,7 +50,10 @@ import previewRoutes, { setWebSocketInstance } from "./routes/previews.js";
 import demoRoutes from "./routes/demo.js";
 import { applyServicesToPreview } from "./services/postProcessing/applyToFiles.ts";
 import { getService, listServices } from "./services/postProcessing/index.ts";
+import { runConfiguredServicesOverResult } from "./services/postProcessing/runOverResult.ts";
+import { persistSideEffects } from "./services/postProcessing/sideEffects.ts";
 import mgsRoutes from "./routes/mgs.js";
+import nlqueryRoutes from "./routes/nlquery.js";
 import healthRoutes from "./routes/health.js";
 import { authenticateToken, optionalAuth, securityHeaders, requireRole } from "./middleware/auth.js";
 import { rateLimitConfig } from "./auth.js";
@@ -168,6 +171,9 @@ app.use('/demo', demoRoutes);
 
 app.use('/mgs', express.json());
 app.use('/mgs', authenticateToken, mgsRoutes);
+
+app.use('/nlquery', express.json());
+app.use('/nlquery', authenticateToken, nlqueryRoutes);
 
 // Health check routes (no auth required)
 app.use('/', healthRoutes);
@@ -2070,6 +2076,31 @@ app.put("/files/:id/results", authenticateToken, async (req, res) => {
                 has_result: true,
                 flags,
             });
+
+            // Re-project into extracted_records so the NL-query layer reflects this edit.
+            // Projection is always-on + idempotent (delete-then-insert by record_uid);
+            // force=true rebuilds even though provenance may show a prior projection.
+            // Best-effort: a projection hiccup must never fail the user's save.
+            try {
+                const proj = await runConfiguredServicesOverResult({
+                    result: resultWithoutSourceLocations,
+                    fileId: id,
+                    registry: listServices(),
+                    force: true,
+                });
+                if (proj.sideEffects.length > 0) {
+                    await client.query('BEGIN');
+                    try {
+                        await persistSideEffects(client, proj.sideEffects);
+                        await client.query('COMMIT');
+                    } catch (e) {
+                        await client.query('ROLLBACK');
+                        throw e;
+                    }
+                }
+            } catch (err) {
+                console.warn(`⚠️ re-projection after edit failed (non-fatal) for file ${updatedFile.id}:`, err.message);
+            }
 
             // Fire-and-forget: log this edit to field_corrections so we have
             // a per-field audit trail (foundation for future few-shot pools,
