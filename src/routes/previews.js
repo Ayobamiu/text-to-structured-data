@@ -23,7 +23,8 @@ import {
     getAvailableJobFiles,
     getPreviewsForFile,
     isFileInPreview,
-    getPreviewStatistics
+    getPreviewStatistics,
+    previewAccessBlock
 } from '../database/previewDataTable.js';
 import mgsDataService from '../services/mgsDataService.js';
 import { getService, listServices } from '../services/postProcessing/index.ts';
@@ -74,6 +75,30 @@ const upload = multer({
 const s3Service = new S3Service();
 
 /**
+ * Loads the preview for public /:id routes and enforces access control
+ * (status + expiry, evaluated at request time). Attaches the row as
+ * req.preview so handlers don't re-fetch it.
+ *
+ * Every public preview route must use this so no route can forget the
+ * check. Admin/mutation routes (PUT/DELETE, items, analytics report)
+ * intentionally do NOT — an expired preview must stay editable so access
+ * can be extended, and its analytics remain readable by admins.
+ */
+async function loadAccessiblePreview(req, res, next) {
+    try {
+        const preview = await getPreviewDataTableById(req.params.id);
+        const block = previewAccessBlock(preview);
+        if (block) {
+            return res.status(block.status).json(block.body);
+        }
+        req.preview = preview;
+        next();
+    } catch (error) {
+        next(error);
+    }
+}
+
+/**
  * GET /previews
  * Get all preview data tables
  */
@@ -109,17 +134,9 @@ router.get('/services', async (req, res) => {
  * GET /previews/:id
  * Get a specific preview data table by ID
  */
-router.get('/:id', async (req, res) => {
+router.get('/:id', loadAccessiblePreview, async (req, res) => {
     try {
-        const { id } = req.params;
-        const preview = await getPreviewDataTableById(id);
-
-        if (!preview) {
-            return res.status(404).json({
-                success: false,
-                message: 'Preview not found'
-            });
-        }
+        const preview = req.preview;
 
         res.json({
             success: true,
@@ -139,17 +156,9 @@ router.get('/:id', async (req, res) => {
  * GET /previews/:id/statistics
  * Get summary statistics for all items in a preview (not paginated)
  */
-router.get('/:id/statistics', async (req, res) => {
+router.get('/:id/statistics', loadAccessiblePreview, async (req, res) => {
     try {
-        const { id } = req.params;
-        const preview = await getPreviewDataTableById(id);
-
-        if (!preview) {
-            return res.status(404).json({
-                success: false,
-                message: 'Preview not found'
-            });
-        }
+        const preview = req.preview;
 
         // Get statistics for all items
         const statistics = await getPreviewStatistics(preview.items_ids || []);
@@ -173,19 +182,11 @@ router.get('/:id/statistics', async (req, res) => {
  * Get preview data with job files results (paginated)
  * Query params: page (default: 1), pageSize (default: 20), search (optional)
  */
-router.get('/:id/data', async (req, res) => {
+router.get('/:id/data', loadAccessiblePreview, async (req, res) => {
     try {
-        const { id } = req.params;
         const { page = '1', pageSize = '20', search = null, slug = null, fileId = null } = req.query;
 
-        const preview = await getPreviewDataTableById(id);
-
-        if (!preview) {
-            return res.status(404).json({
-                success: false,
-                message: 'Preview not found'
-            });
-        }
+        const preview = req.preview;
 
         // Parse pagination params
         const pageNum = parseInt(page, 10) || 1;
@@ -243,15 +244,11 @@ router.get('/:id/data', async (req, res) => {
  * GET /previews/:id/files
  * "By file" lens: one row per file with a by-type record summary + review status.
  */
-router.get('/:id/files', async (req, res) => {
+router.get('/:id/files', loadAccessiblePreview, async (req, res) => {
     try {
-        const { id } = req.params;
         const { page = '1', pageSize = '20', search = null } = req.query;
 
-        const preview = await getPreviewDataTableById(id);
-        if (!preview) {
-            return res.status(404).json({ success: false, message: 'Preview not found' });
-        }
+        const preview = req.preview;
 
         const pageNum = Math.max(parseInt(page, 10) || 1, 1);
         const pageSizeNum = Math.min(Math.max(parseInt(pageSize, 10) || 20, 1), 100);
@@ -294,7 +291,7 @@ router.get('/:id/files', async (req, res) => {
  * preview's items_ids. Returns JSON { success, url } (or 302 to the signed URL
  * when JSON isn't requested).
  */
-router.get('/:id/files/:fileId/download', async (req, res) => {
+router.get('/:id/files/:fileId/download', loadAccessiblePreview, async (req, res) => {
     try {
         const { id, fileId } = req.params;
 
@@ -347,9 +344,8 @@ router.get('/:id/files/:fileId/download', async (req, res) => {
  * row-by-row. One clean row per record; scalars + one level of nested objects
  * become real snake_case columns; arrays/internal keys are excluded.
  */
-router.get('/:id/export', async (req, res) => {
+router.get('/:id/export', loadAccessiblePreview, async (req, res) => {
     try {
-        const { id } = req.params;
         const { slug = null, format = 'csv' } = req.query;
 
         if (format !== 'csv') {
@@ -365,10 +361,7 @@ router.get('/:id/export', async (req, res) => {
             });
         }
 
-        const preview = await getPreviewDataTableById(id);
-        if (!preview) {
-            return res.status(404).json({ success: false, message: 'Preview not found' });
-        }
+        const preview = req.preview;
 
         const records = await getAllRecordsForSlug(preview.items_ids || [], slug);
 
@@ -425,17 +418,13 @@ router.get('/:id/export', async (req, res) => {
  * Wellogic-format multi-tab Excel: a Wells tab (records → Wellogic columns, with
  * coordinates + precision from record_geocodes) and a linked Lithology tab.
  */
-router.get('/:id/export-wellogic', async (req, res) => {
+router.get('/:id/export-wellogic', loadAccessiblePreview, async (req, res) => {
     try {
-        const { id } = req.params;
         const { slug = null } = req.query;
         if (!slug) {
             return res.status(400).json({ success: false, message: 'A document type (slug) is required.' });
         }
-        const preview = await getPreviewDataTableById(id);
-        if (!preview) {
-            return res.status(404).json({ success: false, message: 'Preview not found' });
-        }
+        const preview = req.preview;
 
         const data = await getWellogicExportData(preview.items_ids || [], slug);
 
@@ -460,9 +449,8 @@ router.get('/:id/export-wellogic', async (req, res) => {
  * dry-run: services execute and counts are returned, but nothing is persisted.
  * Generalizes the old /enrich-with-mgs routes.
  */
-router.post('/:id/run-service', async (req, res) => {
+router.post('/:id/run-service', loadAccessiblePreview, async (req, res) => {
     try {
-        const { id } = req.params;
         const { name, slug, options = {}, apply = false, force = false } = req.body || {};
 
         if (!name || !slug) {
@@ -479,10 +467,7 @@ router.post('/:id/run-service', async (req, res) => {
             });
         }
 
-        const preview = await getPreviewDataTableById(id);
-        if (!preview) {
-            return res.status(404).json({ success: false, message: 'Preview not found' });
-        }
+        const preview = req.preview;
 
         const result = await applyServicesToPreview({
             itemIds: preview.items_ids || [],
@@ -1085,7 +1070,7 @@ router.post('/files/bulk/enrich-with-mgs', async (req, res) => {
  * POST /previews/:id/analytics/events
  * Public — record preview visitor activity (no auth on preview links).
  */
-router.post('/:id/analytics/events', async (req, res) => {
+router.post('/:id/analytics/events', loadAccessiblePreview, async (req, res) => {
     try {
         const { id: previewId } = req.params;
         const { clientSessionId, events } = req.body || {};
@@ -1108,14 +1093,6 @@ router.post('/:id/analytics/events', async (req, res) => {
             return res.status(400).json({
                 success: false,
                 message: 'Maximum 25 events per request',
-            });
-        }
-
-        const preview = await getPreviewDataTableById(previewId);
-        if (!preview) {
-            return res.status(404).json({
-                success: false,
-                message: 'Preview not found',
             });
         }
 
@@ -1178,6 +1155,9 @@ router.get(
                     preview: {
                         id: preview.id,
                         name: preview.name,
+                        status: preview.status,
+                        expires_at: preview.expires_at,
+                        access_note: preview.access_note,
                     },
                     ...report,
                 },

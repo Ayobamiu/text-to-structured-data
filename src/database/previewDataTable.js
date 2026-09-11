@@ -15,7 +15,7 @@ export async function createPreviewDataTable(name, schema, logo = null) {
         const query = `
             INSERT INTO preview_data_table (name, schema, logo)
             VALUES ($1, $2, $3)
-            RETURNING id, name, schema, logo, items_ids, created_at, updated_at
+            RETURNING id, name, schema, logo, items_ids, expires_at, status, access_note, created_at, updated_at
         `;
 
         const values = [name, schema, logo];
@@ -34,7 +34,7 @@ export async function getPreviewDataTables() {
     const client = await pool.connect();
     try {
         const query = `
-            SELECT id, name, schema, logo, items_ids, created_at, updated_at,
+            SELECT id, name, schema, logo, items_ids, expires_at, status, access_note, created_at, updated_at,
                    array_length(items_ids, 1) as item_count
             FROM preview_data_table
             ORDER BY created_at DESC
@@ -54,7 +54,7 @@ export async function getPreviewDataTableById(id) {
     const client = await pool.connect();
     try {
         const query = `
-            SELECT id, name, schema, logo, items_ids, created_at, updated_at
+            SELECT id, name, schema, logo, items_ids, expires_at, status, access_note, created_at, updated_at
             FROM preview_data_table
             WHERE id = $1
         `;
@@ -67,12 +67,61 @@ export async function getPreviewDataTableById(id) {
 }
 
 /**
+ * Access-control policy for PUBLIC preview routes.
+ *
+ * Given a preview row (or null), returns null when it may be served, or
+ * { status, body } to send as the HTTP response when access is blocked.
+ * Expiry is evaluated at request time — no cron or sweeper required.
+ *
+ * Blocked responses use 410 Gone with a machine-readable `code` so the
+ * public preview page can render a proper "access ended" state instead of
+ * a generic error:
+ *   - PREVIEW_DISABLED — an operator turned the link off
+ *   - PREVIEW_EXPIRED  — expires_at is in the past
+ */
+export function previewAccessBlock(preview) {
+    if (!preview) {
+        return {
+            status: 404,
+            body: { success: false, message: 'Preview not found' }
+        };
+    }
+
+    if (preview.status && preview.status !== 'active') {
+        return {
+            status: 410,
+            body: {
+                success: false,
+                code: 'PREVIEW_DISABLED',
+                message: 'This preview is no longer available.',
+                accessNote: preview.access_note || null
+            }
+        };
+    }
+
+    if (preview.expires_at && new Date(preview.expires_at).getTime() <= Date.now()) {
+        return {
+            status: 410,
+            body: {
+                success: false,
+                code: 'PREVIEW_EXPIRED',
+                message: 'Access to this preview has ended.',
+                expiresAt: preview.expires_at,
+                accessNote: preview.access_note || null
+            }
+        };
+    }
+
+    return null;
+}
+
+/**
  * Update a preview data table
  */
 export async function updatePreviewDataTable(id, updates) {
     const client = await pool.connect();
     try {
-        const allowedFields = ['name', 'schema', 'logo', 'items_ids'];
+        const allowedFields = ['name', 'schema', 'logo', 'items_ids', 'expires_at', 'status', 'access_note'];
         const updateFields = [];
         const values = [];
         let paramCount = 1;
@@ -96,7 +145,7 @@ export async function updatePreviewDataTable(id, updates) {
             UPDATE preview_data_table
             SET ${updateFields.join(', ')}, updated_at = NOW()
             WHERE id = $${paramCount}
-            RETURNING id, name, schema, logo, items_ids, created_at, updated_at
+            RETURNING id, name, schema, logo, items_ids, expires_at, status, access_note, created_at, updated_at
         `;
 
         const result = await client.query(query, values);
