@@ -330,12 +330,26 @@ function rowsShallowEqual(a, b) {
 }
 
 /**
+ * An update_row's row_value is a PATCH — the fields QA could verify, merged onto
+ * the existing row by the apply path (web jsonPath mergeRowValue). It is a no-op
+ * when every field it lists already holds that value; fields it omits say
+ * nothing. rowsShallowEqual compares the union of both key sets, so a sparse
+ * patch could never equal a full row and every unchanged patch would survive
+ * verification as a finding for someone to dismiss.
+ */
+function patchIsNoOp(patch, row) {
+    if (!patch || !row || typeof patch !== 'object' || typeof row !== 'object') return false;
+    return Object.keys(patch).every((key) =>
+        qaValuesEqual(toActualString(patch[key]), toActualString(row[key])));
+}
+
+/**
  * Verify a delete_row/add_row/update_row finding against the real array.
  * Never trusts the model's row_index/row_value blindly:
  *   - the target field must resolve to a real array, or the finding is dropped
  *   - row_index (delete_row/update_row) must be a valid in-range integer
  *   - row_value (add_row/update_row) must parse as JSON
- *   - update_row is dropped as a no-op when the proposed row already matches
+ *   - update_row is dropped as a no-op when every field its patch lists already matches
  *   - add_row is dropped when the proposed row is a near-duplicate of an
  *     existing item (the model re-adding something that's already there)
  */
@@ -392,8 +406,8 @@ function verifyStructuredRowFinding(issue, record, rootSchema = null) {
         // real integer for the row_index column.
         const corrected = { ...issue, row_index: idx, actual: toActualString(array[idx]) };
         if (issueType === 'update_row') {
-            if (rowValue === undefined || rowsShallowEqual(rowValue, array[idx])) {
-                return { keep: false, issue: corrected }; // no-op: proposed row already matches
+            if (rowValue === undefined || patchIsNoOp(rowValue, array[idx])) {
+                return { keep: false, issue: corrected }; // no-op: every patched field already matches
             }
         }
         return { keep: true, issue: corrected };
