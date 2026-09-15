@@ -944,6 +944,21 @@ class FileProcessorWorker {
                 return;
             }
 
+            // A file deleted after it was queued (or mid-run) can never be
+            // processed, so a missing job_files row is terminal: drop every
+            // queue row for the file and stop. The retry path below can't
+            // handle it — retryFile inserts another row, then the status
+            // update throws "File not found", escapes this catch, and leaves
+            // the claimed row in 'processing' for the next restart to requeue
+            // (the 2026-09-15 ghost-row flood).
+            if (await this.isFileDeleted(fileId)) {
+                const removed = await queueService.removeFileFromQueue(fileId);
+                console.warn(
+                    `🗑️ File ${fileId} no longer exists — removed ${removed} queue row(s), not retrying (${error.message})`
+                );
+                return;
+            }
+
             console.error('❌ Error processing file:', error.message);
             this.errorCount++;
 
@@ -1001,6 +1016,20 @@ class FileProcessorWorker {
                     error.message
                 );
             }
+        }
+    }
+
+    /**
+     * True only when the file's job_files row is confirmed gone. If the check
+     * itself fails (e.g. the database is unreachable) this returns false, so
+     * the normal retry path still runs.
+     */
+    async isFileDeleted(fileId) {
+        try {
+            return !(await queueService.jobFileExists(fileId));
+        } catch (checkError) {
+            console.warn(`⚠️ Could not check whether file ${fileId} still exists: ${checkError.message}`);
+            return false;
         }
     }
 
