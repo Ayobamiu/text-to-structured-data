@@ -444,6 +444,47 @@ describe('verifyFindingAgainstRecord', () => {
             expect(r.keep).toBe(false);
         });
 
+        it('drops a sparse update_row patch whose listed fields already match (patch, not whole row)', () => {
+            // row_value is merged onto the row, so omitted fields mean "unchanged".
+            // Comparing the union of keys would have kept this as a finding.
+            const r = verifyFindingAgainstRecord(
+                {
+                    field: 'lithology_intervals',
+                    issue_type: 'update_row',
+                    row_index: 1,
+                    row_value: JSON.stringify({ depth_to_ft: 68, primary_material: 'sand' }),
+                },
+                record,
+            );
+            expect(r.keep).toBe(false);
+        });
+
+        it('keeps a sparse update_row patch when one listed field differs', () => {
+            const r = verifyFindingAgainstRecord(
+                {
+                    field: 'lithology_intervals',
+                    issue_type: 'update_row',
+                    row_index: 1,
+                    row_value: JSON.stringify({ depth_to_ft: 72 }),
+                },
+                record,
+            );
+            expect(r.keep).toBe(true);
+        });
+
+        it('keeps an update_row patch that clears a field with an explicit null', () => {
+            const r = verifyFindingAgainstRecord(
+                {
+                    field: 'lithology_intervals',
+                    issue_type: 'update_row',
+                    row_index: 1,
+                    row_value: JSON.stringify({ description_raw: null }),
+                },
+                record,
+            );
+            expect(r.keep).toBe(true);
+        });
+
         it('keeps a valid add_row for genuinely new content', () => {
             const r = verifyFindingAgainstRecord(
                 {

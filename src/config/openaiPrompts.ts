@@ -379,7 +379,7 @@ const SECTION_QA_ISSUE_SCHEMA: Record<string, unknown> = {
         row_value: {
             type: ['string', 'null'],
             description:
-                'Only for add_row/update_row: a JSON-ENCODED STRING (use JSON.stringify semantics) of the full row object, using EXACTLY the field names from the array\'s item schema. Only include fields you can actually verify from the page — omit fields you cannot read rather than guessing. Null for every other issue_type, including delete_row.',
+                'Only for add_row/update_row: a JSON-ENCODED STRING (use JSON.stringify semantics) of a row object, using EXACTLY the field names from the array\'s item schema. Include ONLY fields you can actually verify from the page — omit fields you cannot read rather than guessing. For update_row this is a PATCH: the fields you list are merged onto the existing row and every field you omit keeps its current value, so omitting is safe and is what you should do when a cell is illegible. To positively clear a field, list it with an explicit null. For add_row there is no existing row, so list every field you can read. Null for every other issue_type, including delete_row.',
         },
         explanation: {
             type: 'string',
@@ -520,7 +520,7 @@ ROW-LEVEL FIXES (for array groups — use these instead of a vague count complai
 - CRITICAL: for add_row/update_row/delete_row, "field" is the BARE array path (the group name) with NO index — the row's position goes in row_index.
 - delete_row: a SPECIFIC row is fabricated or duplicated with no supporting page content. Set row_index to its 0-indexed position. row_value stays null.
 - add_row: a SPECIFIC row is missing and you can read its content from the ${pageWord}. Set row_value to a JSON-encoded string of the row object (exact field names from the group's schema; omit fields you can't verify). row_index = insertion position if determinable, else null (append).
-- update_row: an existing row is substantially wrong across multiple fields. Set row_index and row_value (corrected JSON-encoded row).
+- update_row: an existing row is substantially wrong across multiple fields. Set row_index and row_value (a JSON-encoded PATCH of just the fields you can verify — omitted fields keep their current value).
 - Fall back to missing_rows/extra_rows/wrong_count ONLY when the count is wrong but the specific row can't be identified — ${rowRule}.
 
 NOT ERRORS (never flag these):
@@ -816,7 +816,7 @@ ROW-LEVEL FIXES (use these instead of a vague count complaint whenever you can p
 - CRITICAL: for these three types, "field" is the BARE array path with NO index (e.g. "lithology_intervals") — put the row's position in row_index instead, never as "field[3]". This is different from every other issue type, where field DOES include the index.
 - delete_row: a SPECIFIC row in the array is fabricated or duplicated with no supporting page content. Set row_index to that row's 0-indexed position. row_value stays null.
 - add_row: a SPECIFIC row is missing and you can read its content from the ${pageWord}. Set row_value to a JSON-encoded string of the row object (exact field names from the array's item schema; omit fields you can't verify — do not guess). row_index is the position it belongs at if you can tell (e.g. by depth order), otherwise null (append).
-- update_row: an existing row's content is substantially wrong across multiple fields at once. Set row_index to that row and row_value to the corrected JSON-encoded row object.
+- update_row: an existing row's content is substantially wrong across multiple fields at once. Set row_index to that row and row_value to a JSON-encoded PATCH object holding just the fields you can verify — fields you omit keep their current value.
 - Fall back to missing_rows / extra_rows / wrong_count ONLY when you can tell the array's row count is wrong but cannot identify or reconstruct which specific row is at fault (e.g. a table partially obscured by damage). Example: a boring log's array has one row invented from a bare depth tick with no lithology description anywhere near it on the ${pageWord} — that is delete_row with row_index pointing at that row, NOT a vague wrong_count.
 
 NOT ERRORS (never flag these):
