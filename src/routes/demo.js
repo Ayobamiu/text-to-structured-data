@@ -22,6 +22,8 @@ import {
     getValidDemoSessionByDownloadToken,
     issueDemoDownloadToken,
     countRecentDemoSessionsByIp,
+    findRecentLeadEmailByIp,
+    recordDemoEvent,
     updateDemoSession,
     claimDemoNotify,
     generateDemoToken,
@@ -29,7 +31,8 @@ import {
 } from '../database/demoSessions.js';
 import { PROCESSING_METHODS, DEFAULT_MODELS, getExtendAIConfig } from '../config/processingConfig.js';
 import { extractPreviewClientMeta } from '../database/previewAnalytics.js';
-import { COMPANY_EMAIL_ERROR, isCompanyEmail } from '../utils/companyEmail.js';
+import { INVALID_EMAIL_ERROR, emailKind, isValidEmail, normalizeEmail } from '../utils/companyEmail.js';
+import { assessDemoResult } from '../services/demoResultQuality.ts';
 import logger from '../utils/logger.js';
 
 const router = express.Router();
@@ -38,6 +41,11 @@ const s3Service = new S3Service();
 export const DEMO_MAX_PAGES = 12;
 export const DEMO_MAX_BYTES = 25 * 1024 * 1024;
 export const DEMO_RATE_PER_HOUR = 3;
+/** Runs an IP gets per week before we ask for an email ("first file free"). */
+export const DEMO_FREE_RUNS = 1;
+/** Hourly cap once the visitor has given an email. */
+export const DEMO_RATE_PER_HOUR_WITH_EMAIL = 10;
+const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
 const DEMO_QUEUE_PRIORITY = -10; // queue is ORDER BY priority ASC
 
 const SLUG_NAMES = {
@@ -214,6 +222,29 @@ async function maybeNotifyProgress(session, file) {
     return { session: updated, classification, status };
 }
 
+/**
+ * Who may upload without an email. The first run per IP per week is free;
+ * after that we ask once, and an email (given now, or on any earlier session
+ * from this IP) also lifts the hourly cap.
+ */
+async function resolveDemoAccess(ipAddress, suppliedEmail) {
+    const knownEmail = suppliedEmail || await findRecentLeadEmailByIp(ipAddress, WEEK_MS);
+    if (knownEmail) {
+        const recentHour = await countRecentDemoSessionsByIp(ipAddress);
+        return {
+            leadEmail: knownEmail,
+            emailRequired: false,
+            capped: recentHour >= DEMO_RATE_PER_HOUR_WITH_EMAIL,
+        };
+    }
+    const recentWeek = await countRecentDemoSessionsByIp(ipAddress, WEEK_MS);
+    return {
+        leadEmail: null,
+        emailRequired: recentWeek >= DEMO_FREE_RUNS,
+        capped: false,
+    };
+}
+
 function unlinkQuiet(path) {
     if (!path) return;
     fs.unlink(path, () => {});
@@ -240,12 +271,40 @@ router.post('/sessions', createLimiter, (req, res) => {
             }
 
             const meta = extractPreviewClientMeta(req);
-            const recent = await countRecentDemoSessionsByIp(meta.ip_address);
-            if (recent >= DEMO_RATE_PER_HOUR) {
+            const rawEmail = normalizeEmail(req.body?.email);
+            if (rawEmail && !isValidEmail(rawEmail)) {
                 unlinkQuiet(tempPath);
+                return res.status(400).json({ success: false, code: 'EMAIL_INVALID', error: INVALID_EMAIL_ERROR });
+            }
+            const access = await resolveDemoAccess(meta.ip_address, rawEmail || null);
+            if (access.emailRequired) {
+                unlinkQuiet(tempPath);
+                void recordDemoEvent({
+                    ipAddress: meta.ip_address,
+                    event: 'upload_blocked_email_required',
+                    detail: { filename: req.file.originalname },
+                });
+                return res.status(403).json({
+                    success: false,
+                    code: 'EMAIL_REQUIRED',
+                    error: 'Add your email to run another file.',
+                });
+            }
+            if (access.capped) {
+                unlinkQuiet(tempPath);
+                void recordDemoEvent({
+                    ipAddress: meta.ip_address,
+                    event: 'upload_blocked_cap',
+                    detail: { filename: req.file.originalname, email: access.leadEmail },
+                });
+                void notifyDemoEvent(
+                    `Hit the hourly cap · ${access.leadEmail}`,
+                    `Email: ${access.leadEmail} (${emailKind(access.leadEmail)})\nIP: ${meta.ip_address || '—'}\nTried: ${req.file.originalname}\n\nThey want to run more than ${DEMO_RATE_PER_HOUR_WITH_EMAIL} files an hour. Reach out.`
+                );
                 return res.status(429).json({
                     success: false,
-                    error: 'This machine has reached the demo limit for now. Email hello@coreextract.app and we will run it for you.',
+                    code: 'CAPPED',
+                    error: `You've run ${DEMO_RATE_PER_HOUR_WITH_EMAIL} files this hour. We've got your email and will reach out to run the rest for you.`,
                 });
             }
 
@@ -329,12 +388,21 @@ router.post('/sessions', createLimiter, (req, res) => {
                 pageCount,
                 ipAddress: meta.ip_address,
                 userAgent: meta.user_agent,
+                leadEmail: access.leadEmail,
             });
+            if (rawEmail) {
+                void recordDemoEvent({
+                    sessionId: session.id,
+                    ipAddress: meta.ip_address,
+                    event: 'lead_submitted',
+                    detail: { intent: 'upload', kind: emailKind(rawEmail) },
+                });
+            }
 
             await queueService.addFileToQueue(fileRecord.id, job.id, DEMO_QUEUE_PRIORITY);
 
             void notifyDemoEvent(
-                `New upload · ${req.file.originalname} · ${pageCount} pages`,
+                `New upload · ${req.file.originalname} · ${pageCount} pages${access.leadEmail ? ` · ${access.leadEmail}` : ''}`,
                 formatDemoSessionEmail(session, { pageCount, status: 'queued' })
             );
 
@@ -359,6 +427,44 @@ router.post('/sessions', createLimiter, (req, res) => {
 
 router.use(express.json());
 router.use(readLimiter);
+
+/** Lets the drop zone ask for an email up front instead of after a 25 MB upload. */
+router.get('/eligibility', async (req, res) => {
+    try {
+        const meta = extractPreviewClientMeta(req);
+        const access = await resolveDemoAccess(meta.ip_address, null);
+        res.json({ success: true, emailRequired: access.emailRequired, hasEmail: Boolean(access.leadEmail) });
+    } catch (error) {
+        logger.error({ err: error.message }, 'demo eligibility failed');
+        res.json({ success: true, emailRequired: false, hasEmail: false });
+    }
+});
+
+const CLIENT_EVENTS = new Set([
+    'email_gate_shown',
+    'download_modal_opened',
+    'download_modal_closed',
+    'review_offer_shown',
+]);
+
+/** Client-side funnel events (modal opened/closed, offers shown). Best effort. */
+router.post('/events', async (req, res) => {
+    const event = String(req.body?.event || '');
+    if (!CLIENT_EVENTS.has(event)) {
+        return res.status(400).json({ success: false, error: 'Unknown event' });
+    }
+    const meta = extractPreviewClientMeta(req);
+    let sessionId = null;
+    const token = tokenFromReq(req);
+    if (token && typeof req.body?.sessionId === 'string') {
+        const session = await getValidDemoSession(req.body.sessionId, token).catch(() => null);
+        sessionId = session?.id || null;
+    }
+    let detail = req.body?.detail && typeof req.body.detail === 'object' ? req.body.detail : null;
+    if (detail && JSON.stringify(detail).length > 2000) detail = { truncated: true };
+    await recordDemoEvent({ sessionId, ipAddress: meta.ip_address, event, detail });
+    res.json({ success: true });
+});
 
 router.get('/sessions/:id', requireDemoSession, async (req, res) => {
     try {
@@ -402,6 +508,10 @@ router.get('/sessions/:id', requireDemoSession, async (req, res) => {
             }
         }
 
+        const { quality, filledFields } = status === 'completed'
+            ? assessDemoResult(records)
+            : { quality: null, filledFields: 0 };
+
         res.json({
             success: true,
             sessionId: updated.id,
@@ -424,7 +534,11 @@ router.get('/sessions/:id', requireDemoSession, async (req, res) => {
             })),
             records,
             error: file?.processing_error || file?.extraction_error || null,
-            hasLeadEmail: Boolean(updated.lead_email) && isCompanyEmail(updated.lead_email),
+            hasLeadEmail: Boolean(updated.lead_email),
+            leadEmail: updated.lead_email || null,
+            reviewRequested: Boolean(updated.review_requested_at),
+            quality,
+            filledFields,
             downloaded: Boolean(updated.downloaded_at),
         });
     } catch (error) {
@@ -511,16 +625,46 @@ router.get('/sessions/:id/pages/:n/thumbnail.jpg', requireDemoSession, async (re
 
 router.post('/sessions/:id/lead', leadLimiter, requireDemoSession, async (req, res) => {
     try {
-        const email = String(req.body?.email || '').trim().toLowerCase();
-        const intent = req.body?.intent === 'quote' ? 'quote' : 'download';
-        if (!isCompanyEmail(email)) {
-            return res.status(400).json({ success: false, error: COMPANY_EMAIL_ERROR });
+        const email = normalizeEmail(req.body?.email);
+        const intent = ['quote', 'review'].includes(req.body?.intent) ? req.body.intent : 'download';
+        if (!isValidEmail(email)) {
+            return res.status(400).json({ success: false, code: 'EMAIL_INVALID', error: INVALID_EMAIL_ERROR });
         }
+        const kind = emailKind(email);
+        const meta = extractPreviewClientMeta(req);
+
+        if (intent === 'review') {
+            // Failed / empty / thin result: a person runs it by hand. No
+            // download link, so no result is required.
+            const already = Boolean(req.demoSession.review_requested_at);
+            const session = await updateDemoSession(req.demoSession.id, {
+                lead_email: email,
+                lead_source: 'review',
+                review_requested_at: req.demoSession.review_requested_at || new Date(),
+            }) || req.demoSession;
+            void recordDemoEvent({
+                sessionId: session.id,
+                ipAddress: meta.ip_address,
+                event: 'lead_submitted',
+                detail: { intent, kind, reason: req.body?.reason || null },
+            });
+            if (!already) {
+                void notifyDemoEvent(
+                    `Review request · ${email} · ${session.filename || 'file'}`,
+                    formatDemoSessionEmail(session, {
+                        leadEmail: email,
+                        note: `Wants a hand run (${req.body?.reason || 'unspecified'}). Promised a reply within 1 business day.`,
+                    })
+                );
+            }
+            return res.json({ success: true, email, emailed: false, review: true });
+        }
+
         const file = await getFileResult(req.demoSession.file_id);
         if (!file?.result) {
             return res.status(409).json({ success: false, error: 'Extraction is not ready yet.' });
         }
-        const issued = await issueDemoDownloadToken(req.demoSession.id, email);
+        const issued = await issueDemoDownloadToken(req.demoSession.id, email, intent);
         const session = issued.session || req.demoSession;
         const url = demoDownloadUrl(session.id, issued.raw);
         const mailed = await sendLeadDownloadEmail({
@@ -536,6 +680,12 @@ router.post('/sessions/:id/lead', leadLimiter, requireDemoSession, async (req, r
                 ...(process.env.NODE_ENV !== 'production' ? { devDownloadUrl: url } : {}),
             });
         }
+        void recordDemoEvent({
+            sessionId: session.id,
+            ipAddress: meta.ip_address,
+            event: 'lead_submitted',
+            detail: { intent, kind },
+        });
         void notifyDemoEvent(
             intent === 'quote'
                 ? `Quote request · ${email}`
@@ -570,8 +720,8 @@ router.get('/sessions/:id/export', async (req, res) => {
                 error: 'This download link is invalid or expired. Request another from the demo page.',
             });
         }
-        if (!session.lead_email || !isCompanyEmail(session.lead_email)) {
-            return res.status(403).json({ success: false, error: COMPANY_EMAIL_ERROR });
+        if (!session.lead_email) {
+            return res.status(403).json({ success: false, error: 'Request a download link from the demo page.' });
         }
         const file = await getFileResult(session.file_id);
         if (!file?.result) {
@@ -579,6 +729,7 @@ router.get('/sessions/:id/export', async (req, res) => {
         }
         const buf = await writeDemoWorkbook(file.result, { filename: session.filename });
         await updateDemoSession(session.id, { downloaded_at: new Date() });
+        void recordDemoEvent({ sessionId: session.id, event: 'excel_downloaded' });
         void notifyDemoEvent(
             `Downloaded Excel · ${session.lead_email}`,
             formatDemoSessionEmail(

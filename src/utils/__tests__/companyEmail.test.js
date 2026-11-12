@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { isCompanyEmail } from '../companyEmail.js';
+import { emailKind, isCompanyEmail, isValidEmail } from '../companyEmail.js';
 
 describe('isCompanyEmail', () => {
     it('accepts company and government domains', () => {
@@ -21,5 +21,18 @@ describe('isCompanyEmail', () => {
     it('rejects invalid addresses', () => {
         expect(isCompanyEmail('')).toBe(false);
         expect(isCompanyEmail('not-an-email')).toBe(false);
+    });
+});
+
+describe('emailKind', () => {
+    it('accepts personal inboxes but tags them', () => {
+        expect(emailKind('Jane@Gmail.com ')).toBe('personal');
+        expect(emailKind('geo@luke-oil.com')).toBe('company');
+    });
+
+    it('returns null for invalid addresses', () => {
+        expect(emailKind('nope')).toBe(null);
+        expect(isValidEmail('a@b')).toBe(false);
+        expect(isValidEmail(`${'a'.repeat(250)}@x.com`)).toBe(false);
     });
 });

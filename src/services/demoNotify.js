@@ -4,6 +4,7 @@
  */
 
 import logger from '../utils/logger.js';
+import { emailKind } from '../utils/companyEmail.js';
 
 function notifyTo() {
     return process.env.DEMO_NOTIFY_EMAIL || 'hello@coreextract.app';
@@ -124,13 +125,20 @@ function escapeHtml(value) {
         .replace(/"/g, '&quot;');
 }
 
+function describeEmail(email, source) {
+    if (!email) return '—';
+    const kind = emailKind(email);
+    const tags = [kind, source ? `via ${source}` : null].filter(Boolean).join(', ');
+    return tags ? `${email} (${tags})` : email;
+}
+
 export function formatDemoSessionEmail(session, extra = {}) {
     const lines = [
         `File: ${session.filename || 'unknown'}`,
         `Type: ${session.document_type || extra.documentType || 'pending'}`,
         `Pages: ${session.page_count ?? extra.pageCount ?? '—'}`,
         `Status: ${extra.status || session.status}`,
-        `Email: ${session.lead_email || extra.leadEmail || '—'}`,
+        `Email: ${describeEmail(session.lead_email || extra.leadEmail, session.lead_source || extra.leadSource)}`,
         `Downloaded: ${session.downloaded_at || extra.downloaded ? 'yes' : 'no'}`,
         `Session: ${session.id}`,
         `IP: ${session.ip_address || '—'}`,
