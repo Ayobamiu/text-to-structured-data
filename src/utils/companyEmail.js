@@ -1,5 +1,6 @@
 /**
- * Work-email gate for the public demo download.
+ * Email helpers for the public demo. Any valid address is accepted;
+ * company vs personal is a tag for the operator, not a gate.
  * Keep in sync with web/src/lib/companyEmail.ts
  */
 
@@ -36,13 +37,34 @@ const PERSONAL_DOMAINS = new Set([
     'guerrillamail.com',
 ]);
 
+export function normalizeEmail(email) {
+    return String(email || '').trim().toLowerCase();
+}
+
+export function isValidEmail(email) {
+    const value = normalizeEmail(email);
+    if (value.length > 254) return false;
+    return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value);
+}
+
 export function isCompanyEmail(email) {
-    const value = String(email || '').trim().toLowerCase();
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value)) return false;
+    const value = normalizeEmail(email);
+    if (!isValidEmail(value)) return false;
     const domain = value.split('@')[1] || '';
     if (!domain || domain.includes(' ')) return false;
     return !PERSONAL_DOMAINS.has(domain);
 }
+
+/**
+ * The demo accepts any address (a Gmail lead beats no lead) and tags it so the
+ * operator can qualify it. 'company' | 'personal' | null (invalid).
+ */
+export function emailKind(email) {
+    if (!isValidEmail(email)) return null;
+    return isCompanyEmail(email) ? 'company' : 'personal';
+}
+
+export const INVALID_EMAIL_ERROR = 'Enter a valid email address.';
 
 export const COMPANY_EMAIL_ERROR =
     'Use a company email — personal inboxes (Gmail, Yahoo, Outlook, iCloud) are not accepted.';

@@ -66,6 +66,24 @@ async function addDemoSessions() {
                 ADD COLUMN IF NOT EXISTS download_token_expires_at TIMESTAMPTZ
         `);
         await client.query(`
+            ALTER TABLE demo_sessions
+                ADD COLUMN IF NOT EXISTS lead_source VARCHAR(20),
+                ADD COLUMN IF NOT EXISTS review_requested_at TIMESTAMPTZ
+        `);
+        await client.query(`
+            CREATE TABLE IF NOT EXISTS demo_events (
+                id BIGSERIAL PRIMARY KEY,
+                session_id UUID REFERENCES demo_sessions(id) ON DELETE SET NULL,
+                ip_address TEXT,
+                event VARCHAR(64) NOT NULL,
+                detail JSONB,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            CREATE INDEX IF NOT EXISTS idx_demo_events_created ON demo_events (created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_demo_events_session ON demo_events (session_id);
+            ALTER TABLE demo_events ENABLE ROW LEVEL SECURITY;
+        `);
+        await client.query(`
             CREATE INDEX IF NOT EXISTS idx_demo_sessions_token_hash
                 ON demo_sessions (token_hash);
         `);

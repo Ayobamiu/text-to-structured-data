@@ -35,6 +35,24 @@ CREATE INDEX IF NOT EXISTS idx_demo_sessions_ip_created ON demo_sessions (ip_add
 CREATE INDEX IF NOT EXISTS idx_demo_sessions_file_id ON demo_sessions (file_id);
 `;
 
+/**
+ * Funnel log for the public demo: where visitors drop off on the way to
+ * leaving an email. Append-only; session_id is null for pre-upload events.
+ */
+const EVENTS_DDL = `
+CREATE TABLE IF NOT EXISTS demo_events (
+    id BIGSERIAL PRIMARY KEY,
+    session_id UUID REFERENCES demo_sessions(id) ON DELETE SET NULL,
+    ip_address TEXT,
+    event VARCHAR(64) NOT NULL,
+    detail JSONB,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_demo_events_created ON demo_events (created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_demo_events_session ON demo_events (session_id);
+ALTER TABLE demo_events ENABLE ROW LEVEL SECURITY;
+`;
+
 export function hashDemoToken(rawToken) {
     return crypto.createHash('sha256').update(String(rawToken)).digest('hex');
 }
@@ -54,6 +72,12 @@ export async function ensureDemoSessionsTable() {
         ALTER TABLE demo_sessions
             ADD COLUMN IF NOT EXISTS download_token_expires_at TIMESTAMPTZ
     `);
+    await pool.query(`
+        ALTER TABLE demo_sessions
+            ADD COLUMN IF NOT EXISTS lead_source VARCHAR(20),
+            ADD COLUMN IF NOT EXISTS review_requested_at TIMESTAMPTZ
+    `);
+    await pool.query(EVENTS_DDL);
     schemaReady = true;
 }
 
@@ -65,15 +89,19 @@ export async function createDemoSession({
     pageCount,
     ipAddress,
     userAgent,
+    leadEmail = null,
 }) {
     await ensureDemoSessionsTable();
     const { rows } = await pool.query(
         `INSERT INTO demo_sessions (
             token_hash, job_id, file_id, filename, page_count,
-            ip_address, user_agent, status
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, 'queued')
+            ip_address, user_agent, status, lead_email, lead_source
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, 'queued', $8, $9)
         RETURNING *`,
-        [tokenHash, jobId, fileId, filename, pageCount, ipAddress, userAgent]
+        [
+            tokenHash, jobId, fileId, filename, pageCount,
+            ipAddress, userAgent, leadEmail, leadEmail ? 'upload' : null,
+        ]
     );
     return rows[0];
 }
@@ -113,10 +141,11 @@ export async function getValidDemoSessionByDownloadToken(id, rawToken) {
 }
 
 /** Rotate the emailed download token. Returns the raw token (shown once, in the email). */
-export async function issueDemoDownloadToken(sessionId, email) {
+export async function issueDemoDownloadToken(sessionId, email, source = 'download') {
     const raw = generateDemoToken();
     const session = await updateDemoSession(sessionId, {
         lead_email: email,
+        lead_source: source,
         download_token_hash: hashDemoToken(raw),
         download_token_expires_at: new Date(Date.now() + DOWNLOAD_TOKEN_TTL_MS),
     });
@@ -137,7 +166,7 @@ export async function countRecentDemoSessionsByIp(ipAddress, windowMs = 60 * 60 
          FROM demo_sessions ds
          LEFT JOIN job_files jf ON jf.id = ds.file_id
          WHERE ds.ip_address = $1
-           AND ds.created_at > NOW() - ($2::int * INTERVAL '1 millisecond')
+           AND ds.created_at > NOW() - ($2::bigint * INTERVAL '1 millisecond')
            AND (
              jf.extraction_status IN ('processing', 'completed')
              OR jf.processing_status IN ('processing', 'completed')
@@ -147,6 +176,37 @@ export async function countRecentDemoSessionsByIp(ipAddress, windowMs = 60 * 60 
     return rows[0]?.n ?? 0;
 }
 
+/** Most recent email this IP has left on any live demo session, or null. */
+export async function findRecentLeadEmailByIp(ipAddress, windowMs = 7 * 24 * 60 * 60 * 1000) {
+    await ensureDemoSessionsTable();
+    if (!ipAddress) return null;
+    const { rows } = await pool.query(
+        `SELECT lead_email
+         FROM demo_sessions
+         WHERE ip_address = $1
+           AND lead_email IS NOT NULL
+           AND created_at > NOW() - ($2::bigint * INTERVAL '1 millisecond')
+         ORDER BY updated_at DESC
+         LIMIT 1`,
+        [ipAddress, windowMs]
+    );
+    return rows[0]?.lead_email || null;
+}
+
+/** Never throws: the funnel log must not break the demo. */
+export async function recordDemoEvent({ sessionId = null, ipAddress = null, event, detail = null }) {
+    try {
+        await ensureDemoSessionsTable();
+        await pool.query(
+            `INSERT INTO demo_events (session_id, ip_address, event, detail)
+             VALUES ($1, $2, $3, $4)`,
+            [sessionId, ipAddress, event, detail ? JSON.stringify(detail) : null]
+        );
+    } catch {
+        /* best effort */
+    }
+}
+
 export async function updateDemoSession(id, patch) {
     await ensureDemoSessionsTable();
     const allowed = [
@@ -154,6 +214,8 @@ export async function updateDemoSession(id, patch) {
         'document_type',
         'page_count',
         'lead_email',
+        'lead_source',
+        'review_requested_at',
         'download_token_hash',
         'download_token_expires_at',
         'downloaded_at',
