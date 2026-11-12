@@ -31,6 +31,14 @@
 import OpenAI from 'openai';
 import { rasterizePdf } from './pdfRasterizer.js';
 import { computeJpegSignature, assignDuplicates, countDuplicates } from './pageDeduplicator.js';
+
+// Mirrors batchedVisualClassifier.
+/**
+ * Clip strip pages to this height/width before classifying (see
+ * pdfRasterizer maxAspect). A clipped page shows only its header, so it is
+ * never dedup-matched: two logs can share a header and differ below it.
+ */
+const CLASSIFIER_MAX_ASPECT = 2.0;
 import {
     buildPageClassificationMessages,
     buildPageClassificationResponseFormat,
@@ -66,6 +74,7 @@ function openai() {
 async function classifyOnePage({
     pageNumber,
     jpegBuffer,
+    clipped = false,
     documentTypes,
     options,
 }) {
@@ -76,7 +85,7 @@ async function classifyOnePage({
     // can still be matched against successful ones (e.g. if pages 1 and 5
     // are byte-identical but page 5's LLM call timed out, we still know
     // they're the same image).
-    const dupe_signature = computeJpegSignature(jpegBuffer);
+    const dupe_signature = clipped ? null : computeJpegSignature(jpegBuffer);
 
     try {
         const response = await openai().chat.completions.create(
@@ -180,6 +189,9 @@ export async function classifyPdf({ pdfBuffer, documentTypes, options = {} }) {
     const pages = await rasterizePdf(pdfBuffer, {
         widthPx: opts.widthPx,
         jpegQuality: opts.jpegQuality,
+        // Strip logs: show the header at full width instead of an
+        // unreadable sliver of the whole page. See pdfRasterizer.
+        maxAspect: CLASSIFIER_MAX_ASPECT,
     });
 
     console.log(
@@ -190,6 +202,7 @@ export async function classifyPdf({ pdfBuffer, documentTypes, options = {} }) {
         classifyOnePage({
             pageNumber: page.pageNumber,
             jpegBuffer: page.jpeg,
+            clipped: page.clipped === true,
             documentTypes,
             options: opts,
         })

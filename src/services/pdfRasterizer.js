@@ -35,6 +35,12 @@ const DEFAULT_OPTIONS = {
     // First/last page bounds. null = whole document.
     firstPage: null,
     lastPage: null,
+    // Clip each page to at most widthPx * maxAspect tall, keeping the top.
+    // For continuous-strip logs (a 565 x 14,378 pt e-log) the uncropped
+    // render is ~19,500 px tall, which a vision model then shrinks to ~80 px
+    // wide: unreadable. The top is where the header lives. Ordinary pages are
+    // shorter than the clip and are unaffected. null = no clipping.
+    maxAspect: null,
 };
 
 /**
@@ -89,6 +95,15 @@ async function runPdftoppm(pdfPath, outputDir, options) {
         '-scale-to-x', String(options.widthPx),
         '-scale-to-y', '-1',
     ];
+    if (options.maxAspect) {
+        // Crop box in output pixels; pdftoppm clamps it to the page, so
+        // pages shorter than the box render whole (no padding).
+        args.push(
+            '-x', '0', '-y', '0',
+            '-W', String(options.widthPx),
+            '-H', String(Math.round(options.widthPx * options.maxAspect))
+        );
+    }
     if (options.firstPage) {
         args.push('-f', String(options.firstPage));
     }
@@ -120,6 +135,32 @@ async function runPdftoppm(pdfPath, outputDir, options) {
     });
 }
 
+/**
+ * Displayed page sizes via pdfinfo (no PDF in memory). Map of
+ * pageNumber -> { width, height } in points after /Rotate. Empty on failure.
+ */
+async function readPageSizes(pdfPath, options) {
+    const args = ['-f', String(options.firstPage || 1), '-l', String(options.lastPage || 100000), pdfPath];
+    const out = await new Promise((resolve) => {
+        const child = spawn('pdfinfo', args);
+        let stdout = '';
+        child.stdout.on('data', (c) => { stdout += c.toString(); });
+        child.on('error', () => resolve(''));
+        child.on('exit', () => resolve(stdout));
+    });
+    const sizes = new Map();
+    for (const m of out.matchAll(/^Page\s+(\d+)\s+size:\s+([\d.]+)\s+x\s+([\d.]+)/gm)) {
+        sizes.set(Number(m[1]), { width: Number(m[2]), height: Number(m[3]) });
+    }
+    for (const m of out.matchAll(/^Page\s+(\d+)\s+rot:\s+(\d+)/gm)) {
+        const size = sizes.get(Number(m[1]));
+        if (size && Number(m[2]) % 180 === 90) {
+            sizes.set(Number(m[1]), { width: size.height, height: size.width });
+        }
+    }
+    return sizes;
+}
+
 function extractPageNumber(filename) {
     // page-1.jpg / page-001.jpg → 1
     const m = /page-(\d+)\.jpg$/.exec(filename);
@@ -147,8 +188,11 @@ function extractPageNumber(filename) {
  *        memory stays at one JPEG rather than the whole document. The
  *        returned array is empty in this mode.
  *
- * @returns {Promise<Array<{ pageNumber: number, jpeg: Buffer, byteLength: number }>>}
+ * @param {number} [options.maxAspect]      Clip pages to widthPx * maxAspect tall (top kept).
+ *
+ * @returns {Promise<Array<{ pageNumber: number, jpeg: Buffer, byteLength: number, clipped?: boolean }>>}
  *          Sorted ascending by pageNumber. Empty when `onPage` is used.
+ *          `clipped` is true when maxAspect cut the page (only the top is in the JPEG).
  */
 export async function rasterizePdfFile(pdfPath, options = {}) {
     const ok = await isRasterizerAvailable();
@@ -167,6 +211,7 @@ export async function rasterizePdfFile(pdfPath, options = {}) {
 
     try {
         const startedAt = Date.now();
+        const pageSizes = opts.maxAspect ? await readPageSizes(pdfPath, opts) : null;
         const filenames = await runPdftoppm(pdfPath, outputDir, opts);
         const renderMs = Date.now() - startedAt;
 
@@ -180,6 +225,10 @@ export async function rasterizePdfFile(pdfPath, options = {}) {
             const filePath = path.join(outputDir, name);
             const jpeg = fs.readFileSync(filePath);
             const page = { pageNumber, jpeg, byteLength: jpeg.length };
+            if (pageSizes) {
+                const size = pageSizes.get(pageNumber);
+                page.clipped = Boolean(size && size.height / size.width > opts.maxAspect);
+            }
 
             if (onPage) {
                 await onPage(page);
