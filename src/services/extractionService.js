@@ -7,6 +7,7 @@ import { randomUUID } from 'crypto';
 import { PutObjectCommand } from '@aws-sdk/client-s3';
 import ExtendAIService from './extendAIService.js';
 import { extractPagesFromPdf } from './formationPageDetectionService.js';
+import { tileTallPages, mergeTiledExtraction } from '../utils/tallPages.ts';
 
 const PADDLEOCR_FLASK_URL = process.env.PADDLEOCR_FLASK_URL || "http://localhost:5002";
 const DEFAULT_EXTRACTION_METHOD = 'paddleocr';
@@ -319,7 +320,10 @@ class ExtractionService {
      * @returns {Promise<Object>} Extraction result
      */
     async extractWithExtendAI(filename, s3Key, options = {}, selectedPages = null) {
-        // Try ExtendAI first
+        // Declared outside try so the catch can clean it up (it used to be
+        // block-scoped, so a failure threw a ReferenceError from the catch).
+        let tempS3Key = null;
+        let tiling = null;
         try {
             if (!s3Key || !this.s3Service) {
                 throw new Error('S3 key and S3Service required for ExtendAI extraction');
@@ -331,7 +335,6 @@ class ExtractionService {
             }
 
             let finalS3Key = s3Key;
-            let tempS3Key = null;
 
             // If selectedPages is provided, filter the PDF first
             if (selectedPages && Array.isArray(selectedPages) && selectedPages.length > 0) {
@@ -342,8 +345,23 @@ class ExtractionService {
                     const pdfBuffer = await this.s3Service.downloadFile(s3Key);
 
                     // Extract only selected pages
-                    const filteredPdfBuffer = await extractPagesFromPdf(pdfBuffer, selectedPages);
+                    let filteredPdfBuffer = await extractPagesFromPdf(pdfBuffer, selectedPages);
                     console.log(`✅ Extracted ${selectedPages.length} pages into filtered PDF (${filteredPdfBuffer.length} bytes)`);
+
+                    // Continuous-strip pages (e.g. a 16-ft e-log) come back from
+                    // OCR as one chart caption. Cut them into page-shaped tiles;
+                    // mergeTiledExtraction folds the result back per page.
+                    try {
+                        const tiled = await tileTallPages(filteredPdfBuffer);
+                        if (tiled.tiled) {
+                            tiling = tiled;
+                            filteredPdfBuffer = tiled.buffer;
+                            console.log(`✂️  Tiled tall page(s) ${tiled.tiledPages.join(', ')} for OCR (${tiled.pageMap.reduce((n, e) => n + e.outputPages.length, 0)} pages sent)`);
+                        }
+                    } catch (tileError) {
+                        // Never block extraction on tiling; send the pages as-is.
+                        console.warn(`⚠️ Tall-page tiling skipped: ${tileError.message}`);
+                    }
 
                     // Upload filtered PDF to S3 temporarily
                     const timestamp = Date.now();
@@ -397,7 +415,7 @@ class ExtractionService {
             }
 
             console.log(`✅ ExtendAI extraction successful for ${filename}`);
-            return result;
+            return tiling ? mergeTiledExtraction(result, tiling) : result;
 
         } catch (extendAIError) {
             // Clean up temporary filtered PDF if it was created (even on error)

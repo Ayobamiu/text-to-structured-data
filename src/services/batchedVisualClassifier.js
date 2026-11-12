@@ -21,6 +21,13 @@ import OpenAI from 'openai';
 import { rasterizePdf } from './pdfRasterizer.js';
 import { computeJpegSignature, assignDuplicates, countDuplicates } from './pageDeduplicator.js';
 
+/**
+ * Clip strip pages to this height/width before classifying (see
+ * pdfRasterizer maxAspect). A clipped page shows only its header, so it is
+ * never dedup-matched: two logs can share a header and differ below it.
+ */
+export const CLASSIFIER_MAX_ASPECT = 2.0;
+
 // ---------------------------------------------------------------------------
 // Record ID normalization
 // ---------------------------------------------------------------------------
@@ -468,6 +475,9 @@ export async function classifyPdfBatched({ pdfBuffer, documentTypes, options = {
     const allPages = await rasterizePdf(pdfBuffer, {
         widthPx: opts.widthPx,
         jpegQuality: opts.jpegQuality,
+        // Strip logs: show the header at full width instead of an
+        // unreadable sliver of the whole page. See pdfRasterizer.
+        maxAspect: CLASSIFIER_MAX_ASPECT,
     });
 
     console.log(
@@ -569,7 +579,7 @@ export async function classifyPdfBatched({ pdfBuffer, documentTypes, options = {
     for (let idx = 0; idx < allResults.length; idx++) {
         const page = allPages.find(p => p.pageNumber === allResults[idx].page_number);
         if (page) {
-            allResults[idx].dupe_signature = computeJpegSignature(page.jpeg);
+            allResults[idx].dupe_signature = page.clipped ? null : computeJpegSignature(page.jpeg);
         }
     }
     const annotated = assignDuplicates(allResults);
@@ -607,7 +617,7 @@ export async function classifyPdfBatched({ pdfBuffer, documentTypes, options = {
             page_count: allPages.length,
             batch_size: opts.batchSize,
             batch_count: batchCount,
-            image: { width: opts.widthPx, detail: opts.detail, jpeg_quality: opts.jpegQuality },
+            image: { width: opts.widthPx, detail: opts.detail, jpeg_quality: opts.jpegQuality, max_aspect: CLASSIFIER_MAX_ASPECT },
             dedup: { strategy: 'md5_byte_hash', version: 1 },
             tokens: totalTokens,
         },
