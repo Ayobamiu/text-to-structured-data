@@ -1,0 +1,1365 @@
+{
+  "description": "You extract the HEADING of oil and gas wireline (electric / geophysical) well logs — the title block, remarks, casing and bore hole records, and curve track headers. The body of the log is continuous curves on a depth scale: do NOT transcribe curve values, and do NOT invent lithology from curve shapes. RULES: (1) The title block is often printed sideways; OCR may return its lines in an odd order. Pair each label with its value by meaning (DATE, RUN NO., DEPTH—DRILLER…). (2) Many logs print the heading again at the bottom, or a REPEAT PASS with its own track header. Extract each fact once. (3) Values with a temperature, e.g. 'Rm @ MRT 1.5 @ 107.6°F', split into the resistivity and the temperature fields. (4) Leave a field null when the log does not print it. Never take the API number, well name or operator from the filename.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "document_metadata",
+    "well_identification",
+    "elevations",
+    "log_runs",
+    "casing_record",
+    "borehole_record",
+    "curves",
+    "formation_tops",
+    "hole_volume_summary",
+    "remarks",
+    "extraction_metadata"
+  ],
+  "properties": {
+    "document_metadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "document_subtype",
+        "report_title",
+        "has_repeat_section",
+        "drilling_contractor",
+        "page_number",
+        "total_pages"
+      ],
+      "properties": {
+        "document_subtype": {
+          "anyOf": [
+            {
+              "type": "string",
+              "enum": [
+                "electric_log",
+                "induction_log",
+                "combo_log",
+                "porosity_log",
+                "gamma_ray_neutron_log",
+                "sonic_log",
+                "cement_bond_log",
+                "other_wireline_log"
+              ]
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "combo_log = one print combining resistivity with porosity/gamma tools (e.g. induction + neutron + density). electric_log = SP + normal/lateral resistivity, typical pre-1960s."
+        },
+        "report_title": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Main title as printed."
+        },
+        "has_repeat_section": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "True when a REPEAT PASS / repeat section is printed."
+        },
+        "drilling_contractor": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Drilling contractor / rig line, e.g. 'MENDENHALL DRILLING RIG #3'."
+        },
+        "page_number": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Printed page number, if any."
+        },
+        "total_pages": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Printed total pages, if any."
+        }
+      }
+    },
+    "well_identification": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "operator_company",
+        "well_name",
+        "lease_name",
+        "well_number",
+        "api_number",
+        "permit_number",
+        "field",
+        "county",
+        "state",
+        "country",
+        "section",
+        "township",
+        "range",
+        "location_description",
+        "latitude_dd",
+        "longitude_dd",
+        "coordinate_datum"
+      ],
+      "properties": {
+        "operator_company": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "COMPANY line of the log heading — the operator the log was run for, e.g. 'LUKE OIL COMPANY', 'GONSETT PETROLEUM COMPANY'. NOT the logging company (Schlumberger, Birdwell, RECON…), which goes in log_runs.logging_company."
+        },
+        "well_name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "WELL line as written, including lease and number, e.g. 'DEERE No. 7A', 'DAILEY #3-A'."
+        },
+        "lease_name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Lease part of the well name without the number, e.g. 'DEERE', 'DAILEY'. Null if the name is not clearly lease + number."
+        },
+        "well_number": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Number part of the well name, e.g. '7A', '3-A'."
+        },
+        "api_number": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "API well number as printed, e.g. '037-29530', '35-037-29530'. Older logs (pre-1970s) usually have none — leave null rather than taking a number from the filename."
+        },
+        "permit_number": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "State permit / file number where printed (also handwritten file stamps like 'CD 15253'). Null if none."
+        },
+        "field": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "FIELD line, e.g. 'DUTCHER (ATOKA)', 'E. CUSHING'. 'WILDCAT' is a valid value."
+        },
+        "county": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "COUNTY / PARISH as written."
+        },
+        "state": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "STATE as written, e.g. 'OKLAHOMA'."
+        },
+        "country": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Country if printed, else null."
+        },
+        "section": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Public Land Survey section, e.g. '23'."
+        },
+        "township": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Township with direction, e.g. '16N'."
+        },
+        "range": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Range with direction, e.g. '8E'."
+        },
+        "location_description": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Footage call or location text as written, e.g. '1157\\' FNL & 700\\' FEL', 'SURF: SAME'."
+        },
+        "latitude_dd": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Latitude in decimal degrees if printed on the log (positive north)."
+        },
+        "longitude_dd": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Longitude in decimal degrees if printed (NEGATIVE for west, e.g. '96.4251 degW' → -96.4251)."
+        },
+        "coordinate_datum": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Datum printed with the coordinates, e.g. 'NAD27'. Null if not printed."
+        }
+      },
+      "description": "Well identity from the log heading (the title block, often printed sideways)."
+    },
+    "elevations": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "permanent_datum",
+        "permanent_datum_elevation_ft",
+        "log_measured_from",
+        "log_measured_from_ft_above_pd",
+        "drilling_measured_from",
+        "kelly_bushing_ft",
+        "derrick_floor_ft",
+        "ground_level_ft"
+      ],
+      "properties": {
+        "permanent_datum": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "PERMANENT DATUM as written, usually 'GROUND LEVEL' or 'GL'."
+        },
+        "permanent_datum_elevation_ft": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Elevation printed beside the permanent datum, feet."
+        },
+        "log_measured_from": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "LOG MEASURED FROM, e.g. 'KELLY BUSHING', 'K.B.', 'DERRICK FLOOR'."
+        },
+        "log_measured_from_ft_above_pd": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Distance above the permanent datum for the log zero, e.g. '13 ft above PD' or '7\\' A.G.L.' → 7."
+        },
+        "drilling_measured_from": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "DRILLING MEASURED FROM, e.g. 'KELLY BUSHING', 'SAME'."
+        },
+        "kelly_bushing_ft": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Elevation K.B. (or KB) in feet."
+        },
+        "derrick_floor_ft": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Elevation D.F. in feet. 'N/A' → null."
+        },
+        "ground_level_ft": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Elevation G.L. in feet."
+        }
+      },
+      "description": "Elevation block of the heading."
+    },
+    "log_runs": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "logging_company",
+          "log_title",
+          "log_types",
+          "run_number",
+          "log_date",
+          "depth_driller_ft",
+          "depth_logger_ft",
+          "bottom_logged_interval_ft",
+          "top_logged_interval_ft",
+          "logged_interval_length_ft",
+          "casing_driller_size_in",
+          "casing_driller_depth_ft",
+          "casing_logger_depth_ft",
+          "bit_size_in",
+          "mud",
+          "time_circulation_stopped",
+          "time_logger_on_bottom",
+          "unit_number",
+          "unit_location",
+          "recorded_by",
+          "witnessed_by",
+          "other_services",
+          "source_pages"
+        ],
+        "properties": {
+          "logging_company": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Wireline service company whose header this is, e.g. 'RECON PETROTECHNOLOGIES INC.', 'BIRDWELL', 'SCHLUMBERGER'."
+          },
+          "log_title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Log name(s) printed in the title block, verbatim, joined with ' / ', e.g. 'DUAL INDUCTION - SP / COMPENSATED NEUTRON / LITHOLOGY DENSITY / GAMMA - MICROLOG', 'ELECTRIC LOG'."
+          },
+          "log_types": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "enum": [
+                "electric",
+                "induction",
+                "dual_induction",
+                "laterolog",
+                "spontaneous_potential",
+                "resistivity_normal",
+                "resistivity_lateral",
+                "gamma_ray",
+                "neutron",
+                "density",
+                "lithology_density",
+                "microlog",
+                "sonic",
+                "caliper",
+                "temperature",
+                "cement_bond",
+                "dipmeter",
+                "other"
+              ]
+            },
+            "description": "Normalised log types present in the title block and track headers. 'TYPE OF LOG: ELEC' → electric."
+          },
+          "run_number": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "RUN NO. as written, e.g. 'ONE', '1'."
+          },
+          "log_date": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "DATE of the log run, ISO 8601 (YYYY-MM-DD). '4-18-58' → '1958-04-18'. This is when the log was run, NOT a completion date."
+          },
+          "depth_driller_ft": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "DEPTH—DRILLER / TD DRILLER, feet."
+          },
+          "depth_logger_ft": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "DEPTH—LOGGER / TD LOGGER (or 'TD RECON' etc.), feet."
+          },
+          "bottom_logged_interval_ft": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "BTM LOG INTERVAL / BOT LOGGED INTERVAL, feet."
+          },
+          "top_logged_interval_ft": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "TOP LOG INTERVAL / TOP LOGGED INTERVAL, feet. Only when printed as a depth — see logged_interval_length_ft."
+          },
+          "logged_interval_length_ft": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "When the heading prints 'LOGGED INTERVAL' as a single footage (e.g. '498'), record it here, not as a top depth."
+          },
+          "casing_driller_size_in": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "CASING—DRILLER size in inches ('8 5/8' → 8.625)."
+          },
+          "casing_driller_depth_ft": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "CASING—DRILLER depth, feet (the '@ 633' part)."
+          },
+          "casing_logger_depth_ft": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "CASING—LOGGER / CASING DEPTH RECON depth, feet."
+          },
+          "bit_size_in": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "BIT SIZE in inches ('7 7/8' → 7.875)."
+          },
+          "mud": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "fluid_type",
+              "density_lb_gal",
+              "viscosity_s",
+              "ph",
+              "fluid_loss_ml",
+              "source_of_sample",
+              "rm_ohmm",
+              "rm_temp_f",
+              "rmf_ohmm",
+              "rmf_temp_f",
+              "rmc_ohmm",
+              "rmc_temp_f",
+              "rm_at_bht_ohmm",
+              "max_recorded_temp_f"
+            ],
+            "properties": {
+              "fluid_type": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "TYPE OF FLUID IN HOLE / DRILLING FLUID TYPE, e.g. 'GEL', 'GEL/CHEM', 'AIR'."
+              },
+              "density_lb_gal": {
+                "anyOf": [
+                  {
+                    "type": "number"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Mud weight / density in lb/gal."
+              },
+              "viscosity_s": {
+                "anyOf": [
+                  {
+                    "type": "number"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Viscosity in seconds."
+              },
+              "ph": {
+                "anyOf": [
+                  {
+                    "type": "number"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "pH."
+              },
+              "fluid_loss_ml": {
+                "anyOf": [
+                  {
+                    "type": "number"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Fluid loss in mL (often 'LOSS ML 30 MIN')."
+              },
+              "source_of_sample": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "SOURCE OF SAMPLE, e.g. 'FLOWLINE', 'FLOW LINE', 'PIT'."
+              },
+              "rm_ohmm": {
+                "anyOf": [
+                  {
+                    "type": "number"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Rm (mud resistivity) at measured temperature, ohm-m. '2.0 @ 75°F' → 2.0."
+              },
+              "rm_temp_f": {
+                "anyOf": [
+                  {
+                    "type": "number"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Temperature for Rm, °F."
+              },
+              "rmf_ohmm": {
+                "anyOf": [
+                  {
+                    "type": "number"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Rmf (mud filtrate resistivity), ohm-m."
+              },
+              "rmf_temp_f": {
+                "anyOf": [
+                  {
+                    "type": "number"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Temperature for Rmf, °F."
+              },
+              "rmc_ohmm": {
+                "anyOf": [
+                  {
+                    "type": "number"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Rmc (mud cake resistivity), ohm-m."
+              },
+              "rmc_temp_f": {
+                "anyOf": [
+                  {
+                    "type": "number"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Temperature for Rmc, °F."
+              },
+              "rm_at_bht_ohmm": {
+                "anyOf": [
+                  {
+                    "type": "number"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Rm @ BHT / Rm @ MRT value, ohm-m."
+              },
+              "max_recorded_temp_f": {
+                "anyOf": [
+                  {
+                    "type": "number"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "MAX RECORDED TEMP / BHT, °F."
+              }
+            },
+            "description": "Mud / borehole-fluid block for this run."
+          },
+          "time_circulation_stopped": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "TIME CIRCULATION STOPPED / TIME SINCE CIRC., as written."
+          },
+          "time_logger_on_bottom": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "TIME LOGGER ON BOTTOM, as written."
+          },
+          "unit_number": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Logging UNIT / TRUCK NO."
+          },
+          "unit_location": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Unit location / district, e.g. 'ALVARADO, TX'."
+          },
+          "recorded_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "RECORDED BY (the logging engineer)."
+          },
+          "witnessed_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "WITNESSED BY (the operator's representative)."
+          },
+          "other_services": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "OTHER SERVICES / OTHER LOGS listed in the heading, verbatim."
+          },
+          "source_pages": {
+            "type": "array",
+            "items": {
+              "type": "integer"
+            },
+            "description": "1-based PDF pages this was read from."
+          }
+        },
+        "description": "One logging run (one heading). A log printed with a main pass and a REPEAT PASS is still ONE run."
+      },
+      "description": "One entry per logging run / heading. Most prints have exactly one."
+    },
+    "casing_record": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "size_in",
+          "weight_lb_ft",
+          "grade",
+          "from_ft",
+          "to_ft",
+          "string_type",
+          "source"
+        ],
+        "properties": {
+          "size_in": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Casing OD in inches ('8-5/8' → 8.625)."
+          },
+          "weight_lb_ft": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Weight, lb/ft, if printed."
+          },
+          "grade": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Grade, if printed."
+          },
+          "from_ft": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Top of the string, feet."
+          },
+          "to_ft": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Bottom / shoe depth, feet."
+          },
+          "string_type": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "surface",
+                  "intermediate",
+                  "production",
+                  "liner",
+                  "conductor",
+                  "unknown"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "String type if labelled; else 'unknown'."
+          },
+          "source": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "heading",
+                  "casing_record_table",
+                  "cement_summary"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Where this row was read."
+          }
+        }
+      },
+      "description": "Casing strings from the CASING RECORD table, the heading's CASING—DRILLER line, or a casing table in a cement summary. One row per string; do not repeat the same string from two places."
+    },
+    "borehole_record": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "run_number",
+          "bit_size_in",
+          "from_ft",
+          "to_ft"
+        ],
+        "properties": {
+          "run_number": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "RUN column of the bore hole record, as written."
+          },
+          "bit_size_in": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Bit size, inches."
+          },
+          "from_ft": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "From depth, feet."
+          },
+          "to_ft": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "To depth, feet."
+          }
+        }
+      },
+      "description": "Rows of the BORE HOLE RECORD / bit record table."
+    },
+    "curves": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "track",
+          "curve_name",
+          "mnemonic",
+          "units",
+          "scale_left",
+          "scale_right",
+          "backup_scale"
+        ],
+        "properties": {
+          "track": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Track as labelled or positioned, e.g. 'Track 1', 'POTENTIAL', 'RESISTIVITY'."
+          },
+          "curve_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Curve label as printed, e.g. 'Deep Induction (ILD)', '16\" NORMAL', 'Gamma Ray (GR)', 'Spontaneous (SP)'."
+          },
+          "mnemonic": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Mnemonic in parentheses if printed, e.g. 'ILD', 'GR', 'NPLS'."
+          },
+          "units": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Units as printed, e.g. 'ohm.m', 'API', 'mV', 'g/cc', 'V/V', 'OHMS M²/M'."
+          },
+          "scale_left": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Left scale value."
+          },
+          "scale_right": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Right scale value."
+          },
+          "backup_scale": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Backup / alternate scale as written, e.g. '0 – 500'."
+          }
+        },
+        "description": "One curve from a track header. List each curve once even if the header repeats at the bottom or for a repeat pass."
+      },
+      "description": "Curve definitions from the track headers."
+    },
+    "formation_tops": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "formation",
+          "depth_ft",
+          "source"
+        ],
+        "properties": {
+          "formation": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Formation or marker name as annotated on the log, e.g. 'ATOKA', 'BIG LIME'."
+          },
+          "depth_ft": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Depth of the top, feet."
+          },
+          "source": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "printed",
+                  "handwritten",
+                  "table"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "How the top appears on the log."
+          }
+        },
+        "description": "A formation top ONLY if it is written on the log (annotation, handwriting, or a tops table). Never infer tops from curve shapes."
+      },
+      "description": "Formation tops written on the log. Usually empty."
+    },
+    "hole_volume_summary": {
+      "anyOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "borehole_volume_ft3",
+            "annular_volume_ft3",
+            "future_casing_od_in",
+            "from_depth",
+            "to_depth"
+          ],
+          "properties": {
+            "borehole_volume_ft3": {
+              "anyOf": [
+                {
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Borehole total volume, cubic feet."
+            },
+            "annular_volume_ft3": {
+              "anyOf": [
+                {
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Annular volume with casing, cubic feet."
+            },
+            "future_casing_od_in": {
+              "anyOf": [
+                {
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Casing OD the annular volume was calculated for ('AHV calculated on a 5.5 in OD casing' → 5.5)."
+            },
+            "from_depth": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "From depth as written, e.g. 'SCG', '644'."
+            },
+            "to_depth": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "To depth as written, e.g. 'TD'."
+            }
+          },
+          "description": "Cement / hole-volume calculation summary, if present."
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Cement / hole-volume summary block, or null."
+    },
+    "remarks": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "REMARKS / GENERAL REMARKS section verbatim (joined lines), excluding legal disclaimers."
+    },
+    "extraction_metadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source_file",
+        "source_pages",
+        "scan_quality",
+        "handwritten",
+        "extraction_confidence",
+        "flags",
+        "extracted_at",
+        "extractor_version"
+      ],
+      "properties": {
+        "source_file": {
+          "type": "string"
+        },
+        "source_pages": {
+          "type": "array",
+          "items": {
+            "type": "integer"
+          }
+        },
+        "scan_quality": {
+          "type": "string",
+          "enum": [
+            "digital_native",
+            "clean_scan",
+            "degraded_scan",
+            "rotated",
+            "partial"
+          ]
+        },
+        "handwritten": {
+          "type": "boolean",
+          "description": "True when any extracted value was read from handwriting."
+        },
+        "extraction_confidence": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "flags": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Standard flags: header_rotated, repeat_section_present, header_repeated_at_bottom, no_api_on_log, handwritten_annotations, partial_header, multiple_runs, illegible_value, curves_only_no_header."
+        },
+        "extracted_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "extractor_version": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "description": "CoreExtract pipeline housekeeping — not from the source document."
+    }
+  }
+}

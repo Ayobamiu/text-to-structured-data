@@ -1,0 +1,13 @@
+{
+  "keep_when": [
+    "The page is an oil and gas WIRELINE / ELECTRIC / GEOPHYSICAL WELL LOG: a heading from a LOGGING SERVICE COMPANY (e.g. Schlumberger, Halliburton, Dresser Atlas, Welex, Lane-Wells, Birdwell, Gearhart, Baker Atlas, RECON, Weatherford) with COMPANY / WELL / FIELD / COUNTY / STATE lines, often printed sideways, and a log name such as 'Electric Log', 'Induction Electrical Log', 'Dual Induction - SP', 'Compensated Neutron', 'Lithology Density', 'Gamma Ray', 'Microlog', 'Sonic', 'Cement Bond Log'. Set page_purpose='data'.",
+    "Decisive signals for this type: heading rows like RUN NO., DEPTH—DRILLER, DEPTH—LOGGER, BTM. LOG INTERVAL, TYPE FLUID IN HOLE, Rm / Rmf / Rmc with temperatures, MAX REC. TEMP, RECORDED BY, WITNESSED BY; or curve TRACK headers with scales in OHMS M²/M, ohm.m, millivolts (SP / POTENTIAL), API units (gamma), g/cc, or porosity units. If you see these, choose wireline_log — NOT borehole_log and NOT mgs_well_log — even though the page says 'well' and has depths.",
+    "A page that is only continuous curves on a depth scale (no heading) and continues a wireline log from the previous page is the same record: keep it as wireline_log with is_new_record=false and page_purpose='attachment'.",
+    "Difference from borehole_log: borehole_log pages describe the ground in WORDS per depth interval (lithology descriptions, sample numbers, blow counts) written by a geologist or driller. A wireline log measures the hole with tools and draws CURVES; any lithology on it is a short abbreviation (SH, LM, SDY) beside a curve, not a description column."
+  ],
+  "skip_when": [
+    "A MUD LOG / mudlogging strip (drilling rate, gas units, sample lithology column by a mudlogging company) is not a wireline log.",
+    "A completion report, well record or plugging form (typed or handwritten form fields, no curve tracks) is not a wireline log, even when it lists the logs that were run."
+  ],
+  "record_id_guidance": "Use the API number printed in the heading (e.g. '037-29530'). If there is none, use the well name with its number exactly as written on the WELL line (e.g. 'DAILEY #3-A'). Handwritten office or file stamps (e.g. 'CD 15253' scrawled in a corner) are NOT the record_id. Never use the logging company name (RECON, BIRDWELL, SCHLUMBERGER) as the record_id."
+}

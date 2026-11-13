@@ -51,6 +51,7 @@ const DEMO_QUEUE_PRIORITY = -10; // queue is ORDER BY priority ASC
 const SLUG_NAMES = {
     borehole_log: 'Boring log',
     mgs_well_log: 'Well record',
+    wireline_log: 'Wireline log',
     aquifer_test: 'Aquifer test',
     analytical_results: 'Analytical results',
     well_coordinate_table: 'Well coordinates',
