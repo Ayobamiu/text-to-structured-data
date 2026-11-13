@@ -4617,9 +4617,11 @@ app.delete("/files/:fileId", authenticateToken, async (req, res) => {
                 console.warn(`⚠️ Stats decrement failed for job ${deletedFile.job_id}:`, statsError.message);
             }
 
-            // Remove file from processing queue if it exists
+            // Remove every queue row for the file, not just a 'processing'
+            // one: a 'queued' row left behind has no file to process and
+            // becomes a ghost the worker fails on after every restart.
             try {
-                await queueService.removeFileFromProcessing(fileId);
+                await queueService.removeFileFromQueue(fileId);
                 console.log(`✅ File ${fileId} removed from processing queue`);
             } catch (queueError) {
                 console.warn(`⚠️ Could not remove file ${fileId} from queue: ${queueError.message}`);
@@ -4715,9 +4717,9 @@ app.delete("/files", authenticateToken, async (req, res) => {
                             console.warn(`⚠️ Stats decrement failed for job ${deletedFile.job_id}:`, statsError.message);
                         }
 
-                        // Remove file from processing queue if it exists
+                        // Remove every queue row for the file (see DELETE /files/:fileId)
                         try {
-                            await queueService.removeFileFromProcessing(fileId);
+                            await queueService.removeFileFromQueue(fileId);
                             console.log(`✅ File ${fileId} removed from processing queue`);
                         } catch (queueError) {
                             console.warn(`⚠️ Could not remove file ${fileId} from queue: ${queueError.message}`);

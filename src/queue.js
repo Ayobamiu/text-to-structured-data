@@ -402,10 +402,34 @@ class QueueService {
                     return [];
                 }
 
+                // A stale row whose job_files row is gone is an orphan: the
+                // file was deleted while it was queued or running. Requeuing
+                // one puts it back at the head of the queue (it keeps its
+                // original created_at), where it fails on every poll. On
+                // 2026-09-15 a redeploy requeued 36 rows for a file deleted on
+                // 2026-08-01, ahead of every new upload. Delete them instead.
+                const dropped = await client.query(
+                    `DELETE FROM file_processing_queue q
+                     WHERE status = 'processing'
+                       AND NOT EXISTS (SELECT 1 FROM job_files jf WHERE jf.id = q.file_id)
+                     ${shardFilter}
+                     ${livenessFilter}
+                     RETURNING file_id`,
+                    params
+                );
+                if (dropped.rows.length > 0) {
+                    const deletedFileIds = [...new Set(dropped.rows.map(r => r.file_id))];
+                    console.log(
+                        `🗑️ Dropped ${dropped.rows.length} stale queue row(s) for deleted file(s): ` +
+                        deletedFileIds.join(', ')
+                    );
+                }
+
                 const result = await client.query(
-                    `UPDATE file_processing_queue
+                    `UPDATE file_processing_queue q
                      SET status = 'queued', updated_at = NOW(), worker_id = NULL, heartbeat_at = NULL
                      WHERE status = 'processing'
+                       AND EXISTS (SELECT 1 FROM job_files jf WHERE jf.id = q.file_id)
                      ${shardFilter}
                      ${livenessFilter}
                      RETURNING file_id, job_id`,
@@ -719,17 +743,21 @@ class QueueService {
         }
     }
 
-    // Remove specific file from queue
+    // Remove every queue row for a file, whatever its status. Returns the
+    // number of rows removed.
     async removeFileFromQueue(fileId) {
         try {
             const client = await pool.connect();
+            let removed = 0;
             try {
-                await client.query(`DELETE FROM file_processing_queue WHERE file_id = $1`, [fileId]);
+                const result = await client.query(`DELETE FROM file_processing_queue WHERE file_id = $1`, [fileId]);
+                removed = result.rowCount || 0;
             } finally {
                 client.release();
             }
 
             console.log(`🗑️ File ${fileId} removed from queue`);
+            return removed;
         } catch (error) {
             console.error('❌ Error removing file from queue:', error.message);
             throw error;
@@ -816,6 +844,14 @@ class QueueService {
             console.error('❌ Error getting processing files:', error.message);
             throw error;
         }
+    }
+
+    // Whether the job_files row behind a queue item still exists. Every
+    // enqueue path inserts job_files first, so a queue row without one is an
+    // orphan: the file was deleted after it was queued.
+    async jobFileExists(fileId) {
+        const result = await pool.query(`SELECT 1 FROM job_files WHERE id = $1`, [fileId]);
+        return result.rows.length > 0;
     }
 
     async isFileInQueue(fileId) {
