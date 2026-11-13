@@ -37,9 +37,11 @@ describe('runConfiguredServicesOverResult', () => {
         expect(r.borehole_log[0]).toMatchObject({ geo: true });
         expect(r.borehole_log[1]).toMatchObject({ geo: true });
         expect(r.aquifer_test[0]).not.toHaveProperty('geo');
-        expect(out.slugsRun).toEqual(['borehole_log']);
-        expect(out.recordsProcessed).toBe(2);
-        expect(out.sideEffects).toHaveLength(2);
+        // Projection is always-on, so every known slug runs (incl. aquifer_test).
+        expect(out.slugsRun).toEqual(expect.arrayContaining(['borehole_log', 'aquifer_test']));
+        expect(out.recordsProcessed).toBe(3);
+        expect(out.sideEffects.filter((s) => s.table === 'record_geocodes')).toHaveLength(2);
+        expect(out.sideEffects.some((s) => s.table === 'extracted_records')).toBe(true);
     });
 
     it('a service enabled for one slug does NOT run on another slug', async () => {
@@ -59,7 +61,7 @@ describe('runConfiguredServicesOverResult', () => {
         expect(r.aquifer_test[0]).not.toHaveProperty('mgs');
     });
 
-    it('job override turns the slug default off → no services run', async () => {
+    it('job override turns the slug default off → enrichment skipped, but projection still runs', async () => {
         const result = { borehole_log: [{ section_result_id: 'a', x: 1 }] };
         const out = await runConfiguredServicesOverResult({
             result,
@@ -68,9 +70,10 @@ describe('runConfiguredServicesOverResult', () => {
             jobOverrides: [{ name: 'geocode_locations', enabled: false }],
             registry,
         });
-        expect(out.slugsRun).toHaveLength(0);
-        expect(out.sideEffects).toHaveLength(0);
-        expect(out.result).toBe(result); // unchanged reference when nothing ran
+        // Geocode is off; no enrichment side effect — but projection is always-on.
+        expect(out.sideEffects.filter((s) => s.table === 'record_geocodes')).toHaveLength(0);
+        expect(out.sideEffects.some((s) => s.table === 'extracted_records')).toBe(true);
+        expect((out.result as { borehole_log: Array<Record<string, unknown>> }).borehole_log[0]).not.toHaveProperty('geo');
     });
 
     it('does not mutate the input envelope', async () => {
